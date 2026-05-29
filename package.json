@@ -1,0 +1,61 @@
+{
+  "name": "claude-code-enhance",
+  "displayName": "Claude Code Enhance",
+  "description": "Adds LaTeX math rendering and enhanced output preview controls to Claude Code chat.",
+  "version": "1.0.0",
+  "publisher": "local",
+  "license": "MIT",
+  "icon": "icon.png",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "keywords": [
+    "latex",
+    "math",
+    "mathematics",
+    "equations",
+    "katex",
+    "claude",
+    "claude-code",
+    "anthropic",
+    "markdown",
+    "rendering"
+  ],
+  "galleryBanner": {
+    "color": "#1e1e2e",
+    "theme": "dark"
+  },
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "claude-code-enhance.enable",
+        "title": "Claude Code Enhance: Enable"
+      },
+      {
+        "command": "claude-code-enhance.disable",
+        "title": "Claude Code Enhance: Disable"
+      },
+      {
+        "command": "claude-code-enhance.status",
+        "title": "Claude Code Enhance: Status"
+      }
+    ]
+  },
+  "scripts": {
+    "test": "node scripts/smoke-test.js",
+    "package": "npx @vscode/vsce package --no-dependencies --allow-missing-repository",
+    "restore": "node ./uninstall-hook.js",
+    "vscode:uninstall": "node ./uninstall-hook.js"
+  },
+  "extensionDependencies": [
+    "anthropic.claude-code"
+  ],
+  "author": ""
+}
