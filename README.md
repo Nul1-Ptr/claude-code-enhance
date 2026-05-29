@@ -2,6 +2,10 @@
 
 Claude Code Enhance is a local VS Code extension that improves the Claude Code chat webview.
 
+Based on work from:
+- [claude-code-enhance](https://github.com/Sophomoresty/claude-code-enhance)
+- [claude-code-katex](https://github.com/MahammadNuriyev62/claude-code-katex)
+
 It adds:
 
 - LaTeX math rendering with KaTeX
@@ -11,6 +15,16 @@ It adds:
 - Copy buttons for assistant output and individual code blocks
 - Table and code-block readability improvements
 - Ctrl/Cmd + mouse-wheel zoom for the chat output
+
+## Preview
+
+Original Claude Code output:
+
+![Original Claude Code chat output](preview/original.png)
+
+Enhanced output with Claude Code Enhance:
+
+![Claude Code Enhance preview](preview/preview.png)
 
 ## Version
 
@@ -81,6 +95,8 @@ The extension applies a common One Dark / One Light inspired syntax palette on t
 
 Each code block also gets its own **Copy** button, separate from the full-response copy button.
 
+Inline math and display math use theme-aware background colors. Display math uses a full-width block similar to code blocks, with a larger centered equation.
+
 ## Theme Behavior
 
 The enhancer uses VS Code theme variables where possible:
@@ -89,6 +105,7 @@ The enhancer uses VS Code theme variables where possible:
 - input foreground/background
 - widget borders
 - text code block background
+- inline and display math background
 - button colors
 - high-contrast borders
 

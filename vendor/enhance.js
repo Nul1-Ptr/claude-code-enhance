@@ -27,6 +27,8 @@
         --ce-hover: var(--vscode-list-hoverBackground, rgba(127, 127, 127, 0.16));
         --ce-shadow: rgba(0, 0, 0, 0.18);
         --ce-success: var(--vscode-testing-iconPassed, var(--vscode-terminal-ansiGreen, #2ea043));
+        --ce-math-display-bg: var(--vscode-textCodeBlock-background, var(--ce-code-bg));
+        --ce-math-inline-bg: var(--vscode-editorWidget-background, var(--ce-code-bg));
         /* One Dark inspired syntax palette. */
         --ce-syntax-fg: #abb2bf;
         --ce-syntax-keyword: #c678dd;
@@ -48,6 +50,8 @@
 
       :is(body.vscode-light, html.vscode-light) {
         --ce-shadow: rgba(0, 0, 0, 0.10);
+        --ce-math-display-bg: var(--vscode-textCodeBlock-background, var(--ce-code-bg));
+        --ce-math-inline-bg: var(--vscode-editorWidget-background, var(--ce-code-bg));
         /* One Light inspired syntax palette. */
         --ce-syntax-fg: #383a42;
         --ce-syntax-keyword: #a626a4;
@@ -71,6 +75,8 @@
       body.vscode-high-contrast-light {
         --ce-border: var(--vscode-contrastBorder, var(--vscode-input-border, currentColor));
         --ce-shadow: transparent;
+        --ce-math-inline-bg: var(--vscode-editorWidget-background, var(--ce-bg));
+        --ce-math-display-bg: var(--vscode-editorWidget-background, var(--ce-bg));
         --ce-syntax-fg: var(--vscode-editor-foreground, currentColor);
         --ce-syntax-comment: var(--vscode-descriptionForeground, var(--vscode-editor-foreground, currentColor));
         --ce-markdown-text: var(--vscode-editor-foreground, currentColor);
@@ -310,45 +316,96 @@
       }
 
       /* KaTeX: inline + display */
+      .katex,
       .claude-enhance-root .katex {
         font-size: 1.1em;
         line-height: 1.35;
         color: var(--ce-fg);
       }
+      .katex:not(.katex-display > .katex),
+      .claude-enhance-root .katex:not(.katex-display > .katex) {
+        padding: 0.08em 0.24em;
+        border-radius: 6px;
+        background: var(--ce-math-inline-bg);
+        box-shadow: 0 1px 2px var(--ce-shadow);
+      }
+      .katex.ce-large-inline-math,
+      .claude-enhance-root .katex.ce-large-inline-math {
+        display: inline-block;
+        max-width: min(100%, calc(100vw - 48px));
+        box-sizing: border-box;
+        vertical-align: middle;
+        margin: 0.25em 0.2em;
+        padding: 0.55em 0.75em;
+        border-radius: 8px;
+        border: 1px solid var(--ce-border);
+        background: var(--ce-math-inline-bg);
+        box-shadow: 0 1px 4px var(--ce-shadow);
+        overflow-x: auto;
+        overflow-y: hidden;
+        line-height: 1.45;
+        white-space: nowrap;
+        -webkit-overflow-scrolling: touch;
+        scrollbar-width: thin;
+        scrollbar-color: var(--ce-border) transparent;
+      }
+      .katex-error,
       .claude-enhance-root .katex-error {
         color: var(--ce-fg) !important;
       }
+      .katex-display,
       .claude-enhance-root .katex-display {
-        margin: 1.2em 0;
+        display: block !important;
+        width: 100% !important;
+        min-width: 100% !important;
+        max-width: 100% !important;
+        box-sizing: border-box;
+        align-self: stretch;
+        clear: both;
+        margin: 1.2em 0 !important;
         overflow-x: auto;
-        padding: 18px 22px;
-        border-radius: 12px;
-        border: 1px solid var(--ce-border);
-        background: var(--ce-panel);
-        box-shadow: 0 2px 10px var(--ce-shadow);
+        min-height: 48px;
+        padding: 14px 18px !important;
+        border-radius: 12px !important;
+        border: 1px solid var(--ce-border) !important;
+        background: var(--ce-math-display-bg) !important;
+        box-shadow: 0 2px 8px var(--ce-shadow) !important;
         position: relative;
+        text-align: center;
         -webkit-overflow-scrolling: touch;
         scrollbar-gutter: stable both-edges;
       }
+      .katex-display > .katex,
       .claude-enhance-root .katex-display > .katex {
         display: inline-block;
+        font-size: 1.6em;
+        line-height: 1.6;
+        text-align: initial;
         padding: 0;
       }
-
       /* Scrollbar polish (WebKit + Firefox) */
+      .katex-display,
+      .katex.ce-large-inline-math,
       .claude-enhance-root pre,
+      .claude-enhance-root .katex.ce-large-inline-math,
       .claude-enhance-root .katex-display,
       .claude-enhance-root table {
         scrollbar-width: thin;
         scrollbar-color: var(--ce-border) transparent;
       }
+      .katex-display::-webkit-scrollbar,
+      .katex.ce-large-inline-math::-webkit-scrollbar,
       .claude-enhance-root pre::-webkit-scrollbar,
+      .claude-enhance-root .katex.ce-large-inline-math::-webkit-scrollbar,
       .claude-enhance-root .katex-display::-webkit-scrollbar,
       .claude-enhance-root table::-webkit-scrollbar {
         height: 10px;
         width: 10px;
       }
+      .katex-display::-webkit-scrollbar-thumb,
+      .katex.ce-large-inline-math::-webkit-scrollbar-thumb,
       .claude-enhance-root pre::-webkit-scrollbar-thumb,
+      .claude-enhance-root .katex.ce-large-inline-math::-webkit-scrollbar-thumb,
       .claude-enhance-root .katex-display::-webkit-scrollbar-thumb,
       .claude-enhance-root table::-webkit-scrollbar-thumb {
         background: var(--ce-border);
@@ -356,14 +413,20 @@
         border: 2px solid transparent;
         background-clip: padding-box;
       }
+      .katex-display::-webkit-scrollbar-thumb:hover,
+      .katex.ce-large-inline-math::-webkit-scrollbar-thumb:hover,
       .claude-enhance-root pre::-webkit-scrollbar-thumb:hover,
+      .claude-enhance-root .katex.ce-large-inline-math::-webkit-scrollbar-thumb:hover,
       .claude-enhance-root .katex-display::-webkit-scrollbar-thumb:hover,
       .claude-enhance-root table::-webkit-scrollbar-thumb:hover {
         background: var(--ce-muted);
         border: 2px solid transparent;
         background-clip: padding-box;
       }
+      .katex-display::-webkit-scrollbar-track,
+      .katex.ce-large-inline-math::-webkit-scrollbar-track,
       .claude-enhance-root pre::-webkit-scrollbar-track,
+      .claude-enhance-root .katex.ce-large-inline-math::-webkit-scrollbar-track,
       .claude-enhance-root .katex-display::-webkit-scrollbar-track,
       .claude-enhance-root table::-webkit-scrollbar-track {
         background: transparent;
@@ -1041,6 +1104,104 @@
     });
   }
 
+  function isLineBoundaryNode(node) {
+    return node?.nodeType === Node.ELEMENT_NODE && node.tagName === 'BR';
+  }
+
+  function textBeforeLastLineBreakIsWhitespace(text) {
+    const lastBreak = Math.max(text.lastIndexOf('\n'), text.lastIndexOf('\r'));
+    const relevant = lastBreak === -1 ? text : text.slice(lastBreak + 1);
+    return !relevant.trim();
+  }
+
+  function textAfterFirstLineBreakIsWhitespace(text) {
+    const breaks = [text.indexOf('\n'), text.indexOf('\r')].filter((idx) => idx !== -1);
+    const firstBreak = breaks.length ? Math.min(...breaks) : -1;
+    const relevant = firstBreak === -1 ? text : text.slice(0, firstBreak);
+    return !relevant.trim();
+  }
+
+  function isWhitespaceLikeNode(node) {
+    if (node.nodeType === Node.TEXT_NODE) return !(node.textContent || '').trim();
+    if (node.nodeType !== Node.ELEMENT_NODE) return false;
+    return node.tagName === 'BR' || node.classList?.contains('katex-mathml');
+  }
+
+  function hasOnlyStandaloneMathOnLine(katexEl) {
+    for (let node = katexEl.previousSibling; node; node = node.previousSibling) {
+      if (isLineBoundaryNode(node)) break;
+      if (node.nodeType === Node.TEXT_NODE) {
+        if (!textBeforeLastLineBreakIsWhitespace(node.textContent || '')) return false;
+        if ((node.textContent || '').includes('\n') || (node.textContent || '').includes('\r')) break;
+        continue;
+      }
+      if (!isWhitespaceLikeNode(node)) return false;
+    }
+
+    for (let node = katexEl.nextSibling; node; node = node.nextSibling) {
+      if (isLineBoundaryNode(node)) break;
+      if (node.nodeType === Node.TEXT_NODE) {
+        if (!textAfterFirstLineBreakIsWhitespace(node.textContent || '')) return false;
+        if ((node.textContent || '').includes('\n') || (node.textContent || '').includes('\r')) break;
+        continue;
+      }
+      if (!isWhitespaceLikeNode(node)) return false;
+    }
+
+    return true;
+  }
+
+  function meaningfulTextWithoutMath(el) {
+    const clone = el.cloneNode(true);
+    clone.querySelectorAll('.katex, .katex-display, script, style, button').forEach((node) => node.remove());
+    return (clone.textContent || '').replace(/[\s\u00a0]+/g, '').trim();
+  }
+
+  function isOnlyMathInContainer(katexEl) {
+    const container = katexEl.closest('p, li, blockquote, td, th, div, section');
+    if (!container || container === document.body || container.closest(INTERACTIVE_SELECTOR)) return false;
+    const mathNodes = Array.from(container.querySelectorAll('.katex:not(.katex-display .katex)'))
+      .filter((el) => !el.closest('.katex-display'));
+    if (mathNodes.length !== 1 || mathNodes[0] !== katexEl) return false;
+    return meaningfulTextWithoutMath(container) === '';
+  }
+
+  function promoteStandaloneInlineMath(root) {
+    const candidates = Array.from(root.querySelectorAll('.katex:not(.katex-display .katex)'))
+      .filter((el) => !el.closest('.katex-display') && !el.closest(INTERACTIVE_SELECTOR));
+
+    candidates.forEach((katexEl) => {
+      if (!katexEl.parentNode || (!hasOnlyStandaloneMathOnLine(katexEl) && !isOnlyMathInContainer(katexEl))) return;
+
+      const display = document.createElement('span');
+      display.className = 'katex-display';
+      katexEl.parentNode.insertBefore(display, katexEl);
+      display.appendChild(katexEl);
+    });
+  }
+
+  function isLargeInlineMath(katexEl) {
+    if (katexEl.querySelector('.mtable, .mfrac, .sqrt')) return true;
+
+    const rect = katexEl.getBoundingClientRect();
+    if (!rect.width && !rect.height) return false;
+
+    const container = katexEl.closest('p, li, blockquote, td, th, div, section') || katexEl.parentElement;
+    const containerWidth = container?.getBoundingClientRect?.().width || window.innerWidth || 0;
+    const wideInlineLimit = containerWidth ? Math.min(360, containerWidth * 0.58) : 360;
+
+    return rect.height > 34 || rect.width > wideInlineLimit;
+  }
+
+  function adaptInlineMathSize(root) {
+    const candidates = Array.from(root.querySelectorAll('.katex'))
+      .filter((el) => !el.closest('.katex-display') && !el.closest(INTERACTIVE_SELECTOR));
+
+    candidates.forEach((katexEl) => {
+      katexEl.classList.toggle('ce-large-inline-math', isLargeInlineMath(katexEl));
+    });
+  }
+
   function renderLaTeX() {
     if (typeof katex === 'undefined') return;
     if (window._claudeRenderingLaTeX) return;
@@ -1050,6 +1211,8 @@
       getEnhanceRoots().forEach((root) => {
         repairProseKatexErrors(root);
         renderRelaxedMarkdownBold(root);
+        promoteStandaloneInlineMath(root);
+        adaptInlineMathSize(root);
 
         // Preprocess HTML-based math (handles markup inside $$...$$)
         preprocessHTMLMath(root);
@@ -1158,6 +1321,8 @@
 
         repairProseKatexErrors(root);
         renderRelaxedMarkdownBold(root);
+        promoteStandaloneInlineMath(root);
+        adaptInlineMathSize(root);
       });
     } finally {
       window._claudeRenderingLaTeX = false;

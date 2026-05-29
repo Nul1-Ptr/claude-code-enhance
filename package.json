@@ -5,6 +5,10 @@
   "version": "1.0.0",
   "publisher": "local",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Nul1-Ptr/claude-code-enhance.git"
+  },
   "icon": "icon.png",
   "engines": {
     "vscode": "^1.85.0"
@@ -50,7 +54,7 @@
   },
   "scripts": {
     "test": "node scripts/smoke-test.js",
-    "package": "npx @vscode/vsce package --no-dependencies --allow-missing-repository",
+    "package": "npx --yes @vscode/vsce package --no-dependencies --allow-missing-repository",
     "restore": "node ./uninstall-hook.js",
     "vscode:uninstall": "node ./uninstall-hook.js"
   },

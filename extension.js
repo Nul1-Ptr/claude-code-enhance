@@ -14,7 +14,7 @@ const EXTENSION_VERSION = require('./package.json').version;
 const PATCH_VERSION_PREFIX = '/* katex-ext-version: ';
 // Internal patch revision. The package version can stay at 1.0.0 while this
 // changes to force a refresh of already-patched Claude Code webview files.
-const PATCH_BUILD_ID = 'relaxed-bold-markdown-2026-05-29';
+const PATCH_BUILD_ID = 'table-pipe-math-protection-2026-05-29';
 const PATCH_BUILD_PREFIX = '/* enhance-patch-build: ';
 
 // Where users report a Claude Code build the patch no longer fits.
@@ -146,12 +146,30 @@ ${PATCH_CSS_MARKER}
 ${katexCss}
 ${highlightCss}
 .katex-display {
-  margin: 0.5em 0;
+  display: block !important;
+  width: 100% !important;
+  min-width: 100% !important;
+  max-width: 100% !important;
+  box-sizing: border-box;
+  clear: both;
+  margin: 1.2em 0 !important;
   overflow-x: auto;
   overflow-y: hidden;
-  padding: 0.25em 0;
+  min-height: 48px;
+  padding: 14px 18px !important;
+  border-radius: 12px !important;
+  border: 1px solid var(--vscode-widget-border, var(--vscode-input-border, rgba(127, 127, 127, 0.32))) !important;
+  background: var(--vscode-textCodeBlock-background, var(--vscode-editorWidget-background, var(--vscode-input-background, rgba(127, 127, 127, 0.10)))) !important;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.18) !important;
+  text-align: center;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-gutter: stable both-edges;
 }
 .katex-display > .katex {
+  display: inline-block;
+  font-size: 1.6em !important;
+  line-height: 1.6;
+  text-align: initial;
   white-space: normal;
 }
 .katex {
