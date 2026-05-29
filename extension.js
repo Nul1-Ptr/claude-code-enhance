@@ -14,7 +14,7 @@ const EXTENSION_VERSION = require('./package.json').version;
 const PATCH_VERSION_PREFIX = '/* katex-ext-version: ';
 // Internal patch revision. The package version can stay at 1.0.0 while this
 // changes to force a refresh of already-patched Claude Code webview files.
-const PATCH_BUILD_ID = 'do-not-color-rich-chat-editor-2026-05-29';
+const PATCH_BUILD_ID = 'relaxed-bold-markdown-2026-05-29';
 const PATCH_BUILD_PREFIX = '/* enhance-patch-build: ';
 
 // Where users report a Claude Code build the patch no longer fits.

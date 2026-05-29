@@ -315,6 +315,9 @@
         line-height: 1.35;
         color: var(--ce-fg);
       }
+      .claude-enhance-root .katex-error {
+        color: var(--ce-fg) !important;
+      }
       .claude-enhance-root .katex-display {
         margin: 1.2em 0;
         overflow-x: auto;
@@ -686,13 +689,42 @@
   function looksLikeLatex(text) {
     const cleaned = text.replace(/\s+/g, ' ').trim();
     return cleaned.length <= 2 || cleaned.includes('\\') ||
-      cleaned.includes('_') || cleaned.includes('^') || cleaned.includes('{') ||
+      cleaned.includes('^') || cleaned.includes('{') ||
       /\b(alpha|beta|gamma|delta|theta|lambda|mu|sigma|pi|omega|sum|int|frac|sqrt|nabla|mathbf|text|tilde)\b/i.test(cleaned);
+  }
+
+  function containsCjk(text) {
+    return /[\u3400-\u9fff\uf900-\ufaff]/.test(text);
+  }
+
+  function hasMarkdownUnderscoreEmphasis(text) {
+    return /(^|[^\w\\])_[^_\n]{2,}_(?=[^\w]|$)/.test(text);
+  }
+
+  function isProseHeavyLatex(text, displayMode) {
+    const cleaned = text.replace(/\s+/g, ' ').trim();
+    if (!cleaned) return true;
+
+    const macroCount = (cleaned.match(/\\[a-zA-Z]+/g) || []).length;
+    const cjkCount = (cleaned.match(/[\u3400-\u9fff\uf900-\ufaff]/g) || []).length;
+    const wordCount = (cleaned.match(/[A-Za-z]{3,}/g) || []).length;
+    const prosePunctuationCount = (cleaned.match(/[，。；：、]|[.!?]\s+[A-Z]/g) || []).length;
+
+    if (!displayMode && cleaned.length > 240) return true;
+    if (cleaned.length > 120 && hasMarkdownUnderscoreEmphasis(cleaned)) return true;
+    if (cleaned.length > 120 && cjkCount > 12 && macroCount < 4) return true;
+    if (cleaned.length > 180 && cjkCount > 12 && prosePunctuationCount > 1) return true;
+    if (cleaned.length > 220 && wordCount > 20 && macroCount < 4) return true;
+    return false;
+  }
+
+  function isRenderableLatexFormula(text, displayMode) {
+    return looksLikeLatex(text) && !isProseHeavyLatex(text, displayMode);
   }
 
   function renderLatexFragment(fragment, displayMode, fallback) {
     const latex = /<[^>]+>/.test(fragment) ? htmlFragmentToLatex(fragment) : fragment;
-    if (!looksLikeLatex(latex)) return fallback;
+    if (!isRenderableLatexFormula(latex, displayMode)) return fallback;
     try {
       return katex.renderToString(normalizeLatexFormula(latex), { displayMode, throwOnError: false });
     } catch {
@@ -767,7 +799,7 @@
         const end = findClosingDelimiter(text, i, '$$', '$$');
         if (end !== -1) {
           const formula = text.slice(i + 2, end);
-          if (looksLikeLatex(formula)) spans.push({ start: i, end: end + 2, formula, displayMode: true });
+          if (isRenderableLatexFormula(formula, true)) spans.push({ start: i, end: end + 2, formula, displayMode: true });
           i = end + 2;
           continue;
         }
@@ -781,7 +813,7 @@
         }
         if (end !== -1) {
           const formula = text.slice(i + 1, end).trim();
-          if (looksLikeLatex(formula)) spans.push({ start: i, end: end + 1, formula, displayMode: false });
+          if (isRenderableLatexFormula(formula, false)) spans.push({ start: i, end: end + 1, formula, displayMode: false });
           i = end + 1;
           continue;
         }
@@ -791,7 +823,7 @@
         const end = findClosingDelimiter(text, i, '\\(', '\\)');
         if (end !== -1) {
           const formula = text.slice(i + 2, end).trim();
-          if (looksLikeLatex(formula)) spans.push({ start: i, end: end + 2, formula, displayMode: false });
+          if (isRenderableLatexFormula(formula, false)) spans.push({ start: i, end: end + 2, formula, displayMode: false });
           i = end + 2;
           continue;
         }
@@ -801,7 +833,7 @@
         const end = findClosingDelimiter(text, i, '\\[', '\\]');
         if (end !== -1) {
           const formula = text.slice(i + 2, end);
-          if (looksLikeLatex(formula)) spans.push({ start: i, end: end + 2, formula, displayMode: true });
+          if (isRenderableLatexFormula(formula, true)) spans.push({ start: i, end: end + 2, formula, displayMode: true });
           i = end + 2;
           continue;
         }
@@ -861,6 +893,8 @@
   }
 
   function replaceMathRange(span, refs) {
+    if (!isRenderableLatexFormula(span.formula, span.displayMode)) return false;
+
     const startRef = refs[span.start];
     const endRef = refs[span.end - 1];
     if (!startRef || !endRef) return false;
@@ -931,6 +965,82 @@
     });
   }
 
+  function repairProseKatexErrors(root) {
+    root.querySelectorAll('.katex-error').forEach((el) => {
+      const text = el.textContent || '';
+      if (!text || !isProseHeavyLatex(text, true)) return;
+      el.replaceWith(document.createTextNode(text));
+    });
+  }
+
+  function shouldSkipRelaxedMarkdownElement(el) {
+    return !el || el.nodeType !== 1 ||
+      el.closest('.katex') ||
+      el.closest(INTERACTIVE_SELECTOR) ||
+      ['SCRIPT', 'STYLE', 'CODE', 'PRE', 'BUTTON', 'INPUT', 'TEXTAREA', 'STRONG', 'B'].includes(el.tagName);
+  }
+
+  function renderRelaxedBoldInTextNode(textNode) {
+    const text = textNode.textContent || '';
+    if (!text.includes('**')) return false;
+
+    const re = /\*\*\s*([^*\n](?:[^*]|\*(?!\*))*?)\s*\*\*/g;
+    let match;
+    let lastIndex = 0;
+    let changed = false;
+    const fragment = document.createDocumentFragment();
+
+    while ((match = re.exec(text))) {
+      const rawContent = match[1];
+      const content = rawContent.trim();
+      if (!content) continue;
+
+      if (match.index > lastIndex) {
+        fragment.appendChild(document.createTextNode(text.slice(lastIndex, match.index)));
+      }
+
+      const strong = document.createElement('strong');
+      strong.textContent = content;
+      fragment.appendChild(strong);
+      lastIndex = re.lastIndex;
+      changed = true;
+    }
+
+    if (!changed) return false;
+    if (lastIndex < text.length) {
+      fragment.appendChild(document.createTextNode(text.slice(lastIndex)));
+    }
+    textNode.parentNode.replaceChild(fragment, textNode);
+    return true;
+  }
+
+  function renderRelaxedMarkdownBold(root) {
+    const walker = document.createTreeWalker(
+      root,
+      NodeFilter.SHOW_TEXT,
+      {
+        acceptNode: (node) => {
+          const parent = node.parentNode;
+          if (!parent || parent.nodeType !== 1 || shouldSkipRelaxedMarkdownElement(parent)) {
+            return NodeFilter.FILTER_REJECT;
+          }
+          return (node.textContent || '').includes('**')
+            ? NodeFilter.FILTER_ACCEPT
+            : NodeFilter.FILTER_REJECT;
+        }
+      }
+    );
+
+    const nodes = [];
+    let node;
+    while (node = walker.nextNode()) nodes.push(node);
+    nodes.forEach((textNode) => {
+      try {
+        renderRelaxedBoldInTextNode(textNode);
+      } catch (e) {}
+    });
+  }
+
   function renderLaTeX() {
     if (typeof katex === 'undefined') return;
     if (window._claudeRenderingLaTeX) return;
@@ -938,6 +1048,9 @@
 
     try {
       getEnhanceRoots().forEach((root) => {
+        repairProseKatexErrors(root);
+        renderRelaxedMarkdownBold(root);
+
         // Preprocess HTML-based math (handles markup inside $$...$$)
         preprocessHTMLMath(root);
 
@@ -984,6 +1097,7 @@
 
             // $$...$$ block formulas.
             resultHTML = resultHTML.replace(/\$\$([\s\S]+?)\$\$/g, (match, formula) => {
+              if (!isRenderableLatexFormula(formula, true)) return match;
               hasFormula = true;
               try {
                 let fixed = normalizeLatexFormula(formula);
@@ -1000,6 +1114,7 @@
 
             // \(...\) inline formulas.
             resultHTML = resultHTML.replace(/\\\(([\s\S]+?)\\\)/g, (match, formula) => {
+              if (!isRenderableLatexFormula(formula.trim(), false)) return match;
               hasFormula = true;
               try {
                 return katex.renderToString(normalizeLatexFormula(formula.trim()), { displayMode: false, throwOnError: false });
@@ -1010,6 +1125,7 @@
 
             // \[...\] block formulas.
             resultHTML = resultHTML.replace(/\\\[([\s\S]+?)\\\]/g, (match, formula) => {
+              if (!isRenderableLatexFormula(formula, true)) return match;
               hasFormula = true;
               try {
                 return katex.renderToString(normalizeLatexFormula(formula), { displayMode: true, throwOnError: false });
@@ -1022,7 +1138,7 @@
             resultHTML = resultHTML.replace(/\$([\s\S]+?)\$/g, (match, formula) => {
               const content = formula.trim();
               const cleaned = content.replace(/\s+/g, ' ').trim();
-              if (!looksLikeLatex(cleaned)) return match;
+              if (!isRenderableLatexFormula(cleaned, false)) return match;
               hasFormula = true;
               try {
                 const fixed = normalizeLatexFormula(cleaned);
@@ -1039,6 +1155,9 @@
             }
           } catch (e) {}
         });
+
+        repairProseKatexErrors(root);
+        renderRelaxedMarkdownBold(root);
       });
     } finally {
       window._claudeRenderingLaTeX = false;

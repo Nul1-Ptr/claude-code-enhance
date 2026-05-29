@@ -71,6 +71,8 @@ The bundled `enhance.js` also runs inside the webview to improve output styling,
 
 Math inside inline code and fenced code blocks is left as literal text.
 
+The enhancer also repairs relaxed bold markers such as `** content **` in output text. Claude Code's Markdown parser follows CommonMark and leaves those markers visible because of the inner spaces; the enhancer renders them as bold while leaving code, math, and the chat input untouched.
+
 ## Syntax Highlighting
 
 Code blocks are highlighted with bundled Highlight.js when Claude Code includes a fence language such as `python`, `ts`, `bash`, or `latex`. Unlabeled fences are highlighted as `markdown`, with colored prose plus stronger colors for headings, links, code spans, and list markers, without random auto-detection as `java`, `css`, `yaml`, `ini`, or another unrelated language. Markdown emphasis keeps the prose color so technical tokens like `A_B` do not split into mismatched colors.
