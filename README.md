@@ -26,6 +26,113 @@ Enhanced output with Claude Code Enhance:
 
 ![Claude Code Enhance preview](preview/preview.png)
 
+## Usage Guide
+
+### LaTeX Math Rendering
+
+The extension renders LaTeX math in Claude Code's responses using KaTeX. Four delimiter styles are supported:
+
+| Delimiter | Mode | Example |
+|---|---|---|
+| `$...$` | Inline math | `The gradient $\nabla f(x)$ is computed via autodiff.` |
+| `$$...$$` | Display math | `$$\int_0^\infty e^{-x^2} dx = \frac{\sqrt{\pi}}{2}$$` |
+| `\(...\)` | Inline math | `The matrix \(A \in \mathbb{R}^{m \times n}\) has rank \(r\).` |
+| `\[...\]` | Display math | `\[\mathbf{n}_{\text{phys}} = \mathbf{S}^T \cdot \mathbf{n}_{\text{ref}}\]` |
+
+**Display math** renders as a centered, full-width block with a themed background and larger font size (1.6em). **Inline math** renders within the text flow at 1.1em with subtle background shading and rounded corners.
+
+**Smart math detection** — the enhancer uses heuristics to avoid rendering prose text as math. It detects CJK characters, prose punctuation, word density, and markdown emphasis patterns to decide whether a `$...$` span is actually LaTeX. False positives (KaTeX error spans in prose) are automatically cleaned up.
+
+**Standalone math promotion** — when an inline math expression is the only content on its line (or the only content in its paragraph), it is automatically promoted to display math with the full block treatment.
+
+**Large inline math** — inline expressions containing matrices (`\begin{matrix}`), fractions (`\frac`), or square roots (`\sqrt`) that exceed 34px in height or 58% of container width get a special `ce-large-inline-math` class with expanded padding and horizontal scroll.
+
+**LaTeX in HTML** — when Claude Code's markdown parser splits math expressions with HTML tags (e.g., `$a_<em>i</em>$`), the enhancer repairs these by linearizing the DOM and restoring the original LaTeX before rendering.
+
+**Escaped delimiters** — delimiters preceded by an odd number of backslashes (e.g. `\$not math\$`) are left as literal text.
+
+Math inside inline code (`` `...` ``) and fenced code blocks is left as literal text.
+
+### Syntax Highlighting
+
+Code blocks are highlighted with bundled Highlight.js with a custom One Dark / One Light inspired syntax palette:
+
+- **Labeled fences** — `` ```python ``, `` ```typescript ``, `` ```bash ``, `` ```latex `` and more are highlighted with language-specific grammar. Aliases are recognized: `js`→javascript, `ts`→typescript, `py`→python, `sh/bash/shell/zsh`→bash, `yml`→yaml, `md`→markdown, `tex`→latex.
+- **Unlabeled fences** — blocks without a language tag default to `markdown` highlighting with colored prose, stronger heading colors, and distinct link/code/list-marker styles. This avoids the random auto-detection problem where unlabeled code gets guessed as `java`, `css`, `ini`, etc.
+- **Unsupported languages** — blocks with languages Highlight.js does not recognize fall back to plain text styling with a language label instead of throwing errors.
+
+The syntax palette maps 14 semantic token types (keywords, strings, numbers, comments, types, functions, etc.) to theme-aware CSS variables that adapt automatically across light, dark, and high-contrast themes.
+
+### Copy Buttons
+
+Two types of copy buttons are added:
+
+**Per-code-block copy** — each `<pre>` block gets a **Copy** button at the top-right corner. Click copies the code block's raw text content. The button shows "Copied" for 1.4 seconds on success, or "Failed" on error.
+
+**Per-turn copy** — each assistant message turn gets a **Copy** button at the bottom-right corner (visible on hover). Click copies the entire conversation turn as Markdown:
+- KaTeX expressions are converted back to `$...$` or `$$...$$` delimited LaTeX
+- Headings, lists, tables, code blocks, links, blockquotes are preserved as proper Markdown
+- **Thinking content** (reasoning blocks) and **tool use/results** are excluded from the copy
+- User messages are excluded from the copy
+
+### Zoom
+
+Hold **Ctrl** (or **Cmd** on macOS) and scroll with the mouse wheel to zoom the chat output:
+
+- **Zoom range**: 0.5× to 2.0× in 0.1× increments
+- A temporary zoom indicator appears in the center of the screen showing the current level (fades out after 1 second)
+- Zoom level is persisted in `localStorage` under the key `claude-zoom` and survives webview reloads
+- Zoom affects only the chat output (enhancement roots), not the entire webview or the chat input
+
+### Relaxed Bold Rendering
+
+Claude Code's Markdown parser follows CommonMark, which does not recognize bold markers with inner spaces: `** bold text **` appears as literal asterisks. The enhancer detects and renders these as `<strong>` elements. This only applies within prose text — code blocks, math expressions, and the chat input are left unchanged.
+
+### Table Styling
+
+Tables receive theme-aware styling:
+- Full-width layout with 0.95em font size
+- Rounded corners (12px border-radius)
+- Themed background with subtle shadow
+- Header row with distinct background color
+- Zebra striping on alternating rows
+- Row hover highlight
+- Thin themed scrollbar for overflow tables
+- Code within table cells is styled consistently
+
+### Input & Prompt Readability
+
+The enhancer forces VS Code theme colors on the chat input and textarea elements, ensuring:
+- Input text color matches VS Code editor foreground
+- Placeholder text matches VS Code placeholder foreground
+- Caret color matches VS Code editor cursor color
+- Text fill color is explicitly set to prevent CSS specificity issues
+
+### Rich Editor Protection
+
+The chat composer uses `contenteditable` and `[role="textbox"]` elements. The enhancer explicitly resets all code block styling on these elements (borders, padding, background, whitespace) so preview styles do not leak into the editing surface.
+
+### Status Bar Indicator
+
+A status bar item (right-aligned) shows the current state:
+
+| Indicator | Meaning |
+|---|---|
+| `LaTeX` (with operator symbol) | Enhancement patch is active |
+| `LaTeX (off)` | Patch is not applied |
+| `LaTeX (no CC)` | Claude Code extension is not installed |
+
+Click the status bar item to run the status command, which reports the current patch state in detail.
+
+### DOM Inspector (Hidden Debug Tool)
+
+Press **Ctrl+Shift+D** inside the Claude Code webview to dump the DOM structure to your clipboard as JSON. This includes:
+- All unique class names in the document
+- Elements matching 14 message-related selector patterns
+- Root element structure analysis (up to 4 levels deep)
+- Text-containing containers (> 200 characters)
+- A green "Copied" notification confirms success
+
 ## Version
 
 Current local version: `1.0.0`
@@ -82,20 +189,6 @@ $$\tilde{F}_{ij} = \sum_k S^{\xi_i}_k \cdot F_{kj}$$
 ```
 
 The bundled `enhance.js` also runs inside the webview to improve output styling, copy behavior, zoom, tables, code blocks, and fallback math rendering.
-
-Math inside inline code and fenced code blocks is left as literal text.
-
-The enhancer also repairs relaxed bold markers such as `** content **` in output text. Claude Code's Markdown parser follows CommonMark and leaves those markers visible because of the inner spaces; the enhancer renders them as bold while leaving code, math, and the chat input untouched.
-
-## Syntax Highlighting
-
-Code blocks are highlighted with bundled Highlight.js when Claude Code includes a fence language such as `python`, `ts`, `bash`, or `latex`. Unlabeled fences are highlighted as `markdown`, with colored prose plus stronger colors for headings, links, code spans, and list markers, without random auto-detection as `java`, `css`, `yaml`, `ini`, or another unrelated language. Markdown emphasis keeps the prose color so technical tokens like `A_B` do not split into mismatched colors.
-
-The extension applies a common One Dark / One Light inspired syntax palette on top of Highlight.js so keywords, strings, comments, numbers, types, functions, and metadata stay colorful and readable across light, dark, and high-contrast themes.
-
-Each code block also gets its own **Copy** button, separate from the full-response copy button.
-
-Inline math and display math use theme-aware background colors. Display math uses a full-width block similar to code blocks, with a larger centered equation.
 
 ## Theme Behavior
 
@@ -166,4 +259,4 @@ The generated `.vsix` file is ignored by `.vscodeignore`, so rebuilding will not
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE)

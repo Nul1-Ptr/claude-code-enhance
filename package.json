@@ -3,7 +3,7 @@
   "displayName": "Claude Code Enhance",
   "description": "Adds LaTeX math rendering and enhanced output preview controls to Claude Code chat.",
   "version": "1.0.0",
-  "publisher": "local",
+  "publisher": "AlexisHe",
   "license": "MIT",
   "repository": {
     "type": "git",
