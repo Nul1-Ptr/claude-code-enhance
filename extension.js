@@ -14,7 +14,7 @@ const EXTENSION_VERSION = require('./package.json').version;
 const PATCH_VERSION_PREFIX = '/* katex-ext-version: ';
 // Internal patch revision. The package version can stay at 1.0.0 while this
 // changes to force a refresh of already-patched Claude Code webview files.
-const PATCH_BUILD_ID = 'table-pipe-math-protection-2026-05-29';
+const PATCH_BUILD_ID = 'stable-runtime-guards-rich-content-api-readability-2026-06-10';
 const PATCH_BUILD_PREFIX = '/* enhance-patch-build: ';
 
 // Where users report a Claude Code build the patch no longer fits.

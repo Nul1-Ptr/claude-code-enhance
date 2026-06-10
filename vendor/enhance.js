@@ -8,6 +8,41 @@
 
   console.log('[Claude Enhance] Loading...');
 
+  const CONTENT_BASE_FONT_SCALE = 1.10;
+  const warningKeys = new Set();
+
+  function warnOnce(key, error) {
+    if (warningKeys.has(key)) return;
+    warningKeys.add(key);
+    console.warn(`[Claude Enhance] ${key} failed:`, error);
+  }
+
+  function safeRun(key, fn, fallback) {
+    try {
+      return fn();
+    } catch (error) {
+      warnOnce(key, error);
+      return fallback;
+    }
+  }
+
+  function toClassName(value) {
+    if (!value) return '';
+    if (typeof value === 'string') return value;
+    if (typeof value.baseVal === 'string') return value.baseVal;
+    return '';
+  }
+
+  function closestSafe(el, selector) {
+    if (!el || typeof el.closest !== 'function') return null;
+    return safeRun(`closest(${selector})`, () => el.closest(selector), null);
+  }
+
+  function querySelectorAllSafe(root, selector) {
+    if (!root || typeof root.querySelectorAll !== 'function') return [];
+    return safeRun(`querySelectorAll(${selector})`, () => Array.from(root.querySelectorAll(selector)), []);
+  }
+
   // 注入样式
   function injectStyles() {
     const styleId = 'claude-enhance-styles';
@@ -29,6 +64,10 @@
         --ce-success: var(--vscode-testing-iconPassed, var(--vscode-terminal-ansiGreen, #2ea043));
         --ce-math-display-bg: var(--vscode-textCodeBlock-background, var(--ce-code-bg));
         --ce-math-inline-bg: var(--vscode-editorWidget-background, var(--ce-code-bg));
+        --ce-api-error-bg: rgba(248, 81, 73, 0.10);
+        --ce-api-error-border: rgba(248, 81, 73, 0.38);
+        --ce-api-error-title: #ffb4ab;
+        --ce-api-error-pill-bg: rgba(248, 81, 73, 0.08);
         /* One Dark inspired syntax palette. */
         --ce-syntax-fg: #abb2bf;
         --ce-syntax-keyword: #c678dd;
@@ -69,6 +108,10 @@
         --ce-syntax-deletion: #e45649;
         --ce-markdown-text: #34516d;
         --ce-inline-code-fg: var(--ce-syntax-string);
+        --ce-api-error-bg: rgba(207, 34, 46, 0.07);
+        --ce-api-error-border: rgba(207, 34, 46, 0.30);
+        --ce-api-error-title: #b42318;
+        --ce-api-error-pill-bg: rgba(207, 34, 46, 0.06);
       }
 
       body.vscode-high-contrast,
@@ -77,6 +120,10 @@
         --ce-shadow: transparent;
         --ce-math-inline-bg: var(--vscode-editorWidget-background, var(--ce-bg));
         --ce-math-display-bg: var(--vscode-editorWidget-background, var(--ce-bg));
+        --ce-api-error-bg: var(--vscode-editorWidget-background, var(--ce-bg));
+        --ce-api-error-border: var(--vscode-contrastBorder, currentColor);
+        --ce-api-error-title: var(--vscode-editor-foreground, currentColor);
+        --ce-api-error-pill-bg: transparent;
         --ce-syntax-fg: var(--vscode-editor-foreground, currentColor);
         --ce-syntax-comment: var(--vscode-descriptionForeground, var(--vscode-editor-foreground, currentColor));
         --ce-markdown-text: var(--vscode-editor-foreground, currentColor);
@@ -383,6 +430,49 @@
         text-align: initial;
         padding: 0;
       }
+      /* Display math inside tables keeps the equation-block affordance, but
+         sizes to the cell instead of becoming a full transcript-width card. */
+      .claude-enhance-root table :is(td, th) .katex-display {
+        display: block !important;
+        width: fit-content !important;
+        min-width: 0 !important;
+        max-width: 100% !important;
+        min-height: 0 !important;
+        margin: 0.35em 0 !important;
+        padding: 9px 18px !important;
+        padding: clamp(8px, 0.65em, 14px) clamp(16px, 1.35em, 28px) !important;
+        border: 1px solid var(--ce-border) !important;
+        border-radius: 8px !important;
+        background: var(--ce-math-display-bg) !important;
+        box-shadow: 0 1px 4px var(--ce-shadow) !important;
+        clear: none;
+        box-sizing: border-box;
+        vertical-align: middle;
+        overflow-x: auto;
+        overflow-y: hidden;
+        scrollbar-gutter: auto;
+      }
+      .claude-enhance-root table :is(td, th) .katex-display > .katex {
+        font-size: 1.48em !important;
+        line-height: 1.5;
+        max-width: 100%;
+      }
+      .claude-enhance-root table :is(td, th) .katex.ce-large-inline-math {
+        display: inline-flex;
+        max-width: 100%;
+        margin: 0.05em 0;
+        padding: 0.12em 0.24em;
+        border: 0;
+        background: transparent;
+        box-shadow: none;
+        line-height: 1.35;
+      }
+      .claude-enhance-root table :is(td, th) .katex:not(.katex-display > .katex) {
+        font-size: 1.22em;
+        padding: 0.04em 0.12em;
+        background: transparent;
+        box-shadow: none;
+      }
       /* Scrollbar polish (WebKit + Firefox) */
       .katex-display,
       .katex.ce-large-inline-math,
@@ -505,6 +595,65 @@
         border: 1px solid var(--ce-border);
       }
 
+      /* API error cards: summarize Claude API failures instead of exposing a
+         wall of raw validation payload text in the main transcript flow. */
+      .ce-api-error {
+        display: block;
+        margin: 0.85em 0;
+        padding: 12px 14px;
+        border: 1px solid var(--ce-api-error-border);
+        border-radius: 8px;
+        background: var(--ce-api-error-bg);
+        color: var(--ce-fg);
+        box-shadow: 0 1px 5px var(--ce-shadow);
+      }
+      .ce-api-error-title {
+        display: block;
+        font-weight: 700;
+        color: var(--ce-api-error-title);
+        margin-bottom: 6px;
+      }
+      .ce-api-error-summary {
+        display: block;
+        font-size: 0.94em;
+        line-height: 1.45;
+      }
+      .ce-api-error-meta,
+      .ce-api-error-fields {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+        margin-top: 8px;
+      }
+      .ce-api-error-meta span,
+      .ce-api-error-fields code {
+        display: inline-flex;
+        align-items: center;
+        max-width: 100%;
+        padding: 2px 7px;
+        border: 1px solid var(--ce-api-error-border);
+        border-radius: 999px;
+        background: var(--ce-api-error-pill-bg);
+        color: var(--ce-fg);
+        font-size: 0.82em;
+        line-height: 1.4;
+        overflow-wrap: anywhere;
+      }
+      .ce-api-error details {
+        margin-top: 9px;
+      }
+      .ce-api-error summary {
+        cursor: pointer;
+        color: var(--ce-muted);
+        font-size: 0.88em;
+      }
+      .ce-api-error pre {
+        margin: 8px 0 0 !important;
+        max-height: 260px;
+        overflow: auto !important;
+        white-space: pre-wrap !important;
+      }
+
       /* Copy button */
       .claude-copy-btn {
         position: absolute;
@@ -545,7 +694,7 @@
         position: relative;
       }
     `;
-    document.head.appendChild(style);
+    (document.head || document.documentElement || document.body)?.appendChild(style);
   }
 
   // 注入 Highlight.js
@@ -586,14 +735,39 @@
     '[class*="userMessageContainer_"]'
   ].join(',');
 
+  const NON_PREVIEW_SELECTOR = [
+    INTERACTIVE_SELECTOR,
+    USER_MESSAGE_SELECTOR,
+    '[class*="thinking_"]',
+    '[class*="thinkingContent_"]',
+    '[class*="thinkingSummary_"]',
+    '[class*="toolUse_"]',
+    '[class*="toolResult_"]',
+    '[class*="toolBody_"]',
+    '[class*="toolBodyGrid_"]',
+    '[class*="toolBodyRow_"]',
+    '[class*="toolSummary_"]',
+    '.ce-api-error',
+    '[class*="header"]',
+    '[class*="sessionList"]',
+    '[class*="sessionsList"]',
+    '[class*="sessionItem"]',
+    '[class*="sessionName"]'
+  ].join(',');
+
   function isInsideInteractiveSurface(el) {
     const node = el?.nodeType === Node.ELEMENT_NODE ? el : el?.parentElement;
-    return !!node?.closest(INTERACTIVE_SELECTOR);
+    return !!closestSafe(node, INTERACTIVE_SELECTOR);
+  }
+
+  function isInsideNonPreviewRegion(el) {
+    const node = el?.nodeType === Node.ELEMENT_NODE ? el : el?.parentElement;
+    return !!closestSafe(node, NON_PREVIEW_SELECTOR);
   }
 
   function shouldSkipPreviewEnhancement(el) {
     if (!el || el.nodeType !== Node.ELEMENT_NODE) return true;
-    return isInsideInteractiveSurface(el) || !!el.closest(USER_MESSAGE_SELECTOR);
+    return isInsideNonPreviewRegion(el);
   }
 
   // 高亮代码块
@@ -606,16 +780,12 @@
       '.rendered-markdown'
     ].join(',');
 
-    const roots = Array.from(document.querySelectorAll(selectors))
-      .filter((el) => !el.closest([
-        INTERACTIVE_SELECTOR,
-        '[class*="header"]',
-        '[class*="sessionList"]',
-        '[class*="sessionItem"]',
-        '[class*="sessionName"]'
-      ].join(',')));
+    const roots = querySelectorAllSafe(document, selectors)
+      .filter((el) => !closestSafe(el, NON_PREVIEW_SELECTOR));
 
-    const topLevelRoots = roots.filter((el) => !roots.some((other) => other !== el && other.contains(el)));
+    const topLevelRoots = roots.filter((el) => !roots.some((other) => (
+      other !== el && typeof other.contains === 'function' && other.contains(el)
+    )));
     topLevelRoots.forEach((el) => el.classList.add('claude-enhance-root'));
     return topLevelRoots;
   }
@@ -623,22 +793,18 @@
   function highlightAllCode() {
     if (typeof hljs === 'undefined') return;
 
-    getEnhanceRoots().forEach((root) => root.querySelectorAll('pre code').forEach((block) => {
-      if (shouldSkipPreviewEnhancement(block)) return;
-      highlightCodeBlock(block);
-      addCodeBlockCopyButton(block);
-    }));
+    getEnhanceRoots().forEach((root) => {
+      querySelectorAllSafe(root, 'pre code').forEach((block) => {
+        if (shouldSkipPreviewEnhancement(block)) return;
+        safeRun('highlightCodeBlock', () => {
+          highlightCodeBlock(block);
+          addCodeBlockCopyButton(block);
+        });
+      });
+    });
   }
 
   function getCodeLanguage(block) {
-    const candidates = [
-      block.className || '',
-      block.parentElement?.className || '',
-      block.getAttribute('data-language') || '',
-      block.parentElement?.getAttribute('data-language') || ''
-    ].join(' ');
-    const match = candidates.match(/(?:^|\s)(?:language|lang)-([A-Za-z0-9_+#.-]+)/);
-    if (!match) return '';
     const aliases = {
       js: 'javascript',
       jsx: 'javascript',
@@ -653,8 +819,18 @@
       md: 'markdown',
       tex: 'latex'
     };
-    const language = match[1].toLowerCase();
-    return aliases[language] || language;
+    const normalize = (language) => aliases[String(language || '').toLowerCase()] || String(language || '').toLowerCase();
+    const dataLanguage = block.getAttribute('data-language') || block.parentElement?.getAttribute('data-language') || '';
+    if (/^[A-Za-z0-9_+#.-]+$/.test(dataLanguage)) return normalize(dataLanguage);
+
+    const candidates = [
+      toClassName(block.className),
+      toClassName(block.parentElement?.className),
+      dataLanguage
+    ].join(' ');
+    const match = candidates.match(/(?:^|\s)(?:language|lang)-([A-Za-z0-9_+#.-]+)/);
+    if (!match) return '';
+    return normalize(match[1]);
   }
 
   function getCodeFingerprint(text) {
@@ -706,7 +882,7 @@
   function addCodeBlockCopyButton(block) {
     const pre = block?.parentElement;
     if (!pre || pre.tagName !== 'PRE') return;
-    if (pre.querySelector(':scope > .claude-code-copy-btn')) return;
+    if (Array.from(pre.children || []).some((child) => child.classList?.contains('claude-code-copy-btn'))) return;
 
     const btn = document.createElement('button');
     btn.type = 'button';
@@ -749,6 +925,27 @@
       .replace(/\\ (?=[a-zA-Z0-9_{}])/g, '\\\\ ');
   }
 
+  function normalizeDisplayLatexFormula(formula) {
+    return normalizeLatexFormula(formula)
+      .replace(/\\\s*\n/g, '\\\\\n')
+      .replace(/\\\[(\d+(?:\.\d+)?[a-z]*)\]/gi, '\\\\[$1]')
+      .replace(/&\s*\\\[6pt\]/g, '& \\\\')
+      .replace(/\\(sum|prod|int|lim|inf|sup|max|min)\{([^}]+)\}/g, '\\\\$1_{$2}')
+      .replace(/\\operatorname\{(\w+)\}(\()/g, '\\\\operatorname{$1}$2');
+  }
+
+  function normalizeLatexForRender(formula, displayMode) {
+    return displayMode ? normalizeDisplayLatexFormula(formula) : normalizeLatexFormula(formula);
+  }
+
+  function renderLatexHtml(formula, displayMode) {
+    return katex.renderToString(normalizeLatexForRender(formula, displayMode), {
+      displayMode,
+      strict: 'ignore',
+      throwOnError: false
+    });
+  }
+
   function looksLikeLatex(text) {
     const cleaned = text.replace(/\s+/g, ' ').trim();
     return cleaned.length <= 2 || cleaned.includes('\\') ||
@@ -789,7 +986,7 @@
     const latex = /<[^>]+>/.test(fragment) ? htmlFragmentToLatex(fragment) : fragment;
     if (!isRenderableLatexFormula(latex, displayMode)) return fallback;
     try {
-      return katex.renderToString(normalizeLatexFormula(latex), { displayMode, throwOnError: false });
+      return renderLatexHtml(latex, displayMode);
     } catch {
       return fallback;
     }
@@ -909,8 +1106,8 @@
 
   function shouldSkipMathElement(el) {
     return !el || el.nodeType !== 1 ||
-      el.closest('.katex') ||
-      el.closest(INTERACTIVE_SELECTOR) ||
+      closestSafe(el, '.katex') ||
+      isInsideNonPreviewRegion(el) ||
       ['SCRIPT', 'STYLE', 'CODE', 'PRE', 'BUTTON', 'INPUT', 'TEXTAREA'].includes(el.tagName);
   }
 
@@ -964,10 +1161,7 @@
 
     let html;
     try {
-      html = katex.renderToString(normalizeLatexFormula(span.formula), {
-        displayMode: span.displayMode,
-        throwOnError: false
-      });
+      html = renderLatexHtml(span.formula, span.displayMode);
     } catch {
       return false;
     }
@@ -1002,6 +1196,46 @@
     return changed;
   }
 
+  function appendHtmlFragment(target, html) {
+    const wrapper = document.createElement('span');
+    wrapper.innerHTML = html;
+    while (wrapper.firstChild) target.appendChild(wrapper.firstChild);
+  }
+
+  function renderMathInTextNode(textNode) {
+    const text = textNode.textContent || '';
+    const spans = findMathSpans(text);
+    if (!spans.length) return false;
+
+    const fragment = document.createDocumentFragment();
+    let cursor = 0;
+    let changed = false;
+
+    spans.forEach((span) => {
+      if (span.start < cursor) return;
+      if (span.start > cursor) {
+        fragment.appendChild(document.createTextNode(text.slice(cursor, span.start)));
+      }
+
+      try {
+        appendHtmlFragment(fragment, renderLatexHtml(span.formula, span.displayMode));
+        changed = true;
+      } catch {
+        fragment.appendChild(document.createTextNode(text.slice(span.start, span.end)));
+      }
+      cursor = span.end;
+    });
+
+    if (!changed) return false;
+    if (cursor < text.length) {
+      fragment.appendChild(document.createTextNode(text.slice(cursor)));
+    }
+    if (textNode.parentNode) {
+      textNode.parentNode.replaceChild(fragment, textNode);
+    }
+    return true;
+  }
+
   // Preprocess rendered Markdown whose inline math was split by emphasis tags.
   function preprocessHTMLMath(root) {
     const selector = [
@@ -1009,7 +1243,7 @@
       'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
       'div', 'span'
     ].join(',');
-    const candidates = [root, ...root.querySelectorAll(selector)]
+    const candidates = [root, ...querySelectorAllSafe(root, selector)]
       .filter((el) => {
         if (shouldSkipMathElement(el)) return false;
         const text = el.textContent || '';
@@ -1029,7 +1263,7 @@
   }
 
   function repairProseKatexErrors(root) {
-    root.querySelectorAll('.katex-error').forEach((el) => {
+    querySelectorAllSafe(root, '.katex-error').forEach((el) => {
       const text = el.textContent || '';
       if (!text || !isProseHeavyLatex(text, true)) return;
       el.replaceWith(document.createTextNode(text));
@@ -1038,8 +1272,8 @@
 
   function shouldSkipRelaxedMarkdownElement(el) {
     return !el || el.nodeType !== 1 ||
-      el.closest('.katex') ||
-      el.closest(INTERACTIVE_SELECTOR) ||
+      closestSafe(el, '.katex') ||
+      isInsideNonPreviewRegion(el) ||
       ['SCRIPT', 'STYLE', 'CODE', 'PRE', 'BUTTON', 'INPUT', 'TEXTAREA', 'STRONG', 'B'].includes(el.tagName);
   }
 
@@ -1153,25 +1387,45 @@
 
   function meaningfulTextWithoutMath(el) {
     const clone = el.cloneNode(true);
-    clone.querySelectorAll('.katex, .katex-display, script, style, button').forEach((node) => node.remove());
+    querySelectorAllSafe(clone, '.katex, .katex-display, script, style, button').forEach((node) => node.remove());
     return (clone.textContent || '').replace(/[\s\u00a0]+/g, '').trim();
   }
 
   function isOnlyMathInContainer(katexEl) {
-    const container = katexEl.closest('p, li, blockquote, td, th, div, section');
-    if (!container || container === document.body || container.closest(INTERACTIVE_SELECTOR)) return false;
-    const mathNodes = Array.from(container.querySelectorAll('.katex:not(.katex-display .katex)'))
-      .filter((el) => !el.closest('.katex-display'));
+    const container = closestSafe(katexEl, 'p, li, blockquote, td, th, div, section');
+    if (!container || container === document.body || isInsideNonPreviewRegion(container)) return false;
+    const mathNodes = querySelectorAllSafe(container, '.katex:not(.katex-display .katex)')
+      .filter((el) => !closestSafe(el, '.katex-display'));
     if (mathNodes.length !== 1 || mathNodes[0] !== katexEl) return false;
     return meaningfulTextWithoutMath(container) === '';
   }
 
+  function isOnlyMathInTableCell(katexEl) {
+    const cell = closestSafe(katexEl, 'td, th');
+    if (!cell || isInsideNonPreviewRegion(cell)) return false;
+    const mathNodes = querySelectorAllSafe(cell, '.katex:not(.katex-display .katex)')
+      .filter((el) => !closestSafe(el, '.katex-display'));
+    if (mathNodes.length !== 1 || mathNodes[0] !== katexEl) return false;
+    return meaningfulTextWithoutMath(cell) === '';
+  }
+
+  function shouldPromoteInlineMath(katexEl) {
+    if (!katexEl?.parentNode ||
+        closestSafe(katexEl, '.katex-display') ||
+        isInsideNonPreviewRegion(katexEl)) {
+      return false;
+    }
+    return isOnlyMathInTableCell(katexEl) ||
+      hasOnlyStandaloneMathOnLine(katexEl) ||
+      isOnlyMathInContainer(katexEl);
+  }
+
   function promoteStandaloneInlineMath(root) {
-    const candidates = Array.from(root.querySelectorAll('.katex:not(.katex-display .katex)'))
-      .filter((el) => !el.closest('.katex-display') && !el.closest(INTERACTIVE_SELECTOR));
+    const candidates = querySelectorAllSafe(root, '.katex:not(.katex-display .katex)')
+      .filter((el) => !closestSafe(el, '.katex-display') && !isInsideNonPreviewRegion(el));
 
     candidates.forEach((katexEl) => {
-      if (!katexEl.parentNode || (!hasOnlyStandaloneMathOnLine(katexEl) && !isOnlyMathInContainer(katexEl))) return;
+      if (!shouldPromoteInlineMath(katexEl)) return;
 
       const display = document.createElement('span');
       display.className = 'katex-display';
@@ -1181,12 +1435,12 @@
   }
 
   function isLargeInlineMath(katexEl) {
-    if (katexEl.querySelector('.mtable, .mfrac, .sqrt')) return true;
+    if (querySelectorAllSafe(katexEl, '.mtable, .mfrac, .sqrt').length) return true;
 
     const rect = katexEl.getBoundingClientRect();
     if (!rect.width && !rect.height) return false;
 
-    const container = katexEl.closest('p, li, blockquote, td, th, div, section') || katexEl.parentElement;
+    const container = closestSafe(katexEl, 'p, li, blockquote, td, th, div, section') || katexEl.parentElement;
     const containerWidth = container?.getBoundingClientRect?.().width || window.innerWidth || 0;
     const wideInlineLimit = containerWidth ? Math.min(360, containerWidth * 0.58) : 360;
 
@@ -1194,12 +1448,269 @@
   }
 
   function adaptInlineMathSize(root) {
-    const candidates = Array.from(root.querySelectorAll('.katex'))
-      .filter((el) => !el.closest('.katex-display') && !el.closest(INTERACTIVE_SELECTOR));
+    const candidates = querySelectorAllSafe(root, '.katex')
+      .filter((el) => !closestSafe(el, '.katex-display') && !isInsideNonPreviewRegion(el));
 
     candidates.forEach((katexEl) => {
       katexEl.classList.toggle('ce-large-inline-math', isLargeInlineMath(katexEl));
     });
+  }
+
+  function singleLineText(value) {
+    return String(value || '').replace(/\s+/g, ' ').trim();
+  }
+
+  function apiErrorSummary(text, status) {
+    const validationMatch = text.match(/(\d+)\s+request validation errors?/i);
+    if (validationMatch) return `${validationMatch[1]} request validation errors`;
+
+    let summary = text.replace(/^API Error:\s*\d+\s*/i, '').trim();
+    summary = summary.replace(/\s*\(request id:\s*[^)]+\)/i, '').trim();
+    summary = summary.replace(/\.{2,}/g, '.');
+    if (status && summary.startsWith(String(status))) {
+      summary = summary.slice(String(status).length).trim();
+    }
+    return summary.length <= 220 ? summary : summary.slice(0, 217).trimEnd() + '...';
+  }
+
+  function extractApiErrorTextFields(text) {
+    const fields = [];
+    const keyRe = /['"]text['"]\s*:/g;
+    let match;
+
+    while ((match = keyRe.exec(text))) {
+      let i = keyRe.lastIndex;
+      while (i < text.length && /\s/.test(text[i])) i++;
+      const quote = text[i];
+      if (quote !== '"' && quote !== "'") continue;
+
+      i++;
+      let value = '';
+      let escaped = false;
+      for (; i < text.length; i++) {
+        const ch = text[i];
+        if (escaped) {
+          if (ch === 'n') value += '\n';
+          else if (ch === 'r') value += '\r';
+          else if (ch === 't') value += '\t';
+          else value += ch;
+          escaped = false;
+          continue;
+        }
+        if (ch === '\\') {
+          escaped = true;
+          continue;
+        }
+        if (ch === quote) break;
+        value += ch;
+      }
+      if (value.trim()) fields.push(value);
+      keyRe.lastIndex = i + 1;
+    }
+
+    return fields;
+  }
+
+  function parseApiErrorText(text) {
+    const raw = String(text || '').trim();
+    if (!raw.startsWith('API Error:')) return null;
+
+    const statusMatch = raw.match(/^API Error:\s*(\d+)/i);
+    const status = statusMatch ? statusMatch[1] : '';
+    const requestIdMatch = raw.match(/request id:\s*([^)]+)/i);
+    const expectedFormatMatch = raw.match(/Expected format:\s*(.+?)\./i);
+    const gatewayMatch = raw.match(/inference gateway\s*\(([^)]+)\)/i);
+    const fields = [];
+    const fieldRe = /field:\s*'?([^,'\n]+)'?/gi;
+    let fieldMatch;
+    while ((fieldMatch = fieldRe.exec(raw))) {
+      const field = fieldMatch[1].trim();
+      if (field && !fields.includes(field)) fields.push(field);
+    }
+
+    return {
+      status,
+      summary: apiErrorSummary(raw, status),
+      requestId: requestIdMatch ? requestIdMatch[1].trim() : '',
+      expectedFormat: expectedFormatMatch ? expectedFormatMatch[1].trim() : '',
+      gateway: gatewayMatch ? gatewayMatch[1].trim() : '',
+      fields,
+      textFields: extractApiErrorTextFields(raw),
+      raw,
+    };
+  }
+
+  function appendTextElement(parent, tagName, className, text) {
+    const el = document.createElement(tagName);
+    if (className) el.className = className;
+    el.textContent = text;
+    parent.appendChild(el);
+    return el;
+  }
+
+  function appendPills(parent, className, values) {
+    const cleanValues = values.map(singleLineText).filter(Boolean);
+    if (!cleanValues.length) return;
+    const wrap = document.createElement('span');
+    wrap.className = className;
+    cleanValues.forEach((value) => appendTextElement(wrap, 'span', '', value));
+    parent.appendChild(wrap);
+  }
+
+  function appendDetails(parent, summaryText, bodyText) {
+    if (!String(bodyText || '').trim()) return;
+    const details = document.createElement('details');
+    const summary = document.createElement('summary');
+    summary.textContent = summaryText;
+    const pre = document.createElement('pre');
+    pre.textContent = bodyText;
+    details.appendChild(summary);
+    details.appendChild(pre);
+    parent.appendChild(details);
+  }
+
+  function createApiErrorCard(info) {
+    const card = document.createElement('span');
+    card.className = 'ce-api-error';
+    appendTextElement(card, 'span', 'ce-api-error-title', `API Error ${info.status}`.trim());
+    appendTextElement(card, 'span', 'ce-api-error-summary', info.summary || 'Claude API error');
+
+    appendPills(card, 'ce-api-error-meta', [
+      info.status ? `Status ${info.status}` : '',
+      info.requestId ? `Request ${info.requestId}` : '',
+      info.expectedFormat ? `Expected ${info.expectedFormat}` : '',
+      info.gateway ? `Gateway ${info.gateway}` : '',
+    ]);
+
+    if (info.fields.length) {
+      const fieldsWrap = document.createElement('span');
+      fieldsWrap.className = 'ce-api-error-fields';
+      info.fields.forEach((field) => appendTextElement(fieldsWrap, 'code', '', field));
+      card.appendChild(fieldsWrap);
+    }
+
+    appendDetails(card, 'Show message text fields', info.textFields.join('\n\n'));
+    appendDetails(card, 'Show raw API error', info.raw);
+    return card;
+  }
+
+  function textForApiErrorParse(el) {
+    return (el?.innerText || el?.textContent || '').replace(/\u00a0/g, ' ').trim();
+  }
+
+  function canContainWholeApiError(el) {
+    if (!el || el.nodeType !== Node.ELEMENT_NODE) return false;
+    const tag = el.tagName;
+    if (tag === 'BODY' || tag === 'HTML' || tag === 'SCRIPT' || tag === 'STYLE') return false;
+
+    const className = toClassName(el.className);
+    if (className.includes('messagesContainer') ||
+        className.includes('sessionsList') ||
+        className.includes('sessionItem') ||
+        className.includes('timelineMessage') ||
+        className.includes('toolUse') ||
+        className.includes('toolResult') ||
+        className.includes('thinking')) {
+      return false;
+    }
+    return !closestSafe(el, '.ce-api-error') && !isInsideNonPreviewRegion(el);
+  }
+
+  function parseApiErrorFromElement(el) {
+    const text = textForApiErrorParse(el);
+    const start = text.indexOf('API Error:');
+    if (start === -1) return null;
+
+    const prefix = text.slice(0, start).replace(/[•·]/g, '').trim();
+    if (prefix) return null;
+    return parseApiErrorText(text.slice(start));
+  }
+
+  function findApiErrorContainer(textNode, root) {
+    let best = null;
+    for (let el = textNode?.parentElement; el && el !== document.body; el = el.parentElement) {
+      if (root && el !== root && !root.contains(el)) break;
+      if (!canContainWholeApiError(el)) continue;
+
+      const info = parseApiErrorFromElement(el);
+      if (!info) {
+        if (best) break;
+        continue;
+      }
+
+      best = { el, info };
+      const className = toClassName(el.className);
+      if (className.includes('rendered-markdown') ||
+          className.includes('messageContent') ||
+          className.includes('assistantMessage')) {
+        break;
+      }
+    }
+    return best;
+  }
+
+  function replaceElementWithApiErrorCard(el, info) {
+    if (!el || querySelectorAllSafe(el, ':scope > .ce-api-error').length) return;
+    const card = createApiErrorCard(info);
+    el.replaceChildren(card);
+    el.setAttribute('data-ce-api-error-rendered', 'true');
+  }
+
+  function renderApiErrors() {
+    getEnhanceRoots().forEach((root) => safeRun('renderApiErrors root', () => {
+      const walker = document.createTreeWalker(
+        root,
+        NodeFilter.SHOW_TEXT,
+        {
+          acceptNode: (node) => {
+            const parent = node.parentNode;
+            if (!parent || parent.nodeType !== 1) return NodeFilter.FILTER_REJECT;
+            if (closestSafe(parent, '.ce-api-error') ||
+                isInsideNonPreviewRegion(parent) ||
+                ['SCRIPT', 'STYLE', 'CODE', 'PRE', 'BUTTON', 'INPUT', 'TEXTAREA'].includes(parent.tagName)) {
+              return NodeFilter.FILTER_REJECT;
+            }
+            return (node.textContent || '').includes('API Error:')
+              ? NodeFilter.FILTER_ACCEPT
+              : NodeFilter.FILTER_REJECT;
+          }
+        }
+      );
+
+      const nodes = [];
+      let node;
+      while (node = walker.nextNode()) nodes.push(node);
+
+      const containerJobs = new Map();
+      const fallbackNodes = [];
+
+      nodes.forEach((textNode) => safeRun('renderApiError collect', () => {
+        const container = findApiErrorContainer(textNode, root);
+        if (container) {
+          containerJobs.set(container.el, container.info);
+        } else {
+          fallbackNodes.push(textNode);
+        }
+      }));
+
+      containerJobs.forEach((info, el) => safeRun('renderApiError container', () => {
+        replaceElementWithApiErrorCard(el, info);
+      }));
+
+      fallbackNodes.forEach((textNode) => safeRun('renderApiError text', () => {
+        if (!textNode.parentNode || closestSafe(textNode.parentNode, '.ce-api-error')) return;
+        const text = textNode.textContent || '';
+        const start = text.indexOf('API Error:');
+        if (start === -1) return;
+        const info = parseApiErrorText(text.slice(start));
+        if (!info) return;
+
+        const fragment = document.createDocumentFragment();
+        if (start > 0) fragment.appendChild(document.createTextNode(text.slice(0, start)));
+        fragment.appendChild(createApiErrorCard(info));
+        textNode.parentNode?.replaceChild(fragment, textNode);
+      }));
+    }));
   }
 
   function renderLaTeX() {
@@ -1208,7 +1719,7 @@
     window._claudeRenderingLaTeX = true;
 
     try {
-      getEnhanceRoots().forEach((root) => {
+      getEnhanceRoots().forEach((root) => safeRun('renderLaTeX root', () => {
         repairProseKatexErrors(root);
         renderRelaxedMarkdownBold(root);
         promoteStandaloneInlineMath(root);
@@ -1224,14 +1735,10 @@
             acceptNode: (node) => {
               const parent = node.parentNode;
               if (!parent || parent.nodeType !== 1) return NodeFilter.FILTER_REJECT;
-              // Skip rendered KaTeX, controls, and session/navigation UI.
+              // Skip rendered KaTeX, controls, tool/user output, and session/navigation UI.
               if (parent.classList?.contains('katex') ||
-                  parent.closest('.katex') ||
-                  parent.closest(INTERACTIVE_SELECTOR) ||
-                  parent.closest('[class*="header"]') ||
-                  parent.closest('[class*="sessionsList"]') ||
-                  parent.closest('[class*="sessionItem"]') ||
-                  parent.closest('[class*="sessionName"]') ||
+                  closestSafe(parent, '.katex') ||
+                  isInsideNonPreviewRegion(parent) ||
                   ['SCRIPT', 'STYLE', 'CODE', 'PRE', 'BUTTON', 'INPUT', 'TEXTAREA'].includes(parent.tagName)) {
                 return NodeFilter.FILTER_REJECT;
               }
@@ -1253,77 +1760,14 @@
         nodesToRender.forEach((textNode) => {
           const text = textNode.textContent;
           if (!text || !text.trim()) return;
-
-          try {
-            let resultHTML = text;
-            let hasFormula = false;
-
-            // $$...$$ block formulas.
-            resultHTML = resultHTML.replace(/\$\$([\s\S]+?)\$\$/g, (match, formula) => {
-              if (!isRenderableLatexFormula(formula, true)) return match;
-              hasFormula = true;
-              try {
-                let fixed = normalizeLatexFormula(formula);
-                fixed = fixed.replace(/\\\s*\n/g, '\\\\\n');
-                fixed = fixed.replace(/\\\[(\d+(?:\.\d+)?[a-z]*)\]/gi, '\\\\[$1]');
-                fixed = fixed.replace(/&\s*\\\[6pt\]/g, '& \\\\');
-                fixed = fixed.replace(/\\(sum|prod|int|lim|inf|sup|max|min)\{([^}]+)\}/g, '\\\\$1_{$2}');
-                fixed = fixed.replace(/\\operatorname\{(\w+)\}(\()/g, '\\\\operatorname{$1}$2');
-                return katex.renderToString(fixed, { displayMode: true, throwOnError: false });
-              } catch {
-                return match;
-              }
-            });
-
-            // \(...\) inline formulas.
-            resultHTML = resultHTML.replace(/\\\(([\s\S]+?)\\\)/g, (match, formula) => {
-              if (!isRenderableLatexFormula(formula.trim(), false)) return match;
-              hasFormula = true;
-              try {
-                return katex.renderToString(normalizeLatexFormula(formula.trim()), { displayMode: false, throwOnError: false });
-              } catch {
-                return match;
-              }
-            });
-
-            // \[...\] block formulas.
-            resultHTML = resultHTML.replace(/\\\[([\s\S]+?)\\\]/g, (match, formula) => {
-              if (!isRenderableLatexFormula(formula, true)) return match;
-              hasFormula = true;
-              try {
-                return katex.renderToString(normalizeLatexFormula(formula), { displayMode: true, throwOnError: false });
-              } catch {
-                return match;
-              }
-            });
-
-            // $...$ inline formulas.
-            resultHTML = resultHTML.replace(/\$([\s\S]+?)\$/g, (match, formula) => {
-              const content = formula.trim();
-              const cleaned = content.replace(/\s+/g, ' ').trim();
-              if (!isRenderableLatexFormula(cleaned, false)) return match;
-              hasFormula = true;
-              try {
-                const fixed = normalizeLatexFormula(cleaned);
-                return katex.renderToString(fixed, { displayMode: false, throwOnError: false });
-              } catch {
-                return match;
-              }
-            });
-
-            if (hasFormula && resultHTML !== text && resultHTML.includes('katex')) {
-              const span = document.createElement('span');
-              span.innerHTML = resultHTML;
-              textNode.parentNode.replaceChild(span, textNode);
-            }
-          } catch (e) {}
+          safeRun('renderMathInTextNode', () => renderMathInTextNode(textNode));
         });
 
         repairProseKatexErrors(root);
         renderRelaxedMarkdownBold(root);
         promoteStandaloneInlineMath(root);
         adaptInlineMathSize(root);
-      });
+      }));
     } finally {
       window._claudeRenderingLaTeX = false;
     }
@@ -1350,7 +1794,7 @@
   // 检查元素是否应该被排除
   function shouldExclude(element) {
     if (!element || !element.className) return false;
-    const className = typeof element.className === 'string' ? element.className : '';
+    const className = toClassName(element.className);
     return EXCLUDE_PREFIXES.some(prefix => className.includes(prefix));
   }
 
@@ -1388,7 +1832,7 @@
 
       // KaTeX 公式处理
       if (tag === 'SPAN' && node.classList?.contains('katex')) {
-        const annotation = node.querySelector('annotation[encoding="application/x-tex"]');
+        const annotation = querySelectorAllSafe(node, 'annotation[encoding="application/x-tex"]')[0];
         if (annotation) {
           const tex = annotation.textContent;
           // 清理换行和多余空格, 保持单行 (Obsidian 兼容)
@@ -1426,8 +1870,8 @@
           return `\`${childrenContent}\``;
 
         case 'PRE': {
-          const codeEl = node.querySelector('code');
-          const lang = codeEl?.className?.match(/language-(\w+)/)?.[1] || '';
+          const codeEl = querySelectorAllSafe(node, 'code')[0];
+          const lang = toClassName(codeEl?.className).match(/language-([A-Za-z0-9_+#.-]+)/)?.[1] || '';
           const content = codeEl ? codeEl.textContent : node.textContent;
           return `\`\`\`${lang}\n${content}\n\`\`\``;
         }
@@ -1443,7 +1887,7 @@
             .filter(c => c.tagName === 'LI')
             .map(li => {
               const text = li.textContent.trim();
-              const nested = li.querySelector('ul, ol');
+              const nested = querySelectorAllSafe(li, 'ul, ol')[0];
               if (nested) {
                 const nestedMd = traverse(nested, {});
                 return `- ${text.replace(nested.textContent.trim(), '').trim()}\n  ${nestedMd}`;
@@ -1470,11 +1914,11 @@
           return childrenContent.trim();
 
         case 'TABLE': {
-          const rows = node.querySelectorAll('tr');
+          const rows = querySelectorAllSafe(node, 'tr');
           if (rows.length === 0) return '';
           let result = '';
           rows.forEach((row, rowIdx) => {
-            const cells = row.querySelectorAll('th, td');
+            const cells = querySelectorAllSafe(row, 'th, td');
             const cellTexts = Array.from(cells).map(c =>
               c.textContent.trim().replace(/\|/g, '\\|')
             );
@@ -1504,24 +1948,24 @@
     }
 
     // 执行转换并紧凑化换行
-    return traverse(element)
+    return safeRun('htmlToMarkdown', () => traverse(element)
       .replace(/\n{3,}/g, '\n\n')      // 3+ 个换行 → 最多1个空行
       .replace(/^\n+/, '')             // 移除开头换行
       .replace(/\n+$/, '')             // 移除末尾换行
       .replace(/[ \t]+$/gm, '')        // 移除行尾空格
-      .trim();
+      .trim(), '');
   }
 
   // 按轮次分组消息
   function groupMessagesByTurn() {
-    const container = document.querySelector('[class*="messagesContainer_"]');
+    const container = querySelectorAllSafe(document, '[class*="messagesContainer_"]')[0];
     if (!container) return [];
 
     const turns = [];
     let currentTurn = [];
 
     for (const child of container.children) {
-      const className = child.className || '';
+      const className = toClassName(child.className);
 
       if (className.includes('userMessage')) {
         if (currentTurn.length > 0) {
@@ -1542,7 +1986,8 @@
 
   // 为消息添加复制按钮
   function addCopyButton(messageEl) {
-    if (messageEl.querySelector('.claude-copy-btn')) return;
+    if (!messageEl || messageEl.nodeType !== 1 || shouldSkipPreviewEnhancement(messageEl)) return;
+    if (querySelectorAllSafe(messageEl, '.claude-copy-btn').length) return;
 
     const btn = document.createElement('button');
     btn.className = 'claude-copy-btn';
@@ -1552,14 +1997,14 @@
     btn.addEventListener('click', async (e) => {
       e.stopPropagation();
 
-      // 获取整轮消息
-      const turnMessages = messageEl._turnMessages || [messageEl];
-
-      // 合并所有消息的 Markdown 内容
-      const contents = turnMessages.map(msg => htmlToMarkdown(msg)).filter(c => c.trim());
-      const finalContent = contents.join('\n\n');
-
       try {
+        // 获取整轮消息
+        const turnMessages = messageEl._turnMessages || [messageEl];
+
+        // 合并所有消息的 Markdown 内容
+        const contents = turnMessages.map(msg => htmlToMarkdown(msg)).filter(c => c.trim());
+        const finalContent = contents.join('\n\n');
+        if (!navigator.clipboard?.writeText) throw new Error('Clipboard API is unavailable');
         await navigator.clipboard.writeText(finalContent);
         btn.textContent = '已复制';
         btn.classList.add('copied');
@@ -1590,15 +2035,23 @@
       // 存储整轮消息的引用
       lastMessage._turnMessages = turnMessages;
 
-      addCopyButton(lastMessage);
+      safeRun('addCopyButton', () => addCopyButton(lastMessage));
     });
   }
 
   // ========== 滚轮缩放功能 ==========
 
+  function getStoredZoom() {
+    const zoom = safeRun('read zoom', () => parseFloat(localStorage.getItem('claude-zoom') || '1.0'), 1.0);
+    return Number.isFinite(zoom) ? zoom : 1.0;
+  }
+
+  function setStoredZoom(zoom) {
+    safeRun('write zoom', () => localStorage.setItem('claude-zoom', zoom.toString()));
+  }
+
   function setupZoom() {
-    let zoom = parseFloat(localStorage.getItem('claude-zoom') || '1.0');
-    if (!Number.isFinite(zoom)) zoom = 1.0;
+    let zoom = getStoredZoom();
     applyContentZoom(zoom);
 
     document.addEventListener('wheel', (e) => {
@@ -1607,16 +2060,18 @@
         const delta = e.deltaY > 0 ? -0.1 : 0.1;
         zoom = Math.max(0.5, Math.min(2.0, zoom + delta));
         applyContentZoom(zoom);
-        localStorage.setItem('claude-zoom', zoom.toString());
+        setStoredZoom(zoom);
         showZoomIndicator(zoom);
       }
     }, { passive: false });
   }
 
   function applyContentZoom(zoom) {
+    if (!document.body) return;
     document.body.style.zoom = '';
+    const effectiveZoom = Number.isFinite(zoom) ? zoom * CONTENT_BASE_FONT_SCALE : CONTENT_BASE_FONT_SCALE;
     getEnhanceRoots().forEach((root) => {
-      root.style.fontSize = `${zoom}em`;
+      root.style.fontSize = `${effectiveZoom}em`;
     });
   }
 
@@ -1635,7 +2090,7 @@
         box-shadow: 0 2px 10px rgba(0,0,0,0.18);
         pointer-events: none;
       `;
-      document.body.appendChild(indicator);
+      (document.body || document.documentElement)?.appendChild(indicator);
     }
     indicator.textContent = `缩放: ${Math.round(zoom * 100)}%`;
     indicator.style.display = 'block';
@@ -1649,51 +2104,62 @@
 
   // DOM 监听 - 防抖处理, 避免输出过程中抽搐
   function setupObserver() {
+    if (typeof MutationObserver === 'undefined' || !document.body) return;
     let debounceTimer = null;
     const DEBOUNCE_DELAY = 500; // 等待 500ms 无变化后再渲染
 
     const observer = new MutationObserver((mutations) => {
-      // 跳过我们自己添加的元素
-      let hasRealChange = false;
-      for (const m of mutations) {
-        if (isInsideInteractiveSurface(m.target)) continue;
-
-        for (const node of m.addedNodes) {
-          if (node.nodeType === 1) {
-            const cls = node.className?.toString() || '';
-            if (isInsideInteractiveSurface(node)) continue;
-
-            if (
-              !cls.includes('hljs') &&
-              !cls.includes('katex') &&
-              !cls.includes('zoom-indicator') &&
-              !cls.includes('claude-code-copy-btn') &&
-              !cls.includes('claude-copy-btn')
-            ) {
+      safeRun('mutation observer', () => {
+        // 跳过我们自己添加的元素
+        let hasRealChange = false;
+        for (const m of mutations) {
+          if (isInsideNonPreviewRegion(m.target)) continue;
+          if (m.type === 'characterData') {
+            const text = m.target?.textContent || '';
+            if (text.trim() && (text.includes('$') || text.includes('\\(') || text.includes('\\[') || text.includes('**'))) {
               hasRealChange = true;
-              break;
             }
           }
+
+          for (const node of m.addedNodes) {
+            if (node.nodeType === Node.TEXT_NODE) {
+              const text = node.textContent || '';
+              if (text.trim() && !isInsideNonPreviewRegion(node)) {
+                hasRealChange = true;
+                break;
+              }
+              continue;
+            }
+            if (node.nodeType === Node.ELEMENT_NODE) {
+              const cls = toClassName(node.className);
+              if (isInsideNonPreviewRegion(node)) continue;
+
+              if (
+                !cls.includes('hljs') &&
+                !cls.includes('katex') &&
+                !cls.includes('zoom-indicator') &&
+                !cls.includes('claude-code-copy-btn') &&
+                !cls.includes('claude-copy-btn')
+              ) {
+                hasRealChange = true;
+                break;
+              }
+            }
+          }
+          if (hasRealChange) break;
         }
-        if (hasRealChange) break;
-      }
 
-      if (!hasRealChange) return;
+        if (!hasRealChange) return;
 
-      // 清除之前的定时器, 重新计时
-      if (debounceTimer) clearTimeout(debounceTimer);
+        // 清除之前的定时器, 重新计时
+        if (debounceTimer) clearTimeout(debounceTimer);
 
-      // 等待输出稳定后再渲染
-      debounceTimer = setTimeout(() => {
-        highlightAllCode();
-        renderLaTeX();
-        scanAndAddCopyButtons();
-        const zoom = parseFloat(localStorage.getItem('claude-zoom') || '1.0');
-        if (Number.isFinite(zoom)) applyContentZoom(zoom);
-      }, DEBOUNCE_DELAY);
+        // 等待输出稳定后再渲染
+        debounceTimer = setTimeout(runEnhancementCycle, DEBOUNCE_DELAY);
+      });
     });
 
-    observer.observe(document.body, { childList: true, subtree: true });
+    observer.observe(document.body, { childList: true, subtree: true, characterData: true });
   }
 
   // DOM 探测工具 - 按 Ctrl+Shift+D 导出 DOM 结构
@@ -1720,9 +2186,10 @@
     };
 
     // 收集所有类名
-    document.querySelectorAll('*').forEach(el => {
-      if (el.className && typeof el.className === 'string') {
-        el.className.split(/\s+/).forEach(cls => {
+    querySelectorAllSafe(document, '*').forEach(el => {
+      const className = toClassName(el.className);
+      if (className) {
+        className.split(/\s+/).forEach(cls => {
           if (cls) result.allClassNames.add(cls);
         });
       }
@@ -1744,12 +2211,12 @@
 
     messagePatterns.forEach(selector => {
       try {
-        const elements = document.querySelectorAll(selector);
+        const elements = querySelectorAllSafe(document, selector);
         if (elements.length > 0) {
           result.potentialMessageSelectors.push({
             selector,
             count: elements.length,
-            sampleClasses: Array.from(elements).slice(0, 3).map(el => el.className)
+            sampleClasses: Array.from(elements).slice(0, 3).map(el => toClassName(el.className))
           });
         }
       } catch (e) {}
@@ -1763,14 +2230,14 @@
 
     // 查找包含大量文本的容器
     const textContainers = [];
-    document.querySelectorAll('div, section, article').forEach(el => {
+    querySelectorAllSafe(document, 'div, section, article').forEach(el => {
       const text = el.innerText || '';
       if (text.length > 200 && text.length < 50000) {
         const children = el.children.length;
         if (children < 50) {
           textContainers.push({
             tag: el.tagName,
-            className: el.className,
+            className: toClassName(el.className),
             textLength: text.length,
             childCount: children,
             preview: text.substring(0, 100) + '...'
@@ -1785,6 +2252,11 @@
 
     // 复制到剪贴板
     const output = JSON.stringify(result, null, 2);
+    if (!navigator.clipboard?.writeText) {
+      console.log('[Claude Enhance] DOM Structure:\n', output);
+      showNotification('复制失败, 请查看控制台 (F12)');
+      return;
+    }
     navigator.clipboard.writeText(output).then(() => {
       showNotification('DOM 结构已复制到剪贴板! 请粘贴给 Claude 分析~');
       console.log('[Claude Enhance] DOM structure copied to clipboard');
@@ -1801,7 +2273,7 @@
 
     const info = {
       tag: el.tagName,
-      className: el.className || null,
+      className: toClassName(el.className) || null,
       id: el.id || null,
       childCount: el.children.length
     };
@@ -1841,7 +2313,7 @@
         border: 1px solid var(--vscode-testing-iconPassed, var(--vscode-terminal-ansiGreen, #2ea043));
         box-shadow: 0 4px 20px rgba(0,0,0,0.22);
       `;
-      document.body.appendChild(notification);
+      (document.body || document.documentElement)?.appendChild(notification);
     }
     notification.textContent = message;
     notification.style.display = 'block';
@@ -1852,18 +2324,39 @@
     }, 2000);
   }
 
+  function runEnhancementCycle() {
+    safeRun('renderApiErrors', renderApiErrors);
+    safeRun('highlightAllCode', highlightAllCode);
+    safeRun('renderLaTeX', renderLaTeX);
+    safeRun('scanAndAddCopyButtons', scanAndAddCopyButtons);
+    safeRun('applyContentZoom', () => applyContentZoom(getStoredZoom()));
+  }
+
   // 初始化
   function init() {
     console.log('[Claude Enhance] Initializing...');
-    injectStyles();
-    injectHighlightJS();
-    injectKaTeX();
-    setupZoom();
-    setupObserver();
-    setupDOMInspector();
-    highlightAllCode();
-    renderLaTeX();
-    scanAndAddCopyButtons();
+    safeRun('injectStyles', injectStyles);
+    safeRun('injectHighlightJS', injectHighlightJS);
+    safeRun('injectKaTeX', injectKaTeX);
+    safeRun('setupZoom', setupZoom);
+    safeRun('setupObserver', setupObserver);
+    safeRun('setupDOMInspector', setupDOMInspector);
+    runEnhancementCycle();
+  }
+
+  if (window.__CLAUDE_ENHANCE_TEST_MODE__) {
+    window.__CLAUDE_ENHANCE_TEST_API__ = {
+      findMathSpans,
+      getCodeLanguage,
+      hasMarkdownUnderscoreEmphasis,
+      parseApiErrorText,
+      isProseHeavyLatex,
+      isRenderableLatexFormula,
+      looksLikeLatex,
+      normalizeLatexForRender,
+      renderLatexHtml,
+    };
+    return;
   }
 
   if (document.readyState === 'loading') {

@@ -53,7 +53,9 @@
     ]
   },
   "scripts": {
-    "test": "node scripts/smoke-test.js",
+    "test": "node scripts/smoke-test.js && node scripts/rich-content-regression.js",
+    "test:smoke": "node scripts/smoke-test.js",
+    "test:rich": "node scripts/rich-content-regression.js",
     "package": "npx --yes @vscode/vsce package --no-dependencies --allow-missing-repository",
     "restore": "node ./uninstall-hook.js",
     "vscode:uninstall": "node ./uninstall-hook.js"
