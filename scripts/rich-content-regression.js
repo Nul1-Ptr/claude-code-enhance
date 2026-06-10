@@ -146,6 +146,15 @@ function readJsonlApiErrorTexts(filePath) {
     });
 }
 
+const embeddedVllmApiErrors = [
+  [
+    "API Error: 400 2 request validation errors:",
+    "Input should be a valid string, field: 'messages[44].***.str', value: [{'text': '<system-reminder>\\nThe following skills are available for use with the Skill tool:\\n</system-reminder>\\n', 'type': 'text'}, {'text': 'with more details\\n', 'type': 'text'}, {'text': 'explain the pagedattention kernel with more details\\n', 'type': 'text'}, {'text': 'explain the pagedattention kernel with more details\\n', 'type': 'text'}, {'text': 'explain the pagedattention kernel with more details\\n', 'type': 'text'}, {'cache_control': {'type': 'ephemeral'}, 'text': 'explain the pagedattention kernel with more details', 'type': 'text'}];",
+    "Extra inputs are not permitted, field: 'messages[44].***.list[ChatMessageContent][5].cache_control'",
+  ].join(' '),
+  "API Error: 500 unable to detect request format. Expected format: ['openai_chat']. Please verify your request body structure matches the expected format. (request id: 20260522104820321990707cF0CdM5Q). This is a server-side issue, usually temporary - try again in a moment. If it persists, check your inference gateway (elysia.h-e.top).",
+];
+
 const api = createEnhanceTestApi();
 
 const apiErrorText = [
@@ -169,8 +178,10 @@ const vllmApiErrorFile = path.join(
   '-home-hzl-Disk-Git-repos-vllm',
   '834578ed-2fc6-4919-a2bf-9ecb255f6a98.jsonl'
 );
-const vllmApiErrors = readJsonlApiErrorTexts(vllmApiErrorFile);
-assert(vllmApiErrors.length >= 1, 'vLLM history fixture should include API errors');
+const vllmApiErrors = [
+  ...embeddedVllmApiErrors,
+  ...readJsonlApiErrorTexts(vllmApiErrorFile),
+];
 const validationApiError = vllmApiErrors.find((text) => text.includes('messages[44].***.list[ChatMessageContent][5].cache_control'));
 assert(validationApiError, 'vLLM validation API error should be found');
 const parsedValidationApiError = api.parseApiErrorText(validationApiError);
