@@ -14,20 +14,50 @@ const EXTENSION_VERSION = require('./package.json').version;
 const PATCH_VERSION_PREFIX = '/* katex-ext-version: ';
 // Internal patch revision. The package version can stay at 1.0.0 while this
 // changes to force a refresh of already-patched Claude Code webview files.
-const PATCH_BUILD_ID = 'stable-runtime-guards-rich-content-api-readability-2026-06-10';
+const PATCH_BUILD_ID = 'stable-runtime-guards-rich-content-api-readability-full-transcript-inline-code-table-pipes-jsx-factory-2026-06-23';
 const PATCH_BUILD_PREFIX = '/* enhance-patch-build: ';
+const FULL_TRANSCRIPT_MARKER = 'claude-code-enhance-full-transcript';
 
 // Where users report a Claude Code build the patch no longer fits.
 const ISSUES_URL = 'https://github.com/MahammadNuriyev62/claude-code-enhance/issues';
 
 // The react-markdown call site in Claude Code's webview bundle:
-//   createElement(<Markdown>, {remarkPlugins:[<plugins>], components:{...}}, <text>)
-// The patch injects the math plugins here. $1 = the Markdown component
-// identifier, $2 = the existing remark plugin list. `remarkPlugins` is
-// react-markdown's stable public prop name, so this survives minification-hash
-// churn; if a future Claude Code reshapes the call entirely, applyPatch reports
-// it as unsupported rather than patching blind.
-const V2_INJECT_RE = /createElement\(([A-Za-z_$][\w$]*),\{remarkPlugins:\[([A-Za-z_$][\w$,]*)\]/;
+//   b(QZ, {remarkPlugins:[GR], components:{...}})
+// The patch injects the math plugins here. $1 = the JSX factory function
+// (b, E, etc.), $2 = the Markdown component identifier, $3 = the existing
+// remark plugin list. `remarkPlugins` is react-markdown's stable public prop
+// name, so this survives minification-hash churn; if a future Claude Code
+// reshapes the call entirely, applyPatch reports it as unsupported rather than
+// patching blind.
+const V2_INJECT_RE = /\b([A-Za-z_$][\w$]*)\(([A-Za-z_$][\w$]*),\{remarkPlugins:\[([A-Za-z_$][\w$,]*)\]/;
+const MESSAGE_RETENTION_CONSTANTS_RE = /var ([A-Za-z_$][\w$]*)=600,([A-Za-z_$][\w$]*)=500[,;]/;
+
+function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function patchMessageRetentionCap(body) {
+  const constants = body.match(MESSAGE_RETENTION_CONSTANTS_RE);
+  if (!constants) {
+    return { body, applied: false };
+  }
+
+  const limitVar = escapeRegExp(constants[1]);
+  const keepVar = escapeRegExp(constants[2]);
+  const retentionFnRe = new RegExp(
+    'function ([A-Za-z_$][\\w$]*)\\(([A-Za-z_$][\\w$]*)\\)\\{' +
+    'if\\(\\2\\.length>' + limitVar + '\\)\\{' +
+    'let ([A-Za-z_$][\\w$]*)=\\2\\.length-' + keepVar + ';' +
+    'return \\2\\.slice\\(\\3\\)\\}' +
+    'return \\2\\}'
+  );
+  const patched = body.replace(
+    retentionFnRe,
+    `function $1($2){return $2/* ${FULL_TRANSCRIPT_MARKER} */}`
+  );
+
+  return { body: patched, applied: patched !== body };
+}
 
 function findClaudeCodeExtDir() {
   const ext = vscode.extensions.getExtension('anthropic.claude-code');
@@ -122,10 +152,11 @@ function applyPatch(extDir, vendorDir) {
   const highlightCore = fs.readFileSync(path.join(vendorDir, 'highlight.min.js'), 'utf8');
   const v2Bundle = fs.readFileSync(path.join(vendorDir, 'remark-math-bundle.js'), 'utf8');
   const enhanceCode = fs.readFileSync(path.join(vendorDir, 'enhance.js'), 'utf8');
-  const injectedBody = body.replace(
+  const retentionPatch = patchMessageRetentionCap(body);
+  const injectedBody = retentionPatch.body.replace(
     V2_INJECT_RE,
-    'createElement($1,{rehypePlugins:window.__KATEX_V2_LOADED?[window.__rehypeKatex]:[],' +
-    'remarkPlugins:[$2].concat(window.__KATEX_V2_LOADED?[window.__remarkBracketMath,window.__remarkMath]:[])'
+    '$1($2,{rehypePlugins:window.__KATEX_V2_LOADED?[window.__rehypeKatex]:[],' +
+    'remarkPlugins:[$3].concat(window.__KATEX_V2_LOADED?[window.__remarkBracketMath,window.__remarkMath]:[])'
   );
   fs.writeFileSync(jsPath,
     `${PATCH_MARKER}\n${PATCH_VERSION_PREFIX}${EXTENSION_VERSION} */\n` +
@@ -437,12 +468,15 @@ module.exports._test = {
   ensurePatched,
   reloadWebviewAndNotify,
   notifyUnsupported,
+  patchMessageRetentionCap,
   EXTENSION_VERSION,
   PATCH_BUILD_ID,
   PATCH_MARKER,
   PATCH_CSS_MARKER,
   PATCH_VERSION_PREFIX,
   PATCH_BUILD_PREFIX,
+  FULL_TRANSCRIPT_MARKER,
   V2_INJECT_RE,
+  MESSAGE_RETENTION_CONSTANTS_RE,
   ISSUES_URL,
 };

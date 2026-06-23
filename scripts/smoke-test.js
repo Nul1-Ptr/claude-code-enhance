@@ -28,7 +28,7 @@ const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-code-enhance-'));
 const webview = path.join(tmp, 'webview');
 fs.mkdirSync(webview);
 
-const fixtureJs = 'const gfm=a;createElement(Md,{remarkPlugins:[gfm],components:{}},text);';
+const fixtureJs = 'var Nrt=600,Art=500;function jS(e){if(e.length>Nrt){let t=e.length-Art;return e.slice(t)}return e}const gfm=a;createElement(Md,{remarkPlugins:[gfm],components:{}},text);';
 const fixtureCss = '/* css */';
 fs.writeFileSync(path.join(webview, 'index.js'), fixtureJs);
 fs.writeFileSync(path.join(webview, 'index.css'), fixtureCss);
@@ -50,6 +50,13 @@ for (const marker of [
   'claude-enhance-root',
   'shouldSkipPreviewEnhancement',
   'isProseHeavyLatex',
+  'isLikelyInlineDollarFormula',
+  'isDimensionLatexFormula',
+  'normalizeDimensionLatexFormula',
+  'repairBareDimensionMath',
+  'renderBareDimensionMathInTextNode',
+  'repairMalformedDimensionKatex',
+  'parseMalformedDimensionText',
   'repairProseKatexErrors',
   'renderRelaxedMarkdownBold',
   'promoteStandaloneInlineMath',
@@ -78,6 +85,7 @@ for (const marker of [
   'font-size: 1.48em',
   'font-size: 1.22em',
   '\\uE000',
+  '__remarkPipeGuard',
   'meaningfulTextWithoutMath',
   'font-size: 1.6em',
   'padding: 14px 18px',
@@ -96,6 +104,7 @@ for (const marker of [
   '--ce-syntax-keyword',
   'Common Highlight.js palette',
   'vscode-high-contrast',
+  'claude-code-enhance-full-transcript',
 ]) {
   if (!patchedJs.includes(marker)) throw new Error('missing JS marker: ' + marker);
 }
@@ -178,6 +187,8 @@ function findLatestInstalledClaudeCodeFixture() {
 
 const installedFixture = findLatestInstalledClaudeCodeFixture();
 if (installedFixture) {
+  const installedSource = fs.readFileSync(installedFixture.jsPath, 'utf8');
+  const installedHasRetentionCap = extension.MESSAGE_RETENTION_CONSTANTS_RE.test(installedSource);
   const localTmp = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-code-enhance-installed-'));
   const localWebview = path.join(localTmp, 'webview');
   fs.mkdirSync(localWebview);
@@ -192,6 +203,9 @@ if (installedFixture) {
     if (!localPatchedJs.includes(marker)) {
       throw new Error('missing installed Claude Code marker: ' + marker);
     }
+  }
+  if (installedHasRetentionCap && !localPatchedJs.includes(extension.FULL_TRANSCRIPT_MARKER)) {
+    throw new Error('missing installed Claude Code full-transcript retention marker');
   }
   extension.removePatch(localTmp);
 }

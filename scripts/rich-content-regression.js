@@ -36,6 +36,45 @@ function createEnhanceTestApi() {
   return api;
 }
 
+function createRemarkBundleTestApi() {
+  class DOMParserStub {
+    parseFromString() {
+      return { nodeType: 9, childNodes: [] };
+    }
+  }
+
+  const context = {
+    console: {
+      log() {},
+      warn() {},
+      error() {},
+    },
+    DOMParser: DOMParserStub,
+    document: {
+      createElement() {
+        return {
+          innerHTML: '',
+          content: { nodeType: 11, childNodes: [] },
+        };
+      },
+    },
+    window: { katex },
+  };
+  context.globalThis = context;
+  vm.createContext(context);
+
+  const bundlePath = path.join(projectRoot, 'vendor', 'remark-math-bundle.js');
+  vm.runInContext(fs.readFileSync(bundlePath, 'utf8'), context, {
+    filename: bundlePath,
+  });
+
+  const guard = context.window.__remarkPipeGuard;
+  const restore = context.window.__remarkPipeGuardRestore;
+  assert(typeof guard === 'function', 'remark pipe guard should be exposed');
+  assert(typeof restore === 'function', 'remark pipe guard restore should be exposed');
+  return { guard, restore };
+}
+
 function renderSpans(api, text, name) {
   const spans = api.findMathSpans(text);
   for (const span of spans.slice(0, 30)) {
@@ -156,6 +195,24 @@ const embeddedVllmApiErrors = [
 ];
 
 const api = createEnhanceTestApi();
+const remarkApi = createRemarkBundleTestApi();
+
+const asymVQuantTableRow = '| Asym V quant | `scale=amax(|V|)/448`; `q=clamp(V/scale).to(fp8)` | [asym_k16_v8.py:69](lmcache/v1/kv_codec/asym_k16_v8.py#L69) |';
+const guardedAsymVQuantTableRow = remarkApi.guard(asymVQuantTableRow);
+assert(
+  guardedAsymVQuantTableRow.includes('`scale=amax(\uE000V\uE000)/448`'),
+  'inline-code pipes in the Asym V quant table row should be protected before GFM table parsing'
+);
+assert(
+  (guardedAsymVQuantTableRow.match(/\|/g) || []).length === 4,
+  'Asym V quant table row should only expose real table separators to the parser'
+);
+const restoredAsymVQuantNode = { value: guardedAsymVQuantTableRow };
+remarkApi.restore(restoredAsymVQuantNode);
+assert(
+  restoredAsymVQuantNode.value.includes('`scale=amax(|V|)/448`'),
+  'inline-code pipes in the Asym V quant table row should be restored after parsing'
+);
 
 const apiErrorText = [
   "API Error: 400 2 request validation errors:",
@@ -205,6 +262,16 @@ const richTextCases = [
     name: 'inline formula with price literal',
     text: 'The gradient $\\nabla f(x)$ renders, but cost $5 and shell $HOME stay prose.',
     expectedSpans: 1,
+  },
+  {
+    name: 'digit-start grid formulas near prose',
+    text: "Caveat 9 (TML axis-order discrepancy between code's `4π×8π×8π` and paper's `8π×8π×4π`) is correctly noted; the manuscript's $L_1,L_2,L_3=8\\pi,8\\pi,4\\pi$ with grid $256{\\times}256{\\times}128$→fDNS $64{\\times}64{\\times}32$ confirms the code's stored `[32,64,64]` is a permutation of the physical axes.",
+    expectedSpans: 3,
+  },
+  {
+    name: 'digit-start formula attached to prose label',
+    text: 'grid $256{\\times}256{\\times}128$→fDNS$64{\\times}64{\\times}32$',
+    expectedSpans: 2,
   },
   {
     name: 'display formula',
@@ -258,6 +325,21 @@ for (const testCase of richTextCases) {
 assert(api.getCodeLanguage(fakeCodeBlock('language-py')) === 'python', 'py alias should resolve to python');
 assert(api.getCodeLanguage(fakeCodeBlock('lang-ts')) === 'typescript', 'ts alias should resolve to typescript');
 assert(api.getCodeLanguage(fakeCodeBlock('', '', 'sh')) === 'bash', 'raw sh data-language should resolve to bash');
+assert(api.isDimensionLatexFormula('256{\\times}256{\\times}128'), 'TeX dimension formula should be recognized');
+assert(api.isDimensionLatexFormula('64×64×32'), 'Unicode dimension formula should be recognized');
+assert(api.isDimensionLatexFormula('\\64{\\times}64{\\times}32'), 'stray-backslash dimension formula should be recognized');
+assert(!api.isDimensionLatexFormula('4π×8π×8π'), 'pi dimension literal should stay non-math unless explicitly delimited');
+for (const malformed of [
+  '256{\\times}256{\\times}128→fDNS\\64{\\times}64{\\times}32',
+  '256{\\times}256{\\times}128→fDNS64{\\times}64{\\times}32',
+  '256{\\times}256{\\times}128→fDNS $64{\\times}64{\\times}32',
+  '256×256×128→fDNS\\64×64×32',
+]) {
+  const parts = api.parseMalformedDimensionText(malformed);
+  assert(parts, `malformed dimension chain should parse: ${malformed}`);
+  assert(parts.label === 'fDNS', `malformed dimension label should parse: ${malformed}`);
+  assert(parts.right === '64{\\times}64{\\times}32' || parts.right === '64×64×32', `malformed right dimension should parse: ${malformed}`);
+}
 assert(hljs.getLanguage('python'), 'Highlight.js should include python');
 assert(hljs.highlight('print(1)', { language: 'python', ignoreIllegals: true }).value.includes('print'), 'python highlighting should not fail');
 assert(!hljs.getLanguage('made-up-language'), 'unsupported language should be detectable before highlighting');

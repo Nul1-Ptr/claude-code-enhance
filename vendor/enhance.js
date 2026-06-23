@@ -982,6 +982,46 @@
     return looksLikeLatex(text) && !isProseHeavyLatex(text, displayMode);
   }
 
+  function isDimensionLatexFormula(text) {
+    const cleaned = normalizeDimensionLatexFormula(text);
+    return /^\d+(?:\s*(?:\{\\times\}|\\times|×)\s*\d+){1,}$/.test(cleaned);
+  }
+
+  function normalizeDimensionLatexFormula(text) {
+    return String(text || '')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .replace(/^\\(?=\d)/, '');
+  }
+
+  function parseMalformedDimensionText(text) {
+    const cleaned = String(text || '').replace(/\s+/g, ' ').trim();
+    const dimension = '(\\\\?\\d+(?:\\s*(?:\\{\\\\times\\}|\\\\times|×)\\s*\\d+){1,})';
+    const re = new RegExp(`^${dimension}\\s*(→|->|\\\\to)\\s*([A-Za-z][A-Za-z0-9]*?)(?:\\s*([\\\\$])\\s*|\\s+|(?=\\\\?\\d))${dimension}$`);
+    const match = cleaned.match(re);
+    if (!match) return null;
+    return {
+      left: normalizeDimensionLatexFormula(match[1]),
+      arrow: match[2] === '\\to' || match[2] === '->' ? '→' : match[2],
+      label: match[3],
+      right: normalizeDimensionLatexFormula(match[5]),
+    };
+  }
+
+  function renderLatexToFragment(formula, displayMode) {
+    const fragment = document.createDocumentFragment();
+    appendHtmlFragment(fragment, renderLatexHtml(formula, displayMode));
+    return fragment;
+  }
+
+  function renderMalformedDimensionFragment(parts) {
+    const fragment = document.createDocumentFragment();
+    fragment.appendChild(renderLatexToFragment(parts.left, false));
+    fragment.appendChild(document.createTextNode(` ${parts.arrow} ${parts.label} `));
+    fragment.appendChild(renderLatexToFragment(parts.right, false));
+    return fragment;
+  }
+
   function renderLatexFragment(fragment, displayMode, fallback) {
     const latex = /<[^>]+>/.test(fragment) ? htmlFragmentToLatex(fragment) : fragment;
     if (!isRenderableLatexFormula(latex, displayMode)) return fallback;
@@ -1041,14 +1081,24 @@
   function isLikelyInlineDollarStart(text, index) {
     const next = text[index + 1];
     const prev = text[index - 1];
-    if (!next || /\s|\d/.test(next)) return false;
-    if (prev && !/\s|[(\[{,;:]/.test(prev)) return false;
+    if (!next || /\s/.test(next)) return false;
+    if (prev && !/\s|[(\[{,;:]/.test(prev) && !/\d/.test(next)) return false;
     return true;
   }
 
   function isLikelyInlineDollarEnd(text, index) {
     const prev = text[index - 1];
     return !!prev && !/\s/.test(prev);
+  }
+
+  function isLikelyInlineDollarFormula(formula) {
+    const cleaned = formula.replace(/\s+/g, ' ').trim();
+    if (!cleaned) return false;
+
+    // Keep ordinary prices like "$5$" or "$5 and ..." as prose, while still
+    // allowing numeric math such as "$10^{-8}$" and "$256{\times}128$".
+    if (/^\d/.test(cleaned) && !/[\\{}_^=+\-*/<>×]/.test(cleaned)) return false;
+    return isRenderableLatexFormula(cleaned, false);
   }
 
   function findMathSpans(text) {
@@ -1073,7 +1123,7 @@
         }
         if (end !== -1) {
           const formula = text.slice(i + 1, end).trim();
-          if (isRenderableLatexFormula(formula, false)) spans.push({ start: i, end: end + 1, formula, displayMode: false });
+          if (isLikelyInlineDollarFormula(formula)) spans.push({ start: i, end: end + 1, formula, displayMode: false });
           i = end + 1;
           continue;
         }
@@ -1236,6 +1286,84 @@
     return true;
   }
 
+  function renderBareDimensionMathInTextNode(textNode) {
+    const text = textNode.textContent || '';
+    if (!text.includes('\\times') && !text.includes('×')) return false;
+
+    const re = /(^|[^_$])((?:\\)?\d+(?:\s*(?:\{\\times\}|\\times|×)\s*\d+){1,})(?=$|[^A-Za-z0-9_$\\])/g;
+    const fragment = document.createDocumentFragment();
+    let cursor = 0;
+    let changed = false;
+    let match;
+
+    while ((match = re.exec(text))) {
+      const prefix = match[1] || '';
+      const formula = match[2];
+      if (/[A-Za-z0-9]$/.test(prefix) && !formula.startsWith('\\')) continue;
+      const formulaStart = match.index + prefix.length;
+      const formulaEnd = formulaStart + formula.length;
+      if (!isDimensionLatexFormula(formula)) continue;
+
+      if (formulaStart > cursor) {
+        fragment.appendChild(document.createTextNode(text.slice(cursor, formulaStart)));
+      }
+
+      try {
+        fragment.appendChild(renderLatexToFragment(normalizeDimensionLatexFormula(formula), false));
+        changed = true;
+      } catch {
+        fragment.appendChild(document.createTextNode(formula));
+      }
+      cursor = formulaEnd;
+    }
+
+    if (!changed) return false;
+    if (cursor < text.length) {
+      fragment.appendChild(document.createTextNode(text.slice(cursor)));
+    }
+    textNode.parentNode?.replaceChild(fragment, textNode);
+    return true;
+  }
+
+  function repairBareDimensionMath(root) {
+    const walker = document.createTreeWalker(
+      root,
+      NodeFilter.SHOW_TEXT,
+      {
+        acceptNode: (node) => {
+          const parent = node.parentNode;
+          if (!parent || parent.nodeType !== 1 ||
+              closestSafe(parent, '.katex') ||
+              isInsideNonPreviewRegion(parent) ||
+              ['SCRIPT', 'STYLE', 'CODE', 'PRE', 'BUTTON', 'INPUT', 'TEXTAREA'].includes(parent.tagName)) {
+            return NodeFilter.FILTER_REJECT;
+          }
+          const text = node.textContent || '';
+          return (text.includes('\\times') || text.includes('×'))
+            ? NodeFilter.FILTER_ACCEPT
+            : NodeFilter.FILTER_REJECT;
+        }
+      }
+    );
+
+    const nodes = [];
+    let node;
+    while (node = walker.nextNode()) nodes.push(node);
+    nodes.forEach((textNode) => safeRun('renderBareDimensionMathInTextNode', () => {
+      renderBareDimensionMathInTextNode(textNode);
+    }));
+  }
+
+  function repairMalformedDimensionKatex(root) {
+    querySelectorAllSafe(root, '.katex').forEach((el) => safeRun('repairMalformedDimensionKatex item', () => {
+      if (closestSafe(el.parentElement, '.katex')) return;
+      const annotation = querySelectorAllSafe(el, 'annotation[encoding="application/x-tex"]')[0];
+      const parts = parseMalformedDimensionText(annotation?.textContent || '');
+      if (!parts) return;
+      el.replaceWith(renderMalformedDimensionFragment(parts));
+    }));
+  }
+
   // Preprocess rendered Markdown whose inline math was split by emphasis tags.
   function preprocessHTMLMath(root) {
     const selector = [
@@ -1264,8 +1392,22 @@
 
   function repairProseKatexErrors(root) {
     querySelectorAllSafe(root, '.katex-error').forEach((el) => {
-      const text = el.textContent || '';
-      if (!text || !isProseHeavyLatex(text, true)) return;
+      const text = (el.textContent || '').trim();
+      if (!text) return;
+      const malformed = parseMalformedDimensionText(text);
+      if (malformed) {
+        try {
+          el.replaceWith(renderMalformedDimensionFragment(malformed));
+          return;
+        } catch {}
+      }
+      if (isDimensionLatexFormula(text)) {
+        try {
+          el.replaceWith(renderLatexToFragment(normalizeDimensionLatexFormula(text), false));
+          return;
+        } catch {}
+      }
+      if (!isProseHeavyLatex(text, true)) return;
       el.replaceWith(document.createTextNode(text));
     });
   }
@@ -1720,6 +1862,7 @@
 
     try {
       getEnhanceRoots().forEach((root) => safeRun('renderLaTeX root', () => {
+        repairMalformedDimensionKatex(root);
         repairProseKatexErrors(root);
         renderRelaxedMarkdownBold(root);
         promoteStandaloneInlineMath(root);
@@ -1763,6 +1906,8 @@
           safeRun('renderMathInTextNode', () => renderMathInTextNode(textNode));
         });
 
+        repairBareDimensionMath(root);
+        repairMalformedDimensionKatex(root);
         repairProseKatexErrors(root);
         renderRelaxedMarkdownBold(root);
         promoteStandaloneInlineMath(root);
@@ -2351,6 +2496,8 @@
       hasMarkdownUnderscoreEmphasis,
       parseApiErrorText,
       isProseHeavyLatex,
+      isDimensionLatexFormula,
+      parseMalformedDimensionText,
       isRenderableLatexFormula,
       looksLikeLatex,
       normalizeLatexForRender,
