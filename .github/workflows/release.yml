@@ -52,16 +52,19 @@ jobs:
           gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes
           gh release upload "$GITHUB_REF_NAME" ./*.vsix --clobber
 
-      - name: Upload rolling release
+      - name: Publish versioned release
         if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: latest
-          RELEASE_TITLE: Latest VSIX build
-          RELEASE_NOTES: Automatic VSIX build from ${{ github.sha }} on ${{ github.ref_name }}.
         run: |
-          git tag --force "$RELEASE_TAG" "$GITHUB_SHA"
-          git push --force origin "$RELEASE_TAG"
-          gh release view "$RELEASE_TAG" >/dev/null 2>&1 || gh release create "$RELEASE_TAG" --title "$RELEASE_TITLE" --notes "$RELEASE_NOTES" --prerelease --target "$GITHUB_SHA"
-          gh release edit "$RELEASE_TAG" --title "$RELEASE_TITLE" --notes "$RELEASE_NOTES" --prerelease
+          VERSION=$(node -p "require('./package.json').version")
+          RELEASE_TAG="v$VERSION"
+          RELEASE_TITLE="v$VERSION"
+          # Create a real (non-prerelease) release for this version if it doesn't exist yet.
+          # Existing releases are reused so re-pushes just refresh the attached VSIX.
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release edit "$RELEASE_TAG" --title "$RELEASE_TITLE" --prerelease=false --latest
+          else
+            gh release create "$RELEASE_TAG" --title "$RELEASE_TITLE" --generate-notes --latest --target "$GITHUB_SHA"
+          fi
           gh release upload "$RELEASE_TAG" ./*.vsix --clobber
