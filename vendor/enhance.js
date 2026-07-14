@@ -11,6 +11,9 @@
   const CONTENT_BASE_FONT_SCALE = 1.10;
   const warningKeys = new Set();
 
+  // [FIX P0-1] 守卫标记：增强循环进行中时 Observer 忽略自身产生的 DOM 变化
+  let _enhancing = false;
+
   function warnOnce(key, error) {
     if (warningKeys.has(key)) return;
     warningKeys.add(key);
@@ -697,8 +700,8 @@
     (document.head || document.documentElement || document.body)?.appendChild(style);
   }
 
-  // 注入 Highlight.js
-  function injectHighlightJS() {
+  // [FIX P3-1] 重命名：此函数不注入 JS，只标记 hljs 已就绪并触发首次高亮
+  function markHighlightJSReady() {
     if (window.hljsLoaded) return;
     // Loaded via extension.js injection
     console.log('[Claude Enhance] Highlight.js already loaded locally');
@@ -755,6 +758,23 @@
     '[class*="sessionName"]'
   ].join(',');
 
+  // [FIX] 对话框/模态框选择器，排除 Claude Code 确认界面
+  const DIALOG_SELECTOR = [
+    '[role="dialog"]',
+    '[class*="dialog"]',
+    '[class*="Dialog"]',
+    '[class*="modal"]',
+    '[class*="Modal"]',
+    '[class*="overlay"]',
+    '[class*="Overlay"]',
+    '[class*="permission"]',
+    '[class*="Permission"]',
+    '[class*="confirm"]',
+    '[class*="Confirm"]',
+    '[class*="approval"]',
+    '[class*="Approval"]'
+  ].join(',');
+
   function isInsideInteractiveSurface(el) {
     const node = el?.nodeType === Node.ELEMENT_NODE ? el : el?.parentElement;
     return !!closestSafe(node, INTERACTIVE_SELECTOR);
@@ -770,6 +790,19 @@
     return isInsideNonPreviewRegion(el);
   }
 
+  // [FIX] 判断元素是否在对话框/模态框内部
+  function isInsideDialog(el) {
+    const node = el?.nodeType === Node.ELEMENT_NODE ? el : el?.parentElement;
+    return !!closestSafe(node, DIALOG_SELECTOR);
+  }
+
+  // [FIX] 消息内容选择器：只匹配实际消息内容，不匹配对话框等 UI 元素
+  const MSG_CONTENT_SELECTOR = '[class*="timelineMessage_"], [class*="assistantMessage_"], [class*="userMessage_"], .rendered-markdown';
+  function isInsideMessageContent(node) {
+    const el = node?.nodeType === Node.TEXT_NODE ? node.parentElement : node;
+    return !!closestSafe(el, MSG_CONTENT_SELECTOR);
+  }
+
   // 高亮代码块
   function getEnhanceRoots() {
     const selectors = [
@@ -781,7 +814,7 @@
     ].join(',');
 
     const roots = querySelectorAllSafe(document, selectors)
-      .filter((el) => !closestSafe(el, NON_PREVIEW_SELECTOR));
+      .filter((el) => !closestSafe(el, NON_PREVIEW_SELECTOR) && !isInsideDialog(el));
 
     const topLevelRoots = roots.filter((el) => !roots.some((other) => (
       other !== el && typeof other.contains === 'function' && other.contains(el)
@@ -1326,6 +1359,10 @@
   }
 
   function repairBareDimensionMath(root) {
+    // [FIX] 不能用 root 级标记：messagesContainer_ 是整个会话唯一且持久的 root，
+    // 一旦打标后续流式消息将永远跳过。此函数天然幂等——
+    // renderBareDimensionMathInTextNode 会消费 ×/\times，已渲染节点不含标记不会被 acceptNode 接受，
+    // 只有新文本会被处理。真正的 O(n²) 热点是 adaptInlineMathSize 的 getBoundingClientRect（保留其元素级标记）。
     const walker = document.createTreeWalker(
       root,
       NodeFilter.SHOW_TEXT,
@@ -1356,10 +1393,12 @@
 
   function repairMalformedDimensionKatex(root) {
     querySelectorAllSafe(root, '.katex').forEach((el) => safeRun('repairMalformedDimensionKatex item', () => {
-      if (closestSafe(el.parentElement, '.katex')) return;
+      if (el.dataset.ceRepaired) return; // 已检查过，跳过
+      if (closestSafe(el.parentElement, '.katex')) { el.dataset.ceRepaired = 'true'; return; }
       const annotation = querySelectorAllSafe(el, 'annotation[encoding="application/x-tex"]')[0];
       const parts = parseMalformedDimensionText(annotation?.textContent || '');
-      if (!parts) return;
+      if (!parts) { el.dataset.ceRepaired = 'true'; return; }
+      el.dataset.ceRepaired = 'true';
       el.replaceWith(renderMalformedDimensionFragment(parts));
     }));
   }
@@ -1454,6 +1493,10 @@
   }
 
   function renderRelaxedMarkdownBold(root) {
+    // [FIX] 不能用 root 级标记：messagesContainer_ 是整个会话唯一且持久的 root，
+    // 一旦打标后续流式消息将永远跳过。此函数天然幂等——
+    // renderRelaxedBoldInTextNode 会消费 **，已渲染节点不含 ** 不会被 acceptNode 接受，
+    // 只有新文本会被处理。
     const walker = document.createTreeWalker(
       root,
       NodeFilter.SHOW_TEXT,
@@ -1567,6 +1610,8 @@
       .filter((el) => !closestSafe(el, '.katex-display') && !isInsideNonPreviewRegion(el));
 
     candidates.forEach((katexEl) => {
+      if (katexEl.dataset.cePromoted) return; // 已处理，跳过
+      katexEl.dataset.cePromoted = 'true';
       if (!shouldPromoteInlineMath(katexEl)) return;
 
       const display = document.createElement('span');
@@ -1594,7 +1639,9 @@
       .filter((el) => !closestSafe(el, '.katex-display') && !isInsideNonPreviewRegion(el));
 
     candidates.forEach((katexEl) => {
+      if (katexEl.dataset.ceAdapted) return; // 已处理，跳过
       katexEl.classList.toggle('ce-large-inline-math', isLargeInlineMath(katexEl));
+      katexEl.dataset.ceAdapted = 'true';
     });
   }
 
@@ -1862,13 +1909,7 @@
 
     try {
       getEnhanceRoots().forEach((root) => safeRun('renderLaTeX root', () => {
-        repairMalformedDimensionKatex(root);
-        repairProseKatexErrors(root);
-        renderRelaxedMarkdownBold(root);
-        promoteStandaloneInlineMath(root);
-        adaptInlineMathSize(root);
-
-        // Preprocess HTML-based math (handles markup inside $$...$$)
+        // [FIX P1-2] 移除重复的前置处理，只保留 preprocessHTMLMath（需要在 TreeWalker 前执行）
         preprocessHTMLMath(root);
 
         const walker = document.createTreeWalker(
@@ -1878,7 +1919,6 @@
             acceptNode: (node) => {
               const parent = node.parentNode;
               if (!parent || parent.nodeType !== 1) return NodeFilter.FILTER_REJECT;
-              // Skip rendered KaTeX, controls, tool/user output, and session/navigation UI.
               if (parent.classList?.contains('katex') ||
                   closestSafe(parent, '.katex') ||
                   isInsideNonPreviewRegion(parent) ||
@@ -1906,6 +1946,7 @@
           safeRun('renderMathInTextNode', () => renderMathInTextNode(textNode));
         });
 
+        // 后置处理：修复、粗体、提升、适配（只执行一次）
         repairBareDimensionMath(root);
         repairMalformedDimensionKatex(root);
         repairProseKatexErrors(root);
@@ -1919,6 +1960,9 @@
   }
 
   // ========== AI 对话复制功能 ==========
+
+  // [FIX P3-2] 使用 WeakMap 存储消息引用，避免直接挂 DOM 属性
+  const _turnMessagesMap = new WeakMap();
 
   // 需要排除的类名前缀 (思维链和工具调用)
   const EXCLUDE_PREFIXES = [
@@ -2144,7 +2188,7 @@
 
       try {
         // 获取整轮消息
-        const turnMessages = messageEl._turnMessages || [messageEl];
+        const turnMessages = _turnMessagesMap.get(messageEl) || [messageEl];
 
         // 合并所有消息的 Markdown 内容
         const contents = turnMessages.map(msg => htmlToMarkdown(msg)).filter(c => c.trim());
@@ -2178,7 +2222,7 @@
       const lastMessage = turnMessages[turnMessages.length - 1];
 
       // 存储整轮消息的引用
-      lastMessage._turnMessages = turnMessages;
+      _turnMessagesMap.set(lastMessage, turnMessages);
 
       safeRun('addCopyButton', () => addCopyButton(lastMessage));
     });
@@ -2247,64 +2291,158 @@
     }, 1000);
   }
 
-  // DOM 监听 - 防抖处理, 避免输出过程中抽搐
+  // DOM 监听 - 只监听 messagesContainer，不监听整个 body
+  // 这样对话框、按钮等 UI 元素的变化根本不会触发 Observer
+  // 不需要黑名单或白名单过滤
   function setupObserver() {
     if (typeof MutationObserver === 'undefined' || !document.body) return;
     let debounceTimer = null;
-    const DEBOUNCE_DELAY = 500; // 等待 500ms 无变化后再渲染
+    const DEBOUNCE_DELAY = 100;
 
-    const observer = new MutationObserver((mutations) => {
-      safeRun('mutation observer', () => {
-        // 跳过我们自己添加的元素
-        let hasRealChange = false;
-        for (const m of mutations) {
-          if (isInsideNonPreviewRegion(m.target)) continue;
-          if (m.type === 'characterData') {
-            const text = m.target?.textContent || '';
-            if (text.trim() && (text.includes('$') || text.includes('\\(') || text.includes('\\[') || text.includes('**'))) {
-              hasRealChange = true;
-            }
-          }
+    function isInsideKatex(node) {
+      return !!closestSafe(node?.nodeType === Node.TEXT_NODE ? node.parentElement : node, '.katex, .katex-display, .katex-mathml');
+    }
 
-          for (const node of m.addedNodes) {
-            if (node.nodeType === Node.TEXT_NODE) {
-              const text = node.textContent || '';
-              if (text.trim() && !isInsideNonPreviewRegion(node)) {
-                hasRealChange = true;
-                break;
-              }
-              continue;
-            }
-            if (node.nodeType === Node.ELEMENT_NODE) {
-              const cls = toClassName(node.className);
-              if (isInsideNonPreviewRegion(node)) continue;
+    function isSelfMutation(m) {
+      const target = m.target;
+      if (isInsideKatex(target)) return true;
+      for (const node of m.addedNodes) {
+        if (node.nodeType === Node.ELEMENT_NODE) {
+          const cls = toClassName(node.className);
+          if (cls.includes('katex') || cls.includes('hljs') ||
+              cls.includes('zoom-indicator') || cls.includes('claude-code-copy-btn') ||
+              cls.includes('claude-copy-btn') || cls.includes('ce-api-error') ||
+              cls.includes('claude-enhance-root')) continue;
+        }
+        if (node.nodeType === Node.TEXT_NODE && isInsideKatex(node)) continue;
+        return false;
+      }
+      return m.addedNodes.length > 0;
+    }
 
-              if (
-                !cls.includes('hljs') &&
-                !cls.includes('katex') &&
-                !cls.includes('zoom-indicator') &&
-                !cls.includes('claude-code-copy-btn') &&
-                !cls.includes('claude-copy-btn')
-              ) {
-                hasRealChange = true;
-                break;
-              }
-            }
-          }
-          if (hasRealChange) break;
+    // 简化：Observer 只监听 messagesContainer，所有 mutation 都在容器内
+    // 只排除增强脚本自身的元素，其余全部触发增强
+    // 增强函数是幂等的（有 dedup 标记），重复执行无视觉副作用
+    // scroll/zoom 由内容指纹控制，只在内容真正变化时执行
+    function classifyMutations(mutations) {
+      let needFull = false;
+      let needMath = false;
+      let needHighlight = false;
+
+      for (const m of mutations) {
+        if (isSelfMutation(m)) continue;
+
+        if (m.type === 'characterData') {
+          const text = m.target?.textContent || '';
+          if (text.includes('$') || text.includes('\\(') || text.includes('\\[')) needMath = true;
+          if (text.includes('**')) needMath = true;
         }
 
-        if (!hasRealChange) return;
+        for (const node of m.addedNodes) {
+          if (node.nodeType === Node.TEXT_NODE) {
+            if (isInsideKatex(node)) continue;
+            const text = node.textContent || '';
+            if (text.includes('$') || text.includes('\\(') || text.includes('\\[')) needMath = true;
+            needFull = true;
+          }
+          if (node.nodeType === Node.ELEMENT_NODE) {
+            const cls = toClassName(node.className);
+            if (cls.includes('katex') || cls.includes('hljs') ||
+                cls.includes('zoom-indicator') || cls.includes('claude-code-copy-btn') ||
+                cls.includes('claude-copy-btn') || cls.includes('ce-api-error') ||
+                cls.includes('claude-enhance-root')) continue;
+            const tag = node.tagName;
+            if (tag === 'PRE' || tag === 'CODE') needHighlight = true;
+            needFull = true;
+          }
+        }
+        if (needFull) break;
+      }
 
-        // 清除之前的定时器, 重新计时
-        if (debounceTimer) clearTimeout(debounceTimer);
+      return { needFull, needMath, needHighlight };
+    }
 
-        // 等待输出稳定后再渲染
-        debounceTimer = setTimeout(runEnhancementCycle, DEBOUNCE_DELAY);
+    const observer = new MutationObserver((mutations) => {
+      if (_enhancing) return;
+
+      safeRun('mutation observer', () => {
+        const { needFull, needMath, needHighlight } = classifyMutations(mutations);
+        if (!needFull && !needMath && !needHighlight) return;
+
+        // 首次变化立即执行，后续变化 100ms 防抖
+        if (!debounceTimer) {
+          // 立即执行，减少视觉闪烁
+          if (needFull) {
+            runEnhancementCycle();
+          } else if (needMath) {
+            _enhancing = true;
+            try {
+              scrollToBottomIfNeeded();
+              safeRun('renderLaTeX', renderLaTeX);
+              scrollToBottomIfNeeded();
+            } finally { _enhancing = false; }
+          } else if (needHighlight) {
+            _enhancing = true;
+            try {
+              scrollToBottomIfNeeded();
+              safeRun('highlightAllCode', highlightAllCode);
+              scrollToBottomIfNeeded();
+            } finally { _enhancing = false; }
+          }
+        }
+        // 防抖窗口：后续变化只刷新定时器
+        clearTimeout(debounceTimer);
+        debounceTimer = setTimeout(() => {
+          debounceTimer = null;
+          if (needFull) runEnhancementCycle();
+        }, DEBOUNCE_DELAY);
       });
     });
 
-    observer.observe(document.body, { childList: true, subtree: true, characterData: true });
+    // 只监听 messagesContainer，而不是整个 document.body
+    // 对话框、按钮等不在 container 内 → Observer 根本不会触发
+    // 尝试将 Observer 附着到 messagesContainer
+    // 如果 container 不存在（新会话），用 body bridge + 延迟重试双重保障
+    function attachToContainer(container) {
+      observer.observe(container, { childList: true, subtree: true, characterData: true });
+      console.log('[Claude Enhance] Observer attached to messagesContainer');
+      // container 刚出现，立即跑一次增强
+      runEnhancementCycle();
+      // 延迟重试：container 刚出现时内容可能还没渲染
+      setTimeout(runEnhancementCycle, 500);
+    }
+
+    let attached = false;
+    function tryAttach() {
+      if (attached) return;
+      const container = document.querySelector('[class*="messagesContainer_"]');
+      if (container) {
+        attached = true;
+        attachToContainer(container);
+        return true;
+      }
+      return false;
+    }
+
+    // 立即尝试一次
+    if (!tryAttach()) {
+      // container 不存在，启动 bridge + 延迟重试
+      const bridge = new MutationObserver(() => {
+        if (tryAttach()) bridge.disconnect();
+      });
+      // subtree: true 才能检测到深度嵌套的 messagesContainer
+      bridge.observe(document.body, { childList: true, subtree: true });
+      console.log('[Claude Enhance] Bridge observer waiting for messagesContainer');
+
+      // 延迟重试作为双重保障（bridge 可能漏掉某些情况）
+      let retryCount = 0;
+      const retryInterval = setInterval(() => {
+        if (tryAttach() || ++retryCount > 30) {
+          clearInterval(retryInterval);
+          if (!attached) bridge.disconnect();
+        }
+      }, 1000);
+    }
   }
 
   // DOM 探测工具 - 按 Ctrl+Shift+D 导出 DOM 结构
@@ -2469,24 +2607,79 @@
     }, 2000);
   }
 
+  // [FIX P0-2] 滚动保持：增强循环修改 DOM 后保持视图在底部
+  function scrollToBottomIfNeeded() {
+    // 查找滚动容器：messagesContainer 的可滚动祖先，或 document 级别的滚动元素
+    const msgContainer = document.querySelector('[class*="messagesContainer_"]');
+    let container = msgContainer;
+    while (container && container !== document.body) {
+      const style = window.getComputedStyle(container);
+      if (/(auto|scroll)/.test(style.overflowY)) break;
+      container = container.parentElement;
+    }
+    if (!container || container === document.body) {
+      container = document.scrollingElement || document.documentElement;
+    }
+    if (!container) return;
+
+    const threshold = 150;
+    const atBottom = container.scrollHeight - container.scrollTop - container.clientHeight < threshold;
+    if (atBottom) {
+      requestAnimationFrame(() => {
+        container.scrollTop = container.scrollHeight;
+      });
+    }
+  }
+
+  // [FIX] 内容指纹跟踪：只在内容真正变化时执行 scroll/zoom
+  // 增强函数本身是幂等的（有 dedup 标记），重复执行不会产生视觉变化
+  // 但 scroll/zoom 会导致视觉跳动，所以只在有新内容时执行
+  let _lastContentHash = '';
+
+  function getContentHash() {
+    const roots = getEnhanceRoots();
+    if (!roots.length) return '';
+    // 取每个 root 的文本长度和前 50 字符作为轻量指纹
+    return roots.map(r => `${r.textContent?.length || 0}:${(r.textContent || '').slice(0, 50)}`).join('|');
+  }
+
   function runEnhancementCycle() {
-    safeRun('renderApiErrors', renderApiErrors);
-    safeRun('highlightAllCode', highlightAllCode);
-    safeRun('renderLaTeX', renderLaTeX);
-    safeRun('scanAndAddCopyButtons', scanAndAddCopyButtons);
-    safeRun('applyContentZoom', () => applyContentZoom(getStoredZoom()));
+    _enhancing = true;
+    try {
+      // scroll 每次都执行（自身有"是否在底部"判断，不会在用户手动滚动时干扰）
+      scrollToBottomIfNeeded();
+      safeRun('renderApiErrors', renderApiErrors);
+      safeRun('highlightAllCode', highlightAllCode);
+      safeRun('renderLaTeX', renderLaTeX);
+      safeRun('scanAndAddCopyButtons', scanAndAddCopyButtons);
+
+      // zoom 只在内容真正变化时执行（避免无意义的字体大小重算）
+      const hash = getContentHash();
+      if (hash !== _lastContentHash) {
+        _lastContentHash = hash;
+        safeRun('applyContentZoom', () => applyContentZoom(getStoredZoom()));
+      }
+
+      scrollToBottomIfNeeded();
+    } finally {
+      _enhancing = false;
+    }
   }
 
   // 初始化
   function init() {
     console.log('[Claude Enhance] Initializing...');
     safeRun('injectStyles', injectStyles);
-    safeRun('injectHighlightJS', injectHighlightJS);
+    safeRun('markHighlightJSReady', markHighlightJSReady);
     safeRun('injectKaTeX', injectKaTeX);
     safeRun('setupZoom', setupZoom);
     safeRun('setupObserver', setupObserver);
     safeRun('setupDOMInspector', setupDOMInspector);
+    // 立即尝试一次（覆盖已有内容的情况）
     runEnhancementCycle();
+    // 延迟重试：React 可能还没渲染完消息
+    setTimeout(runEnhancementCycle, 1000);
+    setTimeout(runEnhancementCycle, 3000);
   }
 
   if (window.__CLAUDE_ENHANCE_TEST_MODE__) {
