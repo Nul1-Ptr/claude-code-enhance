@@ -5,6 +5,7 @@
 ### Fixed
 - Fixed window freeze from an infinite render loop. The `MutationObserver` mistook the `$` characters inside KaTeX `<annotation>` output for new user content and re-triggered the enhancement cycle endlessly. Added an `_enhancing` guard flag and `isSelfMutation()` / `isInsideKatex()` checks so the Observer ignores DOM changes produced by the enhancement script itself.
 - Fixed window freeze when a tool confirmation dialog or context button appears. The Observer now watches only the `messagesContainer_` element instead of `document.body`, so dialogs and other UI outside the container no longer trigger the enhancement cycle. Attachment uses a triple fallback (immediate attempt, body-bridge Observer, and `setInterval` polling) to cover both new and existing sessions.
+- Fixed enhancements disappearing after switching conversations. The observer now detects when Claude Code replaces `messagesContainer_`, reattaches to the new container, and immediately renders its existing content.
 - Fixed auto-scroll not following streaming output. Added `scrollToBottomIfNeeded()`, called before and after each cycle, which restores scroll position via `requestAnimationFrame` when the user is within 150px of the bottom.
 
 ### Performance

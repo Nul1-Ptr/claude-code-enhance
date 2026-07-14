@@ -72,6 +72,11 @@ for (const marker of [
   'renderMathInTextNode',
   'runEnhancementCycle',
   'characterData: true',
+  'let currentContainer = null',
+  'currentContainer && currentContainer.isConnected',
+  'observer.disconnect()',
+  'Bridge observer watching for messagesContainer changes',
+  'interval ensureAttached',
   'renderApiErrors',
   'parseApiErrorText',
   'findApiErrorContainer',
@@ -107,6 +112,10 @@ for (const marker of [
   'claude-code-enhance-full-transcript',
 ]) {
   if (!patchedJs.includes(marker)) throw new Error('missing JS marker: ' + marker);
+}
+
+if (patchedJs.includes('let attached = false')) {
+  throw new Error('enhancer still contains the one-shot messagesContainer observer');
 }
 
 for (const marker of ['.katex-display', '.hljs']) {

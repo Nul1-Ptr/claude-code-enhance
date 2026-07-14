@@ -1,6 +1,6 @@
 /**
- * Claude Code UI 增强脚本 v10
- * 功能: 滚轮缩放, 字体, 表格, LaTeX, 换行, 代码高亮, AI对话复制
+ * Claude Code UI enhancement script: zoom, fonts, tables, LaTeX, line breaks,
+ * code highlighting, and conversation copy.
  */
 
 (function() {
@@ -11,8 +11,10 @@
   const CONTENT_BASE_FONT_SCALE = 1.10;
   const warningKeys = new Set();
 
-  // [FIX P0-1] 守卫标记：增强循环进行中时 Observer 忽略自身产生的 DOM 变化
+  // Guard flag: while an enhancement cycle runs, the Observer ignores its own DOM changes.
   let _enhancing = false;
+
+  // ===== Utilities =====
 
   function warnOnce(key, error) {
     if (warningKeys.has(key)) return;
@@ -46,7 +48,8 @@
     return safeRun(`querySelectorAll(${selector})`, () => Array.from(root.querySelectorAll(selector)), []);
   }
 
-  // 注入样式
+  // ===== Style and asset injection =====
+
   function injectStyles() {
     const styleId = 'claude-enhance-styles';
     if (document.getElementById(styleId)) return;
@@ -700,19 +703,17 @@
     (document.head || document.documentElement || document.body)?.appendChild(style);
   }
 
-  // [FIX P3-1] 重命名：此函数不注入 JS，只标记 hljs 已就绪并触发首次高亮
   function markHighlightJSReady() {
     if (window.hljsLoaded) return;
-    // Loaded via extension.js injection
+
     console.log('[Claude Enhance] Highlight.js already loaded locally');
     window.hljsLoaded = true;
     highlightAllCode();
   }
 
-  // 注入 KaTeX
   function injectKaTeX() {
     if (window.katexLoaded) return;
-    // Loaded via extension.js injection
+
     const checkKatex = () => {
       if (typeof katex !== 'undefined') {
         window.katexLoaded = true;
@@ -758,7 +759,6 @@
     '[class*="sessionName"]'
   ].join(',');
 
-  // [FIX] 对话框/模态框选择器，排除 Claude Code 确认界面
   const DIALOG_SELECTOR = [
     '[role="dialog"]',
     '[class*="dialog"]',
@@ -790,20 +790,17 @@
     return isInsideNonPreviewRegion(el);
   }
 
-  // [FIX] 判断元素是否在对话框/模态框内部
   function isInsideDialog(el) {
     const node = el?.nodeType === Node.ELEMENT_NODE ? el : el?.parentElement;
     return !!closestSafe(node, DIALOG_SELECTOR);
   }
 
-  // [FIX] 消息内容选择器：只匹配实际消息内容，不匹配对话框等 UI 元素
   const MSG_CONTENT_SELECTOR = '[class*="timelineMessage_"], [class*="assistantMessage_"], [class*="userMessage_"], .rendered-markdown';
   function isInsideMessageContent(node) {
     const el = node?.nodeType === Node.TEXT_NODE ? node.parentElement : node;
     return !!closestSafe(el, MSG_CONTENT_SELECTOR);
   }
 
-  // 高亮代码块
   function getEnhanceRoots() {
     const selectors = [
       '[class*="messagesContainer_"]',
@@ -822,6 +819,8 @@
     topLevelRoots.forEach((el) => el.classList.add('claude-enhance-root'));
     return topLevelRoots;
   }
+
+  // ===== Code highlighting =====
 
   function highlightAllCode() {
     if (typeof hljs === 'undefined') return;
@@ -943,7 +942,8 @@
     pre.appendChild(btn);
   }
 
-  // Make \text{} labels with underscores KaTeX-safe
+  // ===== LaTeX rendering =====
+
   function escapeUnderscoresInText(formula) {
     return formula.replace(/\\text\{([^}]*)\}/g, (match, content) => {
       return `\\text{${content.replace(/_/g, '\\_')}}`;
@@ -1065,11 +1065,8 @@
     }
   }
 
-  // Render LaTeX
-  // Restore LaTeX from Markdown emphasis markup inside math delimiters.
   function htmlFragmentToLatex(html) {
-    // Restore markdown emphasis that was converted to HTML tags
-    // The tags might be UNPAIRED because markdown can split *...* or _..._ across multiple $$ blocks!
+
     let processed = html
       .replace(/(.?)(<\/?(?:em|i)\b[^>]*>)/gi, (match, prefix, tag) => {
         if (prefix === '^') return prefix + '*';
@@ -1087,9 +1084,9 @@
     tmp.childNodes.forEach((node) => {
       const txt = node.textContent || '';
       const isText = node.nodeType === Node.TEXT_NODE;
-      // If there was no separator and an element sits between text-like tokens, insert a star operator as fallback
+
       if (!isText && prevWasText) {
-        // Heuristic: insert a literal operator if adjacent tokens look like identifiers.
+
         if (/\w$/.test(out) && /^\w/.test(txt)) out += '\\ast';
       }
       out += txt;
@@ -1128,8 +1125,6 @@
     const cleaned = formula.replace(/\s+/g, ' ').trim();
     if (!cleaned) return false;
 
-    // Keep ordinary prices like "$5$" or "$5 and ..." as prose, while still
-    // allowing numeric math such as "$10^{-8}$" and "$256{\times}128$".
     if (/^\d/.test(cleaned) && !/[\\{}_^=+\-*/<>×]/.test(cleaned)) return false;
     return isRenderableLatexFormula(cleaned, false);
   }
@@ -1359,10 +1354,7 @@
   }
 
   function repairBareDimensionMath(root) {
-    // [FIX] 不能用 root 级标记：messagesContainer_ 是整个会话唯一且持久的 root，
-    // 一旦打标后续流式消息将永远跳过。此函数天然幂等——
-    // renderBareDimensionMathInTextNode 会消费 ×/\times，已渲染节点不含标记不会被 acceptNode 接受，
-    // 只有新文本会被处理。真正的 O(n²) 热点是 adaptInlineMathSize 的 getBoundingClientRect（保留其元素级标记）。
+
     const walker = document.createTreeWalker(
       root,
       NodeFilter.SHOW_TEXT,
@@ -1393,7 +1385,7 @@
 
   function repairMalformedDimensionKatex(root) {
     querySelectorAllSafe(root, '.katex').forEach((el) => safeRun('repairMalformedDimensionKatex item', () => {
-      if (el.dataset.ceRepaired) return; // 已检查过，跳过
+      if (el.dataset.ceRepaired) return;
       if (closestSafe(el.parentElement, '.katex')) { el.dataset.ceRepaired = 'true'; return; }
       const annotation = querySelectorAllSafe(el, 'annotation[encoding="application/x-tex"]')[0];
       const parts = parseMalformedDimensionText(annotation?.textContent || '');
@@ -1403,7 +1395,6 @@
     }));
   }
 
-  // Preprocess rendered Markdown whose inline math was split by emphasis tags.
   function preprocessHTMLMath(root) {
     const selector = [
       'p', 'li', 'td', 'th', 'blockquote',
@@ -1493,10 +1484,7 @@
   }
 
   function renderRelaxedMarkdownBold(root) {
-    // [FIX] 不能用 root 级标记：messagesContainer_ 是整个会话唯一且持久的 root，
-    // 一旦打标后续流式消息将永远跳过。此函数天然幂等——
-    // renderRelaxedBoldInTextNode 会消费 **，已渲染节点不含 ** 不会被 acceptNode 接受，
-    // 只有新文本会被处理。
+
     const walker = document.createTreeWalker(
       root,
       NodeFilter.SHOW_TEXT,
@@ -1610,7 +1598,7 @@
       .filter((el) => !closestSafe(el, '.katex-display') && !isInsideNonPreviewRegion(el));
 
     candidates.forEach((katexEl) => {
-      if (katexEl.dataset.cePromoted) return; // 已处理，跳过
+      if (katexEl.dataset.cePromoted) return;
       katexEl.dataset.cePromoted = 'true';
       if (!shouldPromoteInlineMath(katexEl)) return;
 
@@ -1639,11 +1627,15 @@
       .filter((el) => !closestSafe(el, '.katex-display') && !isInsideNonPreviewRegion(el));
 
     candidates.forEach((katexEl) => {
-      if (katexEl.dataset.ceAdapted) return; // 已处理，跳过
+      // Per-element marker: measure each formula once. isLargeInlineMath calls
+      // getBoundingClientRect (forced reflow), so skipping processed elements avoids O(n^2).
+      if (katexEl.dataset.ceAdapted) return;
       katexEl.classList.toggle('ce-large-inline-math', isLargeInlineMath(katexEl));
       katexEl.dataset.ceAdapted = 'true';
     });
   }
+
+  // ===== API error rendering =====
 
   function singleLineText(value) {
     return String(value || '').replace(/\s+/g, ' ').trim();
@@ -1909,7 +1901,7 @@
 
     try {
       getEnhanceRoots().forEach((root) => safeRun('renderLaTeX root', () => {
-        // [FIX P1-2] 移除重复的前置处理，只保留 preprocessHTMLMath（需要在 TreeWalker 前执行）
+
         preprocessHTMLMath(root);
 
         const walker = document.createTreeWalker(
@@ -1946,7 +1938,6 @@
           safeRun('renderMathInTextNode', () => renderMathInTextNode(textNode));
         });
 
-        // 后置处理：修复、粗体、提升、适配（只执行一次）
         repairBareDimensionMath(root);
         repairMalformedDimensionKatex(root);
         repairProseKatexErrors(root);
@@ -1959,12 +1950,10 @@
     }
   }
 
-  // ========== AI 对话复制功能 ==========
+  // ===== Conversation copy =====
 
-  // [FIX P3-2] 使用 WeakMap 存储消息引用，避免直接挂 DOM 属性
   const _turnMessagesMap = new WeakMap();
 
-  // 需要排除的类名前缀 (思维链和工具调用)
   const EXCLUDE_PREFIXES = [
     'thinking_',
     'thinkingContent_',
@@ -1980,28 +1969,25 @@
     'userMessageContainer_'
   ];
 
-  // 检查元素是否应该被排除
   function shouldExclude(element) {
     if (!element || !element.className) return false;
     const className = toClassName(element.className);
     return EXCLUDE_PREFIXES.some(prefix => className.includes(prefix));
   }
 
-  // 从 HTML 元素提取 Markdown 格式内容 (紧凑版)
   function htmlToMarkdown(element) {
     if (!element) return '';
 
     const IGNORE_TAGS = new Set(['BUTTON', 'STYLE', 'SCRIPT', 'SVG', 'MAT-ICON']);
 
     function traverse(node, context = {}) {
-      // 文本节点
+
       if (node.nodeType === 3) {
         const text = node.textContent;
         if (context.inPre) return text;
         return text.replace(/\s+/g, ' ');
       }
 
-      // 非元素节点跳过
       if (node.nodeType !== 1) return '';
       if (IGNORE_TAGS.has(node.tagName)) return '';
       if (shouldExclude(node)) return '';
@@ -2014,24 +2000,21 @@
         inList: context.inList || tag === 'LI',
       };
 
-      // 先递归处理子节点
       const childrenContent = children
         .map(c => traverse(c, newContext))
         .join('');
 
-      // KaTeX 公式处理
       if (tag === 'SPAN' && node.classList?.contains('katex')) {
         const annotation = querySelectorAllSafe(node, 'annotation[encoding="application/x-tex"]')[0];
         if (annotation) {
           const tex = annotation.textContent;
-          // 清理换行和多余空格, 保持单行 (Obsidian 兼容)
+
           const cleaned = tex.replace(/\s+/g, ' ').trim();
           const isDisplay = node.classList.contains('katex-display');
           return isDisplay ? `$$${cleaned}$$` : `$${cleaned}$`;
         }
       }
 
-      // 根据标签类型返回格式化内容
       switch (tag) {
         case 'H1': return '\n# ' + childrenContent + '\n';
         case 'H2': return '\n## ' + childrenContent + '\n';
@@ -2136,16 +2119,14 @@
       }
     }
 
-    // 执行转换并紧凑化换行
     return safeRun('htmlToMarkdown', () => traverse(element)
-      .replace(/\n{3,}/g, '\n\n')      // 3+ 个换行 → 最多1个空行
-      .replace(/^\n+/, '')             // 移除开头换行
-      .replace(/\n+$/, '')             // 移除末尾换行
-      .replace(/[ \t]+$/gm, '')        // 移除行尾空格
+      .replace(/\n{3,}/g, '\n\n')
+      .replace(/^\n+/, '')
+      .replace(/\n+$/, '')
+      .replace(/[ \t]+$/gm, '')
       .trim(), '');
   }
 
-  // 按轮次分组消息
   function groupMessagesByTurn() {
     const container = querySelectorAllSafe(document, '[class*="messagesContainer_"]')[0];
     if (!container) return [];
@@ -2173,7 +2154,6 @@
     return turns;
   }
 
-  // 为消息添加复制按钮
   function addCopyButton(messageEl) {
     if (!messageEl || messageEl.nodeType !== 1 || shouldSkipPreviewEnhancement(messageEl)) return;
     if (querySelectorAllSafe(messageEl, '.claude-copy-btn').length) return;
@@ -2187,10 +2167,9 @@
       e.stopPropagation();
 
       try {
-        // 获取整轮消息
+
         const turnMessages = _turnMessagesMap.get(messageEl) || [messageEl];
 
-        // 合并所有消息的 Markdown 内容
         const contents = turnMessages.map(msg => htmlToMarkdown(msg)).filter(c => c.trim());
         const finalContent = contents.join('\n\n');
         if (!navigator.clipboard?.writeText) throw new Error('Clipboard API is unavailable');
@@ -2211,24 +2190,21 @@
     messageEl.appendChild(btn);
   }
 
-  // 扫描并添加复制按钮 (只在每轮末尾添加)
   function scanAndAddCopyButtons() {
     const turns = groupMessagesByTurn();
 
     turns.forEach(turnMessages => {
       if (turnMessages.length === 0) return;
 
-      // 只在每轮最后一个消息上添加按钮
       const lastMessage = turnMessages[turnMessages.length - 1];
 
-      // 存储整轮消息的引用
       _turnMessagesMap.set(lastMessage, turnMessages);
 
       safeRun('addCopyButton', () => addCopyButton(lastMessage));
     });
   }
 
-  // ========== 滚轮缩放功能 ==========
+  // ===== Zoom =====
 
   function getStoredZoom() {
     const zoom = safeRun('read zoom', () => parseFloat(localStorage.getItem('claude-zoom') || '1.0'), 1.0);
@@ -2291,9 +2267,8 @@
     }, 1000);
   }
 
-  // DOM 监听 - 只监听 messagesContainer，不监听整个 body
-  // 这样对话框、按钮等 UI 元素的变化根本不会触发 Observer
-  // 不需要黑名单或白名单过滤
+  // ===== DOM observer =====
+
   function setupObserver() {
     if (typeof MutationObserver === 'undefined' || !document.body) return;
     let debounceTimer = null;
@@ -2303,6 +2278,10 @@
       return !!closestSafe(node?.nodeType === Node.TEXT_NODE ? node.parentElement : node, '.katex, .katex-display, .katex-mathml');
     }
 
+    // Detect DOM changes produced by the enhancement script itself (KaTeX output, hljs,
+    // copy buttons, etc.) so they don't re-trigger the cycle and cause an infinite loop.
+    // Detects DOM changes produced by the enhancement script itself (KaTeX output, highlighting,
+    // copy buttons, etc.) so they don't re-trigger the cycle and cause an infinite render loop.
     function isSelfMutation(m) {
       const target = m.target;
       if (isInsideKatex(target)) return true;
@@ -2320,10 +2299,6 @@
       return m.addedNodes.length > 0;
     }
 
-    // 简化：Observer 只监听 messagesContainer，所有 mutation 都在容器内
-    // 只排除增强脚本自身的元素，其余全部触发增强
-    // 增强函数是幂等的（有 dedup 标记），重复执行无视觉副作用
-    // scroll/zoom 由内容指纹控制，只在内容真正变化时执行
     function classifyMutations(mutations) {
       let needFull = false;
       let needMath = false;
@@ -2369,9 +2344,8 @@
         const { needFull, needMath, needHighlight } = classifyMutations(mutations);
         if (!needFull && !needMath && !needHighlight) return;
 
-        // 首次变化立即执行，后续变化 100ms 防抖
         if (!debounceTimer) {
-          // 立即执行，减少视觉闪烁
+
           if (needFull) {
             runEnhancementCycle();
           } else if (needMath) {
@@ -2390,7 +2364,7 @@
             } finally { _enhancing = false; }
           }
         }
-        // 防抖窗口：后续变化只刷新定时器
+
         clearTimeout(debounceTimer);
         debounceTimer = setTimeout(() => {
           debounceTimer = null;
@@ -2399,56 +2373,44 @@
       });
     });
 
-    // 只监听 messagesContainer，而不是整个 document.body
-    // 对话框、按钮等不在 container 内 → Observer 根本不会触发
-    // 尝试将 Observer 附着到 messagesContainer
-    // 如果 container 不存在（新会话），用 body bridge + 延迟重试双重保障
+    // Switching conversations unmounts the old messagesContainer and mounts a new one,
+    // so we track the current container and re-attach whenever it is replaced or removed.
+    let currentContainer = null;
     function attachToContainer(container) {
+      observer.disconnect();
+      currentContainer = container;
       observer.observe(container, { childList: true, subtree: true, characterData: true });
       console.log('[Claude Enhance] Observer attached to messagesContainer');
-      // container 刚出现，立即跑一次增强
       runEnhancementCycle();
-      // 延迟重试：container 刚出现时内容可能还没渲染
+      // Content may not be rendered yet when the container first appears.
       setTimeout(runEnhancementCycle, 500);
     }
 
-    let attached = false;
-    function tryAttach() {
-      if (attached) return;
+    function ensureAttached() {
+      // Fast path: still attached to a live container, nothing to do.
+      if (currentContainer && currentContainer.isConnected) return;
       const container = document.querySelector('[class*="messagesContainer_"]');
-      if (container) {
-        attached = true;
+      if (container && container !== currentContainer) {
         attachToContainer(container);
-        return true;
       }
-      return false;
     }
 
-    // 立即尝试一次
-    if (!tryAttach()) {
-      // container 不存在，启动 bridge + 延迟重试
-      const bridge = new MutationObserver(() => {
-        if (tryAttach()) bridge.disconnect();
-      });
-      // subtree: true 才能检测到深度嵌套的 messagesContainer
-      bridge.observe(document.body, { childList: true, subtree: true });
-      console.log('[Claude Enhance] Bridge observer waiting for messagesContainer');
+    ensureAttached();
 
-      // 延迟重试作为双重保障（bridge 可能漏掉某些情况）
-      let retryCount = 0;
-      const retryInterval = setInterval(() => {
-        if (tryAttach() || ++retryCount > 30) {
-          clearInterval(retryInterval);
-          if (!attached) bridge.disconnect();
-        }
-      }, 1000);
-    }
+    // Persistent bridge: body-level childList changes signal a container swap. Never disconnected.
+    const bridge = new MutationObserver(() => { safeRun('bridge ensureAttached', ensureAttached); });
+    bridge.observe(document.body, { childList: true, subtree: true });
+    console.log('[Claude Enhance] Bridge observer watching for messagesContainer changes');
+
+    // Low-frequency poll as a backstop in case the bridge misses a swap.
+    setInterval(() => { safeRun('interval ensureAttached', ensureAttached); }, 2000);
   }
 
-  // DOM 探测工具 - 按 Ctrl+Shift+D 导出 DOM 结构
+  // ===== DOM inspector (Ctrl+Shift+D) =====
+
   function setupDOMInspector() {
     document.addEventListener('keydown', (e) => {
-      // Ctrl+Shift+D 触发 DOM 导出
+
       if (e.ctrlKey && e.shiftKey && e.key === 'D') {
         e.preventDefault();
         exportDOMStructure();
@@ -2468,7 +2430,6 @@
       potentialMessageSelectors: []
     };
 
-    // 收集所有类名
     querySelectorAllSafe(document, '*').forEach(el => {
       const className = toClassName(el.className);
       if (className) {
@@ -2478,7 +2439,6 @@
       }
     });
 
-    // 查找可能的消息容器 (基于常见模式)
     const messagePatterns = [
       '[class*="message"]', '[class*="Message"]',
       '[class*="chat"]', '[class*="Chat"]',
@@ -2505,13 +2465,11 @@
       } catch (e) {}
     });
 
-    // 分析 #root 下的结构
     const root = document.getElementById('root');
     if (root) {
       result.rootStructure = analyzeElement(root, 0, 4);
     }
 
-    // 查找包含大量文本的容器
     const textContainers = [];
     querySelectorAllSafe(document, 'div, section, article').forEach(el => {
       const text = el.innerText || '';
@@ -2530,10 +2488,8 @@
     });
     result.textContainers = textContainers.slice(0, 20);
 
-    // 转换 Set 为数组
     result.allClassNames = Array.from(result.allClassNames).sort();
 
-    // 复制到剪贴板
     const output = JSON.stringify(result, null, 2);
     if (!navigator.clipboard?.writeText) {
       console.log('[Claude Enhance] DOM Structure:\n', output);
@@ -2545,7 +2501,7 @@
       console.log('[Claude Enhance] DOM structure copied to clipboard');
     }).catch(err => {
       console.error('[Claude Enhance] Failed to copy:', err);
-      // 降级: 打印到控制台
+
       console.log('[Claude Enhance] DOM Structure:\n', output);
       showNotification('复制失败, 请查看控制台 (F12)');
     });
@@ -2561,7 +2517,6 @@
       childCount: el.children.length
     };
 
-    // 检查特殊属性
     const attrs = ['role', 'data-message', 'data-turn', 'data-type', 'data-testid'];
     attrs.forEach(attr => {
       if (el.hasAttribute(attr)) {
@@ -2569,7 +2524,6 @@
       }
     });
 
-    // 递归分析子元素 (只分析前几个)
     if (el.children.length > 0 && depth < maxDepth) {
       info.children = Array.from(el.children)
         .slice(0, 5)
@@ -2607,9 +2561,10 @@
     }, 2000);
   }
 
-  // [FIX P0-2] 滚动保持：增强循环修改 DOM 后保持视图在底部
+  // ===== Enhancement cycle and init =====
+
   function scrollToBottomIfNeeded() {
-    // 查找滚动容器：messagesContainer 的可滚动祖先，或 document 级别的滚动元素
+
     const msgContainer = document.querySelector('[class*="messagesContainer_"]');
     let container = msgContainer;
     while (container && container !== document.body) {
@@ -2631,29 +2586,27 @@
     }
   }
 
-  // [FIX] 内容指纹跟踪：只在内容真正变化时执行 scroll/zoom
-  // 增强函数本身是幂等的（有 dedup 标记），重复执行不会产生视觉变化
-  // 但 scroll/zoom 会导致视觉跳动，所以只在有新内容时执行
   let _lastContentHash = '';
 
   function getContentHash() {
     const roots = getEnhanceRoots();
     if (!roots.length) return '';
-    // 取每个 root 的文本长度和前 50 字符作为轻量指纹
+
     return roots.map(r => `${r.textContent?.length || 0}:${(r.textContent || '').slice(0, 50)}`).join('|');
   }
 
+  // Full enhancement pass. Sets _enhancing so the Observer ignores the DOM
+  // changes it makes; zoom only re-applies when content actually changed.
   function runEnhancementCycle() {
     _enhancing = true;
     try {
-      // scroll 每次都执行（自身有"是否在底部"判断，不会在用户手动滚动时干扰）
+
       scrollToBottomIfNeeded();
       safeRun('renderApiErrors', renderApiErrors);
       safeRun('highlightAllCode', highlightAllCode);
       safeRun('renderLaTeX', renderLaTeX);
       safeRun('scanAndAddCopyButtons', scanAndAddCopyButtons);
 
-      // zoom 只在内容真正变化时执行（避免无意义的字体大小重算）
       const hash = getContentHash();
       if (hash !== _lastContentHash) {
         _lastContentHash = hash;
@@ -2666,7 +2619,6 @@
     }
   }
 
-  // 初始化
   function init() {
     console.log('[Claude Enhance] Initializing...');
     safeRun('injectStyles', injectStyles);
@@ -2675,9 +2627,9 @@
     safeRun('setupZoom', setupZoom);
     safeRun('setupObserver', setupObserver);
     safeRun('setupDOMInspector', setupDOMInspector);
-    // 立即尝试一次（覆盖已有内容的情况）
+
     runEnhancementCycle();
-    // 延迟重试：React 可能还没渲染完消息
+
     setTimeout(runEnhancementCycle, 1000);
     setTimeout(runEnhancementCycle, 3000);
   }
