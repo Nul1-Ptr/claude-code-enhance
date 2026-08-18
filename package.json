@@ -1,8 +1,8 @@
 {
   "name": "claude-code-enhance",
   "displayName": "Claude Code Enhance",
-  "description": "Adds LaTeX math rendering and enhanced output preview controls to Claude Code chat.",
-  "version": "1.0.4",
+  "description": "Improves Claude Code rich rendering and exposes complete sub-agent transcripts in VS Code.",
+  "version": "1.0.5",
   "publisher": "AlexisHe",
   "license": "MIT",
   "repository": {
@@ -25,6 +25,8 @@
     "claude",
     "claude-code",
     "anthropic",
+    "agents",
+    "transcripts",
     "markdown",
     "rendering"
   ],
@@ -33,7 +35,8 @@
     "theme": "dark"
   },
   "activationEvents": [
-    "onStartupFinished"
+    "onStartupFinished",
+    "onView:claude-code-enhance.subagents"
   ],
   "main": "./extension.js",
   "contributes": {
@@ -53,8 +56,56 @@
       {
         "command": "claude-code-enhance.diagnostics",
         "title": "Claude Code Enhance: Show Diagnostics"
+      },
+      {
+        "command": "claude-code-enhance.openSubagentTranscripts",
+        "title": "Claude Code Enhance: Open Sub-agent Sidebar"
+      },
+      {
+        "command": "claude-code-enhance.openRawSubagentTranscript",
+        "title": "Claude Code Enhance: Open Raw Sub-agent Transcript",
+        "icon": "$(json)"
+      },
+      {
+        "command": "claude-code-enhance.refreshSubagents",
+        "title": "Claude Code Enhance: Refresh Sub-agents",
+        "icon": "$(refresh)"
       }
     ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "claude-code-enhance",
+          "title": "Claude Code",
+          "icon": "resources/subagents.svg"
+        }
+      ]
+    },
+    "views": {
+      "claude-code-enhance": [
+        {
+          "id": "claude-code-enhance.subagents",
+          "name": "Sub-agents",
+          "contextualTitle": "Claude Code Sub-agents"
+        }
+      ]
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "claude-code-enhance.refreshSubagents",
+          "when": "view == claude-code-enhance.subagents",
+          "group": "navigation@1"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "claude-code-enhance.openRawSubagentTranscript",
+          "when": "viewItem == subagentTranscript",
+          "group": "inline@1"
+        }
+      ]
+    },
     "configuration": {
       "title": "Claude Code Enhance",
       "properties": {
@@ -96,15 +147,21 @@
           "type": "boolean",
           "default": true,
           "description": "Present API errors as structured, theme-aware diagnostic cards."
+        },
+        "claudeCodeEnhance.subagentProjectsRoot": {
+          "type": "string",
+          "default": "",
+          "description": "Root containing Claude Code project histories and sub-agent transcripts. Leave empty to use ~/.claude/projects."
         }
       }
     }
   },
   "scripts": {
-    "test": "node scripts/smoke-test.js && node scripts/rich-content-regression.js && node scripts/architecture-regression.js",
+    "test": "node scripts/smoke-test.js && node scripts/rich-content-regression.js && node scripts/architecture-regression.js && node scripts/subagent-regression.js",
     "test:smoke": "node scripts/smoke-test.js",
     "test:rich": "node scripts/rich-content-regression.js",
     "test:architecture": "node scripts/architecture-regression.js",
+    "test:subagents": "node scripts/subagent-regression.js",
     "test:history": "node scripts/history-regression.js",
     "package": "npx --yes @vscode/vsce package --no-dependencies --allow-missing-repository",
     "restore": "node ./uninstall-hook.js",

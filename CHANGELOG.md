@@ -1,5 +1,21 @@
 # Changelog
 
+## [1.0.5] - 2026-08-18
+
+### Sub-agent Transcripts
+- Added a native activity-bar tree that groups Claude Code child-agent histories by project and parent session, with prompt labels, agent type, status, size, and raw JSONL access.
+- Added a separate complete transcript webview for user, assistant, thinking, tool-call, tool-result, and error records. Open transcripts refresh append-only while their JSONL files grow.
+- Added search and message-type filters without coupling the feature to Claude Code's private extension-host/webview protocol.
+
+### Rich Rendering And Safety
+- Added bundled Marked GFM parsing for transcript tables and code fences, KaTeX rendering with math-aware table-pipe protection, Highlight.js code rendering, and source-preserving formula failures.
+- Added DOM allowlisting, literal raw-HTML handling, restricted links, local-only assets, and a nonce-based Content Security Policy.
+- Added softer tool/API error styling, readable table math, adaptive display-math padding, and left-aligned formulas.
+
+### Validation
+- Added synthetic JSONL streaming, malformed-line, tool/error, Markdown, math, table, code, and CSP regressions.
+- Validated every local sub-agent history: 113 JSONL files, 16,184 renderable messages, and 50 MB in the current test corpus.
+
 ## [1.0.4] - 2026-08-18
 
 ### Architecture

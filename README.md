@@ -17,6 +17,7 @@ It adds:
 - Table and code-block readability improvements
 - Ctrl/Cmd + mouse-wheel zoom for the chat output
 - Configurable content/math scale and optional full-transcript retention
+- A native sub-agent sidebar with complete, live child transcripts
 
 ## Preview
 
@@ -114,6 +115,22 @@ The enhancer forces VS Code theme colors on the chat input and textarea elements
 
 The chat composer uses `contenteditable` and `[role="textbox"]` elements. The enhancer explicitly resets all code block styling on these elements (borders, padding, background, whitespace) so preview styles do not leak into the editing surface.
 
+### Sub-agent Transcript Sidebar
+
+The Claude Code activity-bar view exposes child-agent histories that the main Claude conversation normally summarizes. It reads Claude's existing files from `~/.claude/projects/<project>/<session>/subagents/agent-*.jsonl` and groups them by project and parent session. History files are read-only and are never rewritten.
+
+Selecting a child agent opens its complete transcript in a separate live webview. The view includes:
+
+- Full user, assistant, thinking, tool-call, and tool-result records
+- Search plus answer, thinking, tool, and error filters
+- GFM tables and fenced code through the bundled Marked parser
+- KaTeX formulas protected before Markdown tokenization, including formulas inside tables
+- Syntax highlighting and copy controls for code and tool output
+- Structured tool/API errors and an option to open the original JSONL
+- Append-only refresh while Claude is writing new records
+
+Raw HTML in transcript text is displayed literally. Rendered Markdown is DOM-sanitized, links are protocol-restricted, and the webview uses a nonce-based Content Security Policy. If KaTeX rejects malformed or unsupported input, the original formula remains visible with an error tooltip.
+
 ### Status Bar Indicator
 
 A status bar item (right-aligned) shows the current state:
@@ -139,7 +156,7 @@ Press **Ctrl+Shift+D** inside the Claude Code webview to dump the DOM structure 
 
 ## Version
 
-Current local version: `1.0.4`
+Current local version: `1.0.5`
 
 The package version, internal patch build, and normalized configuration hash are stamped separately. A rebuild can therefore refresh stale injected code or settings without depending on a specific Claude Code version.
 
@@ -155,7 +172,7 @@ From this directory:
 
 ```bash
 npm run package
-code --install-extension claude-code-enhance-1.0.4.vsix --force
+code --install-extension claude-code-enhance-1.0.5.vsix --force
 ```
 
 Reload VS Code after installing. The extension patches Claude Code automatically on startup and reloads the Claude Code webview when it applies or refreshes the patch.
@@ -168,6 +185,9 @@ Open the command palette with `Ctrl+Shift+P`:
 - `Claude Code Enhance: Disable`
 - `Claude Code Enhance: Status`
 - `Claude Code Enhance: Show Diagnostics`
+- `Claude Code Enhance: Open Sub-agent Sidebar`
+- `Claude Code Enhance: Open Raw Sub-agent Transcript`
+- `Claude Code Enhance: Refresh Sub-agents`
 
 ## Settings
 
@@ -180,6 +200,7 @@ Open the command palette with `Ctrl+Shift+P`:
 | `claudeCodeEnhance.syntaxHighlighting` | `true` | Apply bundled syntax highlighting. |
 | `claudeCodeEnhance.copyButtons` | `true` | Add code-block and assistant-turn copy controls. |
 | `claudeCodeEnhance.apiErrorCards` | `true` | Render API errors as structured diagnostic cards. |
+| `claudeCodeEnhance.subagentProjectsRoot` | empty | Override the Claude history root used by the sub-agent sidebar; empty uses `~/.claude/projects`. |
 
 Setting changes are normalized, hashed into the patch stamp, and applied by a guarded webview refresh.
 
@@ -197,6 +218,8 @@ Before patching, it creates backups:
 - `webview/.claude-enhance-backup.json`
 
 The extension discovers the Markdown renderer and transcript-retention function through an Acorn syntax tree rather than a version-specific minified-code string. Discovery fails closed if no unique target exists. JS/CSS updates use verified temporary files, `fsync`, atomic renames, and rollback; backup metadata records Claude's version and SHA-256 hashes.
+
+The sub-agent sidebar does not patch Claude Code. It runs in this extension's host process and reads the public JSONL history layout, so its project/session/agent view is independent of Claude Code's minified webview bundle.
 
 ## How Rendering Works
 
@@ -261,6 +284,12 @@ Run the dependency-free smoke test:
 
 ```bash
 npm test
+```
+
+Run the focused sub-agent parser/renderer regression, including every local child-agent JSONL file:
+
+```bash
+npm run test:subagents
 ```
 
 Validate all local Claude and Codex JSONL histories (this scans several gigabytes on a typical development machine):

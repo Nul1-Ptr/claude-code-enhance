@@ -15,6 +15,7 @@ const {
   sha256,
   transactionalWriteFilesSync,
 } = require('./lib/file-transaction');
+const { registerSubagentSidebar } = require('./lib/subagent-sidebar');
 
 const PATCH_MARKER = '/* === KaTeX LaTeX Rendering Patch === */';
 const PATCH_CSS_MARKER = '/* === KaTeX LaTeX Rendering CSS Patch === */';
@@ -555,6 +556,12 @@ function collectDiagnostics(extDir, options = readPatchOptions()) {
 function activate(context) {
   const vendorDir = path.join(context.extensionPath, 'vendor');
 
+  try {
+    registerSubagentSidebar(vscode, context);
+  } catch (error) {
+    console.error('[Claude Code Enhance] Sub-agent sidebar failed to initialize:', error);
+  }
+
   // Auto-patch on startup. Files stay patched on disk between sessions so the
   // webview always loads the patched version (it loads before this extension).
   const extDir = findClaudeCodeExtDir();
@@ -778,4 +785,5 @@ module.exports._test = {
   BACKUP_METADATA_FILE,
   PATCH_SCHEMA_VERSION,
   ISSUES_URL,
+  registerSubagentSidebar,
 };
