@@ -2,7 +2,7 @@
   "name": "claude-code-enhance",
   "displayName": "Claude Code Enhance",
   "description": "Improves Claude Code rich rendering and exposes complete sub-agent transcripts in VS Code.",
-  "version": "1.0.5",
+  "version": "1.0.6",
   "publisher": "AlexisHe",
   "license": "MIT",
   "repository": {

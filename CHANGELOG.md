@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.0.6] - 2026-08-18
+
+### Sidebar Icon
+- Replaced the unsupported raster-embedded activity icon with a native 24px SVG and assigned an explicit visible stroke color.
+- Bumped the extension version so VS Code loads the corrected icon from a fresh extension resource path instead of a cached `1.0.5` asset.
+
 ## [1.0.5] - 2026-08-18
 
 ### Sub-agent Transcripts

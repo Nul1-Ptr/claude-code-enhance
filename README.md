@@ -156,7 +156,7 @@ Press **Ctrl+Shift+D** inside the Claude Code webview to dump the DOM structure 
 
 ## Version
 
-Current local version: `1.0.5`
+Current local version: `1.0.6`
 
 The package version, internal patch build, and normalized configuration hash are stamped separately. A rebuild can therefore refresh stale injected code or settings without depending on a specific Claude Code version.
 
@@ -172,7 +172,7 @@ From this directory:
 
 ```bash
 npm run package
-code --install-extension claude-code-enhance-1.0.5.vsix --force
+code --install-extension claude-code-enhance-1.0.6.vsix --force
 ```
 
 Reload VS Code after installing. The extension patches Claude Code automatically on startup and reloads the Claude Code webview when it applies or refreshes the patch.
