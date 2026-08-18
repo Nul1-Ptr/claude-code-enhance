@@ -77,7 +77,7 @@
         {
           "id": "claude-code-enhance",
           "title": "Claude Code",
-          "icon": "resources/subagents.svg"
+          "icon": "icon.png"
         }
       ]
     },
