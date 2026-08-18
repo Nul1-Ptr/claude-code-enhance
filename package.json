@@ -49,13 +49,63 @@
       {
         "command": "claude-code-enhance.status",
         "title": "Claude Code Enhance: Status"
+      },
+      {
+        "command": "claude-code-enhance.diagnostics",
+        "title": "Claude Code Enhance: Show Diagnostics"
       }
-    ]
+    ],
+    "configuration": {
+      "title": "Claude Code Enhance",
+      "properties": {
+        "claudeCodeEnhance.fullTranscript": {
+          "type": "boolean",
+          "default": true,
+          "description": "Keep the full Claude conversation mounted instead of applying Claude Code's built-in retention cap. This can use substantial memory in very long sessions."
+        },
+        "claudeCodeEnhance.contentScale": {
+          "type": "number",
+          "default": 1.1,
+          "minimum": 0.8,
+          "maximum": 1.5,
+          "description": "Base scale applied to rendered conversation content."
+        },
+        "claudeCodeEnhance.mathScale": {
+          "type": "number",
+          "default": 1.0,
+          "minimum": 0.8,
+          "maximum": 1.6,
+          "description": "Additional scale applied to inline and display mathematics."
+        },
+        "claudeCodeEnhance.toolOutputMath": {
+          "type": "boolean",
+          "default": true,
+          "description": "Render validated mathematics found in prose-oriented tool output while preserving code regions."
+        },
+        "claudeCodeEnhance.syntaxHighlighting": {
+          "type": "boolean",
+          "default": true,
+          "description": "Apply bundled syntax highlighting to Claude Code output blocks."
+        },
+        "claudeCodeEnhance.copyButtons": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show copy controls for code blocks and assistant turns."
+        },
+        "claudeCodeEnhance.apiErrorCards": {
+          "type": "boolean",
+          "default": true,
+          "description": "Present API errors as structured, theme-aware diagnostic cards."
+        }
+      }
+    }
   },
   "scripts": {
-    "test": "node scripts/smoke-test.js && node scripts/rich-content-regression.js",
+    "test": "node scripts/smoke-test.js && node scripts/rich-content-regression.js && node scripts/architecture-regression.js",
     "test:smoke": "node scripts/smoke-test.js",
     "test:rich": "node scripts/rich-content-regression.js",
+    "test:architecture": "node scripts/architecture-regression.js",
+    "test:history": "node scripts/history-regression.js",
     "package": "npx --yes @vscode/vsce package --no-dependencies --allow-missing-repository",
     "restore": "node ./uninstall-hook.js",
     "vscode:uninstall": "node ./uninstall-hook.js"

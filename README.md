@@ -13,8 +13,10 @@ It adds:
 - Theme-aware output styling for light, dark, and high-contrast themes
 - More readable prompt/input text
 - Copy buttons for assistant output and individual code blocks
+- Structured, theme-aware API error cards
 - Table and code-block readability improvements
 - Ctrl/Cmd + mouse-wheel zoom for the chat output
+- Configurable content/math scale and optional full-transcript retention
 
 ## Preview
 
@@ -39,7 +41,7 @@ The extension renders LaTeX math in Claude Code's responses using KaTeX. Four de
 | `\(...\)` | Inline math | `The matrix \(A \in \mathbb{R}^{m \times n}\) has rank \(r\).` |
 | `\[...\]` | Display math | `\[\mathbf{n}_{\text{phys}} = \mathbf{S}^T \cdot \mathbf{n}_{\text{ref}}\]` |
 
-**Display math** renders as a centered, full-width block with a themed background and larger font size (1.6em). **Inline math** renders within the text flow at 1.1em with subtle background shading and rounded corners.
+**Display math** renders as a centered, full-width block with a themed background and larger type. **Inline math** renders within the text flow with subtle background shading. Both sizes follow the `mathScale` setting.
 
 **Smart math detection** — the enhancer uses heuristics to avoid rendering prose text as math. It detects CJK characters, prose punctuation, word density, and markdown emphasis patterns to decide whether a `$...$` span is actually LaTeX. False positives (KaTeX error spans in prose) are automatically cleaned up.
 
@@ -120,6 +122,7 @@ A status bar item (right-aligned) shows the current state:
 |---|---|
 | `LaTeX` (with operator symbol) | Enhancement patch is active |
 | `LaTeX (off)` | Patch is not applied |
+| `LaTeX` (with warning symbol) | Only part of the patch is present; open diagnostics |
 | `LaTeX (no CC)` | Claude Code extension is not installed |
 
 Click the status bar item to run the status command, which reports the current patch state in detail.
@@ -127,6 +130,7 @@ Click the status bar item to run the status command, which reports the current p
 ### DOM Inspector (Hidden Debug Tool)
 
 Press **Ctrl+Shift+D** inside the Claude Code webview to dump the DOM structure to your clipboard as JSON. This includes:
+- Runtime configuration and rendering/scheduler diagnostics
 - All unique class names in the document
 - Elements matching 14 message-related selector patterns
 - Root element structure analysis (up to 4 levels deep)
@@ -135,9 +139,9 @@ Press **Ctrl+Shift+D** inside the Claude Code webview to dump the DOM structure 
 
 ## Version
 
-Current local version: `1.0.0`
+Current local version: `1.0.4`
 
-The package version is intentionally kept at `1.0.0` for now. Internal patch revisions are tracked separately inside the patched webview so a rebuilt `1.0.0` VSIX can still refresh stale injected code.
+The package version, internal patch build, and normalized configuration hash are stamped separately. A rebuild can therefore refresh stale injected code or settings without depending on a specific Claude Code version.
 
 ## Requirements
 
@@ -151,7 +155,7 @@ From this directory:
 
 ```bash
 npm run package
-code --install-extension claude-code-enhance-1.0.0.vsix --force
+code --install-extension claude-code-enhance-1.0.4.vsix --force
 ```
 
 Reload VS Code after installing. The extension patches Claude Code automatically on startup and reloads the Claude Code webview when it applies or refreshes the patch.
@@ -163,6 +167,21 @@ Open the command palette with `Ctrl+Shift+P`:
 - `Claude Code Enhance: Enable`
 - `Claude Code Enhance: Disable`
 - `Claude Code Enhance: Status`
+- `Claude Code Enhance: Show Diagnostics`
+
+## Settings
+
+| Setting | Default | Purpose |
+|---|---:|---|
+| `claudeCodeEnhance.fullTranscript` | `true` | Keep the full conversation mounted; disable this for Claude Code's built-in retention cap. |
+| `claudeCodeEnhance.contentScale` | `1.1` | Scale rendered conversation content (`0.8`-`1.5`). |
+| `claudeCodeEnhance.mathScale` | `1.0` | Additional inline/display math scale (`0.8`-`1.6`). |
+| `claudeCodeEnhance.toolOutputMath` | `true` | Render validated math in prose-oriented tool output while preserving code regions. |
+| `claudeCodeEnhance.syntaxHighlighting` | `true` | Apply bundled syntax highlighting. |
+| `claudeCodeEnhance.copyButtons` | `true` | Add code-block and assistant-turn copy controls. |
+| `claudeCodeEnhance.apiErrorCards` | `true` | Render API errors as structured diagnostic cards. |
+
+Setting changes are normalized, hashed into the patch stamp, and applied by a guarded webview refresh.
 
 ## What Gets Patched
 
@@ -175,8 +194,9 @@ Before patching, it creates backups:
 
 - `webview/index.js.katex-bak`
 - `webview/index.css.katex-bak`
+- `webview/.claude-enhance-backup.json`
 
-The patch is version-stamped. When this extension updates, it can restore the original files from backup and re-apply the current patch.
+The extension discovers the Markdown renderer and transcript-retention function through an Acorn syntax tree rather than a version-specific minified-code string. Discovery fails closed if no unique target exists. JS/CSS updates use verified temporary files, `fsync`, atomic renames, and rollback; backup metadata records Claude's version and SHA-256 hashes.
 
 ## How Rendering Works
 
@@ -188,7 +208,7 @@ $J^{-1} = S/|J|$
 $$\tilde{F}_{ij} = \sum_k S^{\xi_i}_k \cdot F_{kj}$$
 ```
 
-The bundled `enhance.js` also runs inside the webview to improve output styling, copy behavior, zoom, tables, code blocks, and fallback math rendering.
+The bundled `enhance.js` also runs inside the webview to improve output styling, copy behavior, zoom, tables, code blocks, API errors, and fallback math rendering. A shared feature registry processes dirty message roots once per animation frame; conversation-container replacement is the deliberate full-pass fallback.
 
 ## Theme Behavior
 
@@ -241,6 +261,12 @@ Run the dependency-free smoke test:
 
 ```bash
 npm test
+```
+
+Validate all local Claude and Codex JSONL histories (this scans several gigabytes on a typical development machine):
+
+```bash
+npm run test:history
 ```
 
 Build a VSIX:

@@ -3,5 +3,7 @@
 node_modules/**
 .gitignore
 .env
+.claude/**
+.codex/**
 scripts/**
 *.vsix

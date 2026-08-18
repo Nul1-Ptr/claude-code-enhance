@@ -8,8 +8,50 @@
 
   console.log('[Claude Enhance] Loading...');
 
-  const CONTENT_BASE_FONT_SCALE = 1.10;
+  const suppliedConfig = window.__CLAUDE_ENHANCE_CONFIG__ || {};
+  const finiteConfig = (value, fallback, minimum, maximum) => {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? Math.max(minimum, Math.min(maximum, parsed)) : fallback;
+  };
+  const RUNTIME_CONFIG = Object.freeze({
+    fullTranscript: suppliedConfig.fullTranscript !== false,
+    contentScale: finiteConfig(suppliedConfig.contentScale, 1.1, 0.8, 1.5),
+    mathScale: finiteConfig(suppliedConfig.mathScale, 1.0, 0.8, 1.6),
+    toolOutputMath: suppliedConfig.toolOutputMath !== false,
+    syntaxHighlighting: suppliedConfig.syntaxHighlighting !== false,
+    copyButtons: suppliedConfig.copyButtons !== false,
+    apiErrorCards: suppliedConfig.apiErrorCards !== false,
+  });
+  const CONTENT_BASE_FONT_SCALE = RUNTIME_CONFIG.contentScale;
+  const mathFontSize = (base) => `${Math.round(base * RUNTIME_CONFIG.mathScale * 1000) / 1000}em`;
   const warningKeys = new Set();
+  const runtimeDiagnostics = {
+    startedAt: new Date().toISOString(),
+    config: RUNTIME_CONFIG,
+    enhancementCycles: 0,
+    mutationBatches: 0,
+    dirtyRootsProcessed: 0,
+    scheduler: {
+      fullPasses: 0,
+      incrementalPasses: 0,
+      coalescedBatches: 0,
+      lastBatchAt: null,
+      lastBatchReasons: [],
+      pending: null,
+    },
+    features: {
+      apiErrors: { attempts: 0, succeeded: 0, failed: 0 },
+      code: { attempts: 0, succeeded: 0, failed: 0 },
+      math: { attempts: 0, succeeded: 0, failed: 0 },
+      copy: { attempts: 0, succeeded: 0, failed: 0 },
+      zoom: { attempts: 0, succeeded: 0, failed: 0 },
+    },
+    warnings: 0,
+    math: { candidates: 0, rendered: 0, literal: 0, repaired: 0, domRendered: 0, failed: 0 },
+    codeBlocks: { highlighted: 0, plain: 0 },
+    apiErrors: 0,
+  };
+  window.__CLAUDE_ENHANCE_DIAGNOSTICS__ = runtimeDiagnostics;
 
   // Guard flag: while an enhancement cycle runs, the Observer ignores its own DOM changes.
   let _enhancing = false;
@@ -19,6 +61,7 @@
   function warnOnce(key, error) {
     if (warningKeys.has(key)) return;
     warningKeys.add(key);
+    runtimeDiagnostics.warnings++;
     console.warn(`[Claude Enhance] ${key} failed:`, error);
   }
 
@@ -46,6 +89,15 @@
   function querySelectorAllSafe(root, selector) {
     if (!root || typeof root.querySelectorAll !== 'function') return [];
     return safeRun(`querySelectorAll(${selector})`, () => Array.from(root.querySelectorAll(selector)), []);
+  }
+
+  function matchesSafe(el, selector) {
+    if (!el || typeof el.matches !== 'function') return false;
+    return safeRun(`matches(${selector})`, () => el.matches(selector), false);
+  }
+
+  function diagnosticsSnapshot() {
+    return JSON.parse(JSON.stringify(runtimeDiagnostics));
   }
 
   // ===== Style and asset injection =====
@@ -371,7 +423,7 @@
       /* KaTeX: inline + display */
       .katex,
       .claude-enhance-root .katex {
-        font-size: 1.1em;
+        font-size: ${mathFontSize(1.1)};
         line-height: 1.35;
         color: var(--ce-fg);
       }
@@ -431,7 +483,7 @@
       .katex-display > .katex,
       .claude-enhance-root .katex-display > .katex {
         display: inline-block;
-        font-size: 1.6em;
+        font-size: ${mathFontSize(1.6)};
         line-height: 1.6;
         text-align: initial;
         padding: 0;
@@ -459,7 +511,7 @@
         scrollbar-gutter: auto;
       }
       .claude-enhance-root table :is(td, th) .katex-display > .katex {
-        font-size: 1.48em !important;
+        font-size: ${mathFontSize(1.48)} !important;
         line-height: 1.5;
         max-width: 100%;
       }
@@ -474,7 +526,7 @@
         line-height: 1.35;
       }
       .claude-enhance-root table :is(td, th) .katex:not(.katex-display > .katex) {
-        font-size: 1.22em;
+        font-size: ${mathFontSize(1.22)};
         padding: 0.04em 0.12em;
         background: transparent;
         box-shadow: none;
@@ -708,7 +760,7 @@
 
     console.log('[Claude Enhance] Highlight.js already loaded locally');
     window.hljsLoaded = true;
-    highlightAllCode();
+    enqueueFullEnhancement(['code'], 'highlight-ready');
   }
 
   function injectKaTeX() {
@@ -718,6 +770,7 @@
       if (typeof katex !== 'undefined') {
         window.katexLoaded = true;
         console.log('[Claude Enhance] KaTeX ready:', typeof katex);
+        enqueueFullEnhancement(['math'], 'katex-ready');
       } else {
         setTimeout(checkKatex, 100);
       }
@@ -739,24 +792,43 @@
     '[class*="userMessageContainer_"]'
   ].join(',');
 
-  const NON_PREVIEW_SELECTOR = [
+  const CODE_SURFACE_SELECTOR = [
+    '[class*="diffEditorWrapper_"]',
+    '[class*="diffEditorContainer_"]',
+    '.monaco-diff-editor',
+    '.monaco-editor'
+  ].join(',');
+
+  // Tool results can contain either source/code or Markdown prose returned by
+  // Read/search tools. Keep them excluded from broad UI enhancements, but give
+  // the math pipeline a separate, code-aware exception for the latter.
+  const TOOL_OUTPUT_SELECTOR = [
+    '[class*="toolResult_"]',
+    '[class*="toolBody_"]',
+    '[class*="toolBodyGrid_"]',
+    '[class*="toolBodyRow_"]'
+  ].join(',');
+
+  const NON_TOOL_PREVIEW_SELECTOR = [
     INTERACTIVE_SELECTOR,
     USER_MESSAGE_SELECTOR,
     '[class*="thinking_"]',
     '[class*="thinkingContent_"]',
     '[class*="thinkingSummary_"]',
-    '[class*="toolUse_"]',
-    '[class*="toolResult_"]',
-    '[class*="toolBody_"]',
-    '[class*="toolBodyGrid_"]',
-    '[class*="toolBodyRow_"]',
     '[class*="toolSummary_"]',
+    CODE_SURFACE_SELECTOR,
     '.ce-api-error',
     '[class*="header"]',
     '[class*="sessionList"]',
     '[class*="sessionsList"]',
     '[class*="sessionItem"]',
     '[class*="sessionName"]'
+  ].join(',');
+
+  const NON_PREVIEW_SELECTOR = [
+    NON_TOOL_PREVIEW_SELECTOR,
+    '[class*="toolUse_"]',
+    TOOL_OUTPUT_SELECTOR
   ].join(',');
 
   const DIALOG_SELECTOR = [
@@ -785,6 +857,37 @@
     return !!closestSafe(node, NON_PREVIEW_SELECTOR);
   }
 
+  function isInsideToolOutput(el) {
+    const node = el?.nodeType === Node.ELEMENT_NODE ? el : el?.parentElement;
+    return !!closestSafe(node, TOOL_OUTPUT_SELECTOR);
+  }
+
+  function hasExplicitCodeLanguage(el) {
+    if (!el || el.nodeType !== Node.ELEMENT_NODE) return false;
+    const className = toClassName(el.className);
+    return !!el.getAttribute?.('data-language') ||
+      /(?:^|\s)(?:language-|lang-|hljs\b)/i.test(className);
+  }
+
+  function isMathCodeElement(el) {
+    const node = el?.nodeType === Node.ELEMENT_NODE ? el : el?.parentElement;
+    if (!node || node.nodeType !== Node.ELEMENT_NODE) return false;
+    if (node.tagName === 'CODE') return true;
+    if (node.tagName !== 'PRE') return false;
+    if (!isInsideToolOutput(node)) return true;
+    return hasExplicitCodeLanguage(node) || querySelectorAllSafe(node, 'code').length > 0;
+  }
+
+  function isInsideMathExcludedRegion(el) {
+    const node = el?.nodeType === Node.ELEMENT_NODE ? el : el?.parentElement;
+    if (!node || node.nodeType !== Node.ELEMENT_NODE) return true;
+    if (isMathCodeElement(node)) return true;
+    if (isInsideToolOutput(node)) {
+      return !RUNTIME_CONFIG.toolOutputMath || !!closestSafe(node, NON_TOOL_PREVIEW_SELECTOR);
+    }
+    return !!closestSafe(node, NON_PREVIEW_SELECTOR);
+  }
+
   function shouldSkipPreviewEnhancement(el) {
     if (!el || el.nodeType !== Node.ELEMENT_NODE) return true;
     return isInsideNonPreviewRegion(el);
@@ -795,42 +898,77 @@
     return !!closestSafe(node, DIALOG_SELECTOR);
   }
 
-  const MSG_CONTENT_SELECTOR = '[class*="timelineMessage_"], [class*="assistantMessage_"], [class*="userMessage_"], .rendered-markdown';
+  const MESSAGE_CONTAINER_SELECTOR = '[class*="messagesContainer_"]';
+  const MESSAGE_PROCESSING_SELECTOR = [
+    '[class*="timelineMessage_"]',
+    '[class*="messageContent_"]',
+    '[class*="assistantMessage_"]',
+    '.rendered-markdown',
+    '[class*="rendered-markdown"]'
+  ].join(',');
+  const MSG_CONTENT_SELECTOR = `${MESSAGE_PROCESSING_SELECTOR}, [class*="userMessage_"]`;
   function isInsideMessageContent(node) {
     const el = node?.nodeType === Node.TEXT_NODE ? node.parentElement : node;
     return !!closestSafe(el, MSG_CONTENT_SELECTOR);
   }
 
-  function getEnhanceRoots() {
-    const selectors = [
-      '[class*="messagesContainer_"]',
-      '[class*="timelineMessage_"]',
-      '[class*="messageContent_"]',
-      '[class*="assistantMessage_"]',
-      '.rendered-markdown'
-    ].join(',');
+  const ENHANCE_ROOT_SELECTOR = `${MESSAGE_CONTAINER_SELECTOR},${MESSAGE_PROCESSING_SELECTOR}`;
 
-    const roots = querySelectorAllSafe(document, selectors)
-      .filter((el) => !closestSafe(el, NON_PREVIEW_SELECTOR) && !isInsideDialog(el));
+  function candidateRoots(scope, selector) {
+    const candidates = [];
+    if (scope?.nodeType === Node.ELEMENT_NODE && matchesSafe(scope, selector)) candidates.push(scope);
+    querySelectorAllSafe(scope || document, selector).forEach((el) => candidates.push(el));
+    return Array.from(new Set(candidates));
+  }
 
-    const topLevelRoots = roots.filter((el) => !roots.some((other) => (
+  function topLevelRoots(roots) {
+    return roots.filter((el) => !roots.some((other) => (
       other !== el && typeof other.contains === 'function' && other.contains(el)
     )));
-    topLevelRoots.forEach((el) => el.classList.add('claude-enhance-root'));
-    return topLevelRoots;
+  }
+
+  function getEnhanceRoots(scope = document) {
+    const roots = candidateRoots(scope, ENHANCE_ROOT_SELECTOR)
+      .filter((el) => !closestSafe(el, NON_PREVIEW_SELECTOR) && !isInsideDialog(el));
+    const top = topLevelRoots(roots);
+    top.forEach((el) => el.classList.add('claude-enhance-root'));
+    return top;
+  }
+
+  function getMathRoots(scope = document) {
+    const roots = candidateRoots(scope, ENHANCE_ROOT_SELECTOR)
+      .filter((el) => !isInsideMathExcludedRegion(el) && !isInsideDialog(el));
+    return topLevelRoots(roots);
+  }
+
+  function rootsForScopes(scopes, resolver) {
+    if (!scopes) return resolver(document);
+    const list = Array.isArray(scopes) ? scopes : [scopes];
+    return topLevelRoots(Array.from(new Set(list.flatMap((scope) => resolver(scope)))));
+  }
+
+  function findProcessingRoot(node, container) {
+    const element = node?.nodeType === Node.TEXT_NODE ? node.parentElement : node;
+    if (!element || element.nodeType !== Node.ELEMENT_NODE) return null;
+    const messageRoot = closestSafe(element, MESSAGE_PROCESSING_SELECTOR);
+    if (messageRoot && (!container || container.contains(messageRoot))) return messageRoot;
+    const messageContainer = closestSafe(element, MESSAGE_CONTAINER_SELECTOR);
+    return messageContainer && (!container || messageContainer === container) ? messageContainer : null;
   }
 
   // ===== Code highlighting =====
 
-  function highlightAllCode() {
-    if (typeof hljs === 'undefined') return;
+  function highlightAllCode(scopes) {
+    if (RUNTIME_CONFIG.syntaxHighlighting && typeof hljs === 'undefined') return;
 
-    getEnhanceRoots().forEach((root) => {
+    rootsForScopes(scopes, getEnhanceRoots).forEach((root) => {
       querySelectorAllSafe(root, 'pre code').forEach((block) => {
         if (shouldSkipPreviewEnhancement(block)) return;
         safeRun('highlightCodeBlock', () => {
-          highlightCodeBlock(block);
-          addCodeBlockCopyButton(block);
+          const result = RUNTIME_CONFIG.syntaxHighlighting ? highlightCodeBlock(block) : 'unchanged';
+          if (RUNTIME_CONFIG.copyButtons) addCodeBlockCopyButton(block);
+          if (result === 'highlighted') runtimeDiagnostics.codeBlocks.highlighted++;
+          if (result === 'plain') runtimeDiagnostics.codeBlocks.plain++;
         });
       });
     });
@@ -881,19 +1019,19 @@
         delete block.parentElement.dataset.ceLanguage;
       }
     }
+    return 'plain';
   }
 
   function highlightCodeBlock(block) {
     const text = block.textContent || '';
-    if (!text.trim()) return;
+    if (!text.trim()) return 'unchanged';
 
     const fingerprint = getCodeFingerprint(text);
-    if (block.dataset.ceHighlighted === fingerprint) return;
+    if (block.dataset.ceHighlighted === fingerprint) return 'unchanged';
 
     const language = getCodeLanguage(block) || 'markdown';
     if (!language || !hljs.getLanguage(language)) {
-      markCodeBlockPlain(block, text, language);
-      return;
+      return markCodeBlockPlain(block, text, language);
     }
 
     try {
@@ -906,12 +1044,14 @@
       if (block.parentElement?.tagName === 'PRE') {
         block.parentElement.dataset.ceLanguage = language;
       }
+      return 'highlighted';
     } catch {
-      markCodeBlockPlain(block, text, language);
+      return markCodeBlockPlain(block, text, language);
     }
   }
 
   function addCodeBlockCopyButton(block) {
+    if (!RUNTIME_CONFIG.copyButtons) return;
     const pre = block?.parentElement;
     if (!pre || pre.tagName !== 'PRE') return;
     if (Array.from(pre.children || []).some((child) => child.classList?.contains('claude-code-copy-btn'))) return;
@@ -942,12 +1082,653 @@
     pre.appendChild(btn);
   }
 
+  // ===== Markdown source normalization =====
+
+  const MATH_DELIMITER_DEFINITIONS = [
+    { id: 'dollar-display', open: '$$', close: '$$', displayMode: true, confidence: 'high' },
+    { id: 'bracket-display', open: '\\[', close: '\\]', displayMode: true, confidence: 'high' },
+    { id: 'bracket-inline', open: '\\(', close: '\\)', displayMode: false, confidence: 'high' },
+    { id: 'dollar-inline', open: '$', close: '$', displayMode: false, confidence: 'ambiguous' },
+  ];
+
+  function countCharacterRun(text, index, character) {
+    let length = 0;
+    while (text[index + length] === character) length++;
+    return length;
+  }
+
+  function mergeSourceRanges(ranges) {
+    const sorted = ranges
+      .filter((range) => range && range.end > range.start)
+      .sort((a, b) => a.start - b.start || a.end - b.end);
+    const merged = [];
+    sorted.forEach((range) => {
+      const previous = merged[merged.length - 1];
+      if (previous && range.start <= previous.end) {
+        previous.end = Math.max(previous.end, range.end);
+      } else {
+        merged.push({ start: range.start, end: range.end, kind: range.kind });
+      }
+    });
+    return merged;
+  }
+
+  function sourceRangeAt(ranges, index) {
+    let low = 0;
+    let high = ranges.length - 1;
+    while (low <= high) {
+      const middle = (low + high) >> 1;
+      const range = ranges[middle];
+      if (index < range.start) high = middle - 1;
+      else if (index >= range.end) low = middle + 1;
+      else return range;
+    }
+    return null;
+  }
+
+  function collectMarkdownProtectedRanges(markdown) {
+    const source = String(markdown || '');
+    const blockRanges = [];
+    let offset = 0;
+    let fence = null;
+
+    source.split(/(?<=\n)/).forEach((rawLine) => {
+      if (!rawLine && offset === source.length) return;
+      const line = rawLine.endsWith('\n') ? rawLine.slice(0, -1) : rawLine;
+      const structuralLine = line.replace(/^(?:\s{0,3}>\s?)+/, '');
+      const lineEnd = offset + rawLine.length;
+
+      if (fence) {
+        blockRanges.push({ start: offset, end: lineEnd, kind: 'fenced-code' });
+        const close = structuralLine.match(/^\s{0,3}(`+|~+)\s*$/);
+        if (close && close[1][0] === fence.character && close[1].length >= fence.length) fence = null;
+      } else {
+        const open = structuralLine.match(/^\s{0,3}(`{3,}|~{3,})(.*)$/);
+        if (open) {
+          fence = { character: open[1][0], length: open[1].length };
+          blockRanges.push({ start: offset, end: lineEnd, kind: 'fenced-code' });
+        } else if (/^(?: {4}|\t)/.test(line) && line.trim()) {
+          blockRanges.push({ start: offset, end: lineEnd, kind: 'indented-code' });
+        }
+      }
+      offset = lineEnd;
+    });
+
+    const htmlCodeRe = /<(pre|code)\b[^>]*>[\s\S]*?<\/\1\s*>/gi;
+    let htmlMatch;
+    while (htmlMatch = htmlCodeRe.exec(source)) {
+      blockRanges.push({ start: htmlMatch.index, end: htmlCodeRe.lastIndex, kind: 'html-code' });
+    }
+
+    let protectedRanges = mergeSourceRanges(blockRanges);
+    const inlineRanges = [];
+    for (let i = 0; i < source.length;) {
+      const protectedRange = sourceRangeAt(protectedRanges, i);
+      if (protectedRange) {
+        i = protectedRange.end;
+        continue;
+      }
+      if (source[i] !== '`') {
+        i++;
+        continue;
+      }
+
+      const markerLength = countCharacterRun(source, i, '`');
+      let closeIndex = i + markerLength;
+      let found = -1;
+      while (closeIndex < source.length) {
+        const closeRange = sourceRangeAt(protectedRanges, closeIndex);
+        if (closeRange) {
+          closeIndex = closeRange.end;
+          continue;
+        }
+        closeIndex = source.indexOf('`', closeIndex);
+        if (closeIndex === -1) break;
+        const closeLength = countCharacterRun(source, closeIndex, '`');
+        if (closeLength === markerLength) {
+          found = closeIndex;
+          break;
+        }
+        closeIndex += closeLength;
+      }
+
+      if (found === -1) {
+        i += markerLength;
+      } else {
+        inlineRanges.push({ start: i, end: found + markerLength, kind: 'inline-code' });
+        i = found + markerLength;
+      }
+    }
+    return mergeSourceRanges([...protectedRanges, ...inlineRanges]);
+  }
+
+  function delimiterDefinitionAt(source, index, protectedRanges) {
+    if (sourceRangeAt(protectedRanges, index) || isEscapedDelimiter(source, index)) return null;
+    return MATH_DELIMITER_DEFINITIONS.find((definition) => source.startsWith(definition.open, index)) || null;
+  }
+
+  function displayDollarRole(source, index) {
+    const lineStart = source.lastIndexOf('\n', index - 1) + 1;
+    const lineEndIndex = source.indexOf('\n', index + 2);
+    const lineEnd = lineEndIndex === -1 ? source.length : lineEndIndex;
+    const stripStructuralPrefix = (line) => String(line || '')
+      .replace(/^[ \t]*\d+(?:\t|[|:>][ \t]?)/, '')
+      .replace(/^(?:[ \t]*>[ \t]?)+/, '')
+      .trim();
+    const looksMathematical = (text) => /(?:\\[A-Za-z]+|[_^={}<>]|\d\s*[+*/=-])/.test(text);
+    const rawBefore = stripStructuralPrefix(source.slice(lineStart, index));
+    const rawAfter = stripStructuralPrefix(source.slice(index + 2, lineEnd));
+    const delimiterFollowsHtmlTag = /<[^>]*>\s*$/.test(rawBefore);
+    const before = delimiterFollowsHtmlTag ? '' : rawBefore.replace(/<[^>]*>/g, '').trim();
+    const after = rawAfter.replace(/<[^>]*>/g, '').trim();
+    const previousLineEnd = Math.max(0, lineStart - 1);
+    const previousLineStart = source.lastIndexOf('\n', previousLineEnd - 1) + 1;
+    const nextLineStart = lineEndIndex === -1 ? source.length : lineEndIndex + 1;
+    const nextLineEndIndex = source.indexOf('\n', nextLineStart);
+    const nextLineEnd = nextLineEndIndex === -1 ? source.length : nextLineEndIndex;
+    const previous = stripStructuralPrefix(source.slice(previousLineStart, previousLineEnd));
+    const next = stripStructuralPrefix(source.slice(nextLineStart, nextLineEnd));
+    const htmlSeparator = !before &&
+      /(?:<[^>]*>\s*)+$/.test(rawBefore) &&
+      /^\s*(?:<[^>]*>\s*)+/.test(rawAfter);
+    if (htmlSeparator) return 'ambiguous';
+    const beforeLooksMathematical = looksMathematical(before);
+    if (before && !after && beforeLooksMathematical) return 'close';
+    if (!before && after) return 'open';
+    if (!before && !after) {
+      const previousLooksMathematical = looksMathematical(previous.replace(/<[^>]*>/g, '').trim());
+      const nextLooksMathematical = looksMathematical(next.replace(/<[^>]*>/g, '').trim());
+      if (nextLooksMathematical && !previousLooksMathematical) return 'open';
+      if (previousLooksMathematical && !nextLooksMathematical) return 'close';
+    }
+    return 'ambiguous';
+  }
+
+  function findStructuredMathClose(source, openIndex, definition, protectedRanges) {
+    for (let i = openIndex + definition.open.length; i <= source.length - definition.close.length; i++) {
+      const protectedRange = sourceRangeAt(protectedRanges, i);
+      if (protectedRange) {
+        // A math span cannot cross a code span. Treat the opener as unmatched
+        // so the scanner can resume after the protected region and recover
+        // valid formulas that follow it.
+        return -1;
+      }
+      if (!source.startsWith(definition.close, i) || isEscapedDelimiter(source, i)) continue;
+
+      if (definition.id !== 'dollar-inline') {
+        if (definition.id === 'dollar-display' && displayDollarRole(source, i) === 'open') {
+          const body = source.slice(openIndex + definition.open.length, i).trim();
+          const bodyIsFormula = body && !/<\/?[A-Za-z][^>]*>/.test(body) &&
+            !body.includes('`') && !isProseHeavyLatex(body, true) &&
+            !looksLikeAmbiguousDollarProse(body);
+          return bodyIsFormula ? i : -1;
+        }
+        return i;
+      }
+      if (source[i - 1] === '$' || source[i + 1] === '$') continue;
+      if (isLikelyInlineDollarEnd(source, i)) return i;
+      if (isLikelyInlineDollarStart(source, i)) return -1;
+    }
+    return -1;
+  }
+
+  function toolOutputLinePrefixMode(source, start, context) {
+    if (!/(?:^|-)tool-output$/.test(String(context || ''))) return '';
+
+    const lineStart = source.lastIndexOf('\n', start - 1) + 1;
+    const lineBeforeCandidate = source.slice(lineStart, start);
+    const numbered = lineBeforeCandidate.match(/^[ \t]*\d+[ \t]*([>|:])[ \t]?/);
+    if (numbered) return numbered[1] === '>' ? 'numbered-quote' : 'numbered';
+    if (/^[ \t]*\d+\t/.test(lineBeforeCandidate)) return 'numbered-tab';
+
+    const quotePrefix = lineBeforeCandidate.match(/^[ \t]*((?:>[ \t]*)+)/);
+    if (quotePrefix) {
+      const depth = (quotePrefix[1].match(/>/g) || []).length;
+      return `quote:${depth}`;
+    }
+    return '';
+  }
+
+  function stripToolOutputLinePrefix(line, mode) {
+    if (mode === 'numbered-quote') {
+      return line.replace(/^[ \t]*\d+[ \t]*>[ \t]*/, '');
+    }
+    if (mode === 'numbered') {
+      return line.replace(/^[ \t]*\d+[ \t]*[|:][ \t]*/, '');
+    }
+    if (mode === 'numbered-tab') {
+      return line.replace(/^[ \t]*\d+\t[ \t]*/, '');
+    }
+    if (!mode.startsWith('quote:')) return line;
+
+    const depth = Number.parseInt(mode.slice('quote:'.length), 10) || 1;
+    let output = line;
+    for (let i = 0; i < depth; i++) {
+      const stripped = output.replace(/^[ \t]*>[ \t]?/, '');
+      if (stripped === output) break;
+      output = stripped;
+    }
+    return output;
+  }
+
+  function normalizeToolOutputMathFormula(formula, mode) {
+    const source = String(formula || '');
+    if (!mode || !source.includes('\n')) return source;
+    return source.split('\n')
+      .map((line) => stripToolOutputLinePrefix(line, mode))
+      .join('\n')
+      .trim();
+  }
+
+  function createStructuredMathCandidate(source, start, closeIndex, definition, context) {
+    const end = closeIndex + definition.close.length;
+    const bodyStart = start + definition.open.length;
+    const body = source.slice(bodyStart, closeIndex);
+    return classifyStructuredMathCandidate({
+      type: 'StructuredMathCandidate',
+      start,
+      end,
+      bodyStart,
+      bodyEnd: closeIndex,
+      raw: source.slice(start, end),
+      body,
+      formula: body.trim(),
+      open: definition.open,
+      close: definition.close,
+      delimiter: definition.id,
+      displayMode: definition.displayMode,
+      delimiterConfidence: definition.confidence,
+      context,
+      toolOutputLinePrefixMode: toolOutputLinePrefixMode(source, start, context),
+    });
+  }
+
+  function scanStructuredMath(source, options = {}) {
+    const text = String(source || '');
+    const protectedRanges = options.markdown === false ? [] : collectMarkdownProtectedRanges(text);
+    const candidates = [];
+    const unmatched = [];
+
+    for (let i = 0; i < text.length;) {
+      const protectedRange = sourceRangeAt(protectedRanges, i);
+      if (protectedRange) {
+        i = protectedRange.end;
+        continue;
+      }
+
+      const definition = delimiterDefinitionAt(text, i, protectedRanges);
+      if (!definition || (definition.id === 'dollar-inline' && !isLikelyInlineDollarStart(text, i))) {
+        i++;
+        continue;
+      }
+
+      if (definition.id === 'dollar-display' && displayDollarRole(text, i) === 'close') {
+        unmatched.push({
+          start: i,
+          end: i + definition.open.length,
+          raw: definition.open,
+          delimiter: definition.id,
+          definition,
+          context: options.context || (options.markdown === false ? 'dom' : 'markdown'),
+          role: 'orphan-close',
+        });
+        i += definition.open.length;
+        continue;
+      }
+
+      const closeIndex = findStructuredMathClose(text, i, definition, protectedRanges);
+      if (closeIndex === -1) {
+        unmatched.push({
+          start: i,
+          end: i + definition.open.length,
+          raw: definition.open,
+          delimiter: definition.id,
+          definition,
+          context: options.context || (options.markdown === false ? 'dom' : 'markdown'),
+        });
+        i += definition.open.length;
+        continue;
+      }
+
+      candidates.push(createStructuredMathCandidate(
+        text,
+        i,
+        closeIndex,
+        definition,
+        options.context || (options.markdown === false ? 'dom' : 'markdown')
+      ));
+      i = closeIndex + definition.close.length;
+    }
+
+    return { source: text, protectedRanges, candidates, unmatched };
+  }
+
+  function applySourceReplacements(source, replacements) {
+    let output = source;
+    replacements
+      .sort((a, b) => b.start - a.start || b.end - a.end)
+      .forEach((replacement) => {
+        output = output.slice(0, replacement.start) + replacement.value + output.slice(replacement.end);
+      });
+    return output;
+  }
+
+  function normalizedMathCandidateSource(candidate, source) {
+    if (candidate.delimiter === 'bracket-inline') return `$${candidate.body}$`;
+    if (candidate.delimiter !== 'bracket-display' && candidate.delimiter !== 'dollar-display') return candidate.raw;
+
+    // Do not reformat a block that is already line-separated. This makes the
+    // source normalizer idempotent when it sees its own output in a later pass.
+    if (/^\s*\n[\s\S]*\n\s*$/.test(candidate.body)) return candidate.raw;
+
+    const lineStart = source.lastIndexOf('\n', candidate.start - 1) + 1;
+    const lineEndIndex = source.indexOf('\n', candidate.end);
+    const lineEnd = lineEndIndex === -1 ? source.length : lineEndIndex;
+    const containingLine = source.slice(lineStart, lineEnd);
+    if (containingLine.includes('|')) return `$$${candidate.body}$$`;
+
+    const body = candidate.body.replace(/^\s*\n/, '').replace(/\n\s*$/, '');
+    return `$$\n${body}\n$$`;
+  }
+
+  function hasPlausibleClosingDollar(text, openIndex) {
+    const definition = MATH_DELIMITER_DEFINITIONS.find((item) => item.id === 'dollar-inline');
+    return findStructuredMathClose(String(text || ''), openIndex, definition, []) !== -1;
+  }
+
+  function protectUnpairedNumericDollars(line) {
+    const source = String(line || '');
+    const scan = scanStructuredMath(source, { markdown: true, context: 'source' });
+    const replacements = scan.unmatched
+      .filter((item) => item.delimiter === 'dollar-inline' && /\d/.test(source[item.end] || ''))
+      .map((item) => ({ start: item.start, end: item.start, value: '\\' }));
+    return applySourceReplacements(source, replacements);
+  }
+
+  function recoverMathOnlyInlineCode(markdown) {
+    const source = String(markdown || '');
+    const replacements = collectMarkdownProtectedRanges(source)
+      .filter((range) => range.kind === 'inline-code')
+      .flatMap((range) => {
+        const markerLength = countCharacterRun(source, range.start, '`');
+        const content = source.slice(range.start + markerLength, range.end - markerLength).trim();
+        if (!content) return [];
+
+        const scan = scanStructuredMath(content, {
+          markdown: false,
+          context: 'math-only-inline-code',
+        });
+        if (scan.unmatched.length || scan.candidates.length !== 1) return [];
+        const candidate = scan.candidates[0];
+        if (candidate.start !== 0 || candidate.end !== content.length || candidate.decision !== 'render') return [];
+        return [{ start: range.start, end: range.end, value: content }];
+      });
+    return replacements.length ? applySourceReplacements(source, replacements) : source;
+  }
+
+  function normalizeMarkdownMathSource(markdown) {
+    if (typeof markdown !== 'string' || (!markdown.includes('\\') && !markdown.includes('$'))) return markdown;
+    const recoveredMarkdown = recoverMathOnlyInlineCode(markdown);
+    const scan = scanStructuredMath(recoveredMarkdown, { markdown: true, context: 'source' });
+    const replacements = [];
+
+    scan.unmatched.forEach((item) => {
+      if (item.delimiter === 'dollar-inline' && /\d/.test(recoveredMarkdown[item.end] || '')) {
+        replacements.push({ start: item.start, end: item.start, value: '\\' });
+      }
+    });
+    scan.candidates.forEach((candidate) => {
+      let value = candidate.raw;
+      if (candidate.decision === 'render') {
+        value = normalizedMathCandidateSource(candidate, recoveredMarkdown);
+      } else if (candidate.delimiter === 'bracket-inline' || candidate.delimiter === 'bracket-display') {
+        value = `\\${candidate.open}${candidate.body}\\${candidate.close}`;
+      }
+      if (value !== candidate.raw) replacements.push({ start: candidate.start, end: candidate.end, value });
+    });
+
+    return applySourceReplacements(recoveredMarkdown, replacements);
+  }
+
+  function installRemarkSourceNormalizer() {
+    const guardPipes = window.__remarkPipeGuard;
+    const restorePipes = window.__remarkPipeGuardRestore;
+    if (typeof guardPipes !== 'function' || typeof restorePipes !== 'function') return false;
+
+    const plugin = function ceRemarkSourceNormalizer() {
+      const originalParser = this.parser;
+      if (typeof originalParser !== 'function') return;
+      this.parser = (source, file) => {
+        const normalizedSource = normalizeMarkdownMathSource(source);
+        const guardedSource = guardPipes(normalizedSource);
+        if (file && typeof file === 'object') {
+          file.data = file.data || {};
+          file.data.__ceNormalizedMathSource = normalizedSource;
+        }
+        const tree = originalParser(guardedSource, file);
+        restorePipes(tree);
+        return tree;
+      };
+    };
+
+    plugin.__ceStructuredMathSource = true;
+    window.__remarkBracketMath = plugin;
+    return true;
+  }
+
   // ===== LaTeX rendering =====
 
+  const LATEX_TEXT_COMMANDS = new Set([
+    'texttt', 'textrm', 'textsf', 'textit', 'textbf', 'textnormal',
+    'textmd', 'textup', 'emph', 'hbox', 'text', 'mbox'
+  ]);
+  const MAX_LATEX_SOURCE_LENGTH = 12000;
+  const MAX_LATEX_PREPARATION_CACHE = 512;
+  const latexPreparationCache = new Map();
+
+  function rememberLatexPreparation(key, result) {
+    if (key.length > 4096) return result;
+    if (latexPreparationCache.has(key)) latexPreparationCache.delete(key);
+    latexPreparationCache.set(key, result);
+    if (latexPreparationCache.size > MAX_LATEX_PREPARATION_CACHE) {
+      latexPreparationCache.delete(latexPreparationCache.keys().next().value);
+    }
+    return result;
+  }
+
+  function escapeUnescapedTextSpecials(text) {
+    const source = String(text || '');
+    let output = '';
+    for (let i = 0; i < source.length; i++) {
+      const char = source[i];
+      if ('_%#&$'.includes(char) && !isEscapedLatexCharacter(source, i)) output += '\\';
+      output += char;
+    }
+    return output;
+  }
+
+  function escapeUnescapedUnderscores(text) {
+    return escapeUnescapedTextSpecials(text);
+  }
+
+  function isEscapedLatexCharacter(text, index) {
+    let slashCount = 0;
+    for (let i = index - 1; i >= 0 && text[i] === '\\'; i--) slashCount++;
+    return slashCount % 2 === 1;
+  }
+
+  function findBalancedLatexGroupEnd(text, openIndex) {
+    if (text[openIndex] !== '{') return -1;
+    let depth = 1;
+    for (let i = openIndex + 1; i < text.length; i++) {
+      if (isEscapedLatexCharacter(text, i)) continue;
+      if (text[i] === '{') depth++;
+      if (text[i] === '}' && --depth === 0) return i;
+    }
+    return -1;
+  }
+
+  function normalizeLatexTextCommands(formula) {
+    const source = String(formula || '');
+    let output = '';
+
+    for (let i = 0; i < source.length;) {
+      if (source[i] !== '\\' || isEscapedLatexCharacter(source, i)) {
+        output += source[i++];
+        continue;
+      }
+
+      const commandMatch = source.slice(i + 1).match(/^([A-Za-z]+)/);
+      if (!commandMatch || !LATEX_TEXT_COMMANDS.has(commandMatch[1])) {
+        output += source[i++];
+        continue;
+      }
+
+      const command = commandMatch[1];
+      const commandEnd = i + 1 + command.length;
+      let openIndex = commandEnd;
+      while (openIndex < source.length && /\s/.test(source[openIndex])) openIndex++;
+      if (source[openIndex] !== '{') {
+        output += source[i++];
+        continue;
+      }
+
+      const closeIndex = findBalancedLatexGroupEnd(source, openIndex);
+      if (closeIndex === -1) {
+        output += source.slice(i);
+        break;
+      }
+
+      const content = source.slice(openIndex + 1, closeIndex);
+      const normalizedContent = normalizeLatexTextCommands(content);
+      const normalizedCommand = command === 'mbox' ? 'text' : command;
+      const spacing = source.slice(commandEnd, openIndex);
+      output += `\\${normalizedCommand}${spacing}{${escapeUnescapedTextSpecials(normalizedContent)}}`;
+      i = closeIndex + 1;
+    }
+
+    return output;
+  }
+
+  function repairUnsupportedKatexMacros(formula) {
+    return String(formula || '').replace(/\\mathds(?=\s*\{)/g, '\\mathbb');
+  }
+
+  function uniqueLatexCandidates(items) {
+    const seen = new Set();
+    return items
+      .filter((item) => typeof item === 'string' && item.trim())
+      .filter((item) => {
+        if (seen.has(item)) return false;
+        seen.add(item);
+        return true;
+      });
+  }
+
+  function repairLatexForKatexError(formula, error, displayMode) {
+    const message = String(error?.message || '');
+    const candidates = [];
+
+    if (/Undefined control sequence/.test(message)) {
+      candidates.push(repairUnsupportedKatexMacros(formula));
+    }
+
+    if (/got '[_#&$]'|Unexpected end of input in a macro argument|Expected '\$'/.test(message)) {
+      candidates.push(normalizeLatexTextCommands(formula));
+    }
+
+    if (displayMode && /got '&'|Expected 'EOF'/.test(message) && formula.includes('&')) {
+      candidates.push(`\\begin{aligned}\n${formula}\n\\end{aligned}`);
+    }
+
+    candidates.push(normalizeLatexTextCommands(repairUnsupportedKatexMacros(formula)));
+    return uniqueLatexCandidates(candidates);
+  }
+
   function escapeUnderscoresInText(formula) {
-    return formula.replace(/\\text\{([^}]*)\}/g, (match, content) => {
-      return `\\text{${content.replace(/_/g, '\\_')}}`;
+    return normalizeLatexTextCommands(formula);
+  }
+
+  function prepareLatexForKatex(formula, displayMode) {
+    const original = String(formula || '');
+    const cacheKey = `${displayMode ? 'D' : 'I'}:${original}`;
+    const cached = latexPreparationCache.get(cacheKey);
+    if (cached) {
+      latexPreparationCache.delete(cacheKey);
+      latexPreparationCache.set(cacheKey, cached);
+      return cached;
+    }
+
+    if (original.length > MAX_LATEX_SOURCE_LENGTH) {
+      return rememberLatexPreparation(cacheKey, {
+        ok: false,
+        formula: original,
+        original,
+        repaired: false,
+        attempts: 0,
+        error: new Error(`Math source exceeds ${MAX_LATEX_SOURCE_LENGTH} characters`),
+      });
+    }
+
+    const queue = uniqueLatexCandidates([normalizeLatexForRender(original, displayMode)]);
+    const seen = new Set(queue);
+    let lastError = null;
+
+    for (let i = 0; i < queue.length && i < 8; i++) {
+      const candidate = queue[i];
+      try {
+        katex.renderToString(candidate, {
+          displayMode,
+          strict: 'ignore',
+          throwOnError: true
+        });
+        return rememberLatexPreparation(cacheKey, {
+          ok: true,
+          formula: candidate,
+          original,
+          repaired: candidate !== original,
+          attempts: i + 1,
+          error: null,
+        });
+      } catch (error) {
+        lastError = error;
+        repairLatexForKatexError(candidate, error, displayMode).forEach((next) => {
+          if (!seen.has(next)) {
+            seen.add(next);
+            queue.push(next);
+          }
+        });
+      }
+    }
+
+    return rememberLatexPreparation(cacheKey, {
+      ok: false,
+      formula: queue[queue.length - 1] || original,
+      original,
+      repaired: false,
+      attempts: Math.min(queue.length, 8),
+      error: lastError,
     });
+  }
+
+  function chooseRenderableLatexForKatex(formula, displayMode) {
+    return prepareLatexForKatex(formula, displayMode).formula;
+  }
+
+  function renderLatexHtml(formula, displayMode) {
+    const preparation = prepareLatexForKatex(formula, displayMode);
+    try {
+      const html = katex.renderToString(preparation.formula, {
+        displayMode,
+        strict: 'ignore',
+        throwOnError: false
+      });
+      runtimeDiagnostics.math.domRendered++;
+      return html;
+    } catch (error) {
+      runtimeDiagnostics.math.failed++;
+      throw error;
+    }
   }
 
   function normalizeLatexFormula(formula) {
@@ -963,26 +1744,313 @@
       .replace(/\\\s*\n/g, '\\\\\n')
       .replace(/\\\[(\d+(?:\.\d+)?[a-z]*)\]/gi, '\\\\[$1]')
       .replace(/&\s*\\\[6pt\]/g, '& \\\\')
-      .replace(/\\(sum|prod|int|lim|inf|sup|max|min)\{([^}]+)\}/g, '\\\\$1_{$2}')
-      .replace(/\\operatorname\{(\w+)\}(\()/g, '\\\\operatorname{$1}$2');
+      .replace(/\\(sum|prod|int|lim|inf|sup|max|min)\{([^}]+)\}/g, '\\$1_{$2}');
   }
 
   function normalizeLatexForRender(formula, displayMode) {
     return displayMode ? normalizeDisplayLatexFormula(formula) : normalizeLatexFormula(formula);
   }
 
-  function renderLatexHtml(formula, displayMode) {
-    return katex.renderToString(normalizeLatexForRender(formula, displayMode), {
-      displayMode,
-      strict: 'ignore',
-      throwOnError: false
+  function looksLikeCodeDollarFormula(text) {
+    const cleaned = String(text || '').replace(/\s+/g, ' ').trim();
+    if (!cleaned) return false;
+
+    // Nested dollar variables cannot be valid inside a TeX math span and are
+    // common in shell, Perl, templates, and Makefiles.
+    if (/\$(?:\{?[A-Za-z_][\w]*|\d+)/.test(cleaned)) return true;
+    if (/^\{?[A-Za-z_][\w]*(?:\{|\[)$/.test(cleaned)) return true;
+
+    const programmingSyntax = /(?:;|&&|\|\||=>|::|\+\+|--|<\w+>|["'`]\s*\w)/.test(cleaned);
+    const programmingWords = /\b(?:if|else|while|for|foreach|print|next|return|defined|keys|open|close)\b/.test(cleaned);
+    return programmingSyntax && programmingWords;
+  }
+
+  function analyzeFormulaSignals(text) {
+    const cleaned = String(text || '').replace(/\s+/g, ' ').trim();
+    const macros = cleaned.match(/\\[A-Za-z]+/g) || [];
+    const words = cleaned.match(/[A-Za-z]{2,}/g) || [];
+    const operators = cleaned.match(/[_^=+\-*/<>×]/g) || [];
+    return {
+      cleaned,
+      macroCount: macros.length,
+      wordCount: words.length,
+      operatorCount: operators.length,
+      hasStructure: /[{}\[\]]/.test(cleaned),
+      hasDigit: /\d/.test(cleaned),
+      hasMathFunction: /\b(?:sin|cos|tan|log|ln|exp|det|rank|dim|max|min|arg)\b/i.test(cleaned),
+      hasProseConnector: /\b(?:and|or|is|are|was|were|the|to|of|for|with|from|then|shell|cost)\b/i.test(cleaned),
+    };
+  }
+
+  function looksLikeAmbiguousDollarProse(text) {
+    const signals = analyzeFormulaSignals(text);
+    if (!signals.cleaned || signals.wordCount < 2 || !/\s/.test(signals.cleaned)) return false;
+    if (signals.macroCount || signals.operatorCount || signals.hasStructure || signals.hasMathFunction) return false;
+    return signals.hasProseConnector || signals.wordCount > 1;
+  }
+
+  function skippedLatexPreparation(formula, reason) {
+    return {
+      ok: false,
+      formula: String(formula || ''),
+      original: String(formula || ''),
+      repaired: false,
+      attempts: 0,
+      skipped: true,
+      error: null,
+      reason,
+    };
+  }
+
+  function classifyStructuredMathCandidate(candidate) {
+    const formula = String(candidate?.formula || '').trim();
+    const preparedSource = normalizeToolOutputMathFormula(
+      formula,
+      candidate?.toolOutputLinePrefixMode || ''
+    );
+    const signals = analyzeFormulaSignals(preparedSource);
+    const codeLike = looksLikeCodeDollarFormula(preparedSource) ||
+      (candidate?.delimiter === 'dollar-inline' && candidate?.raw?.startsWith('${'));
+    const proseLike = looksLikeAmbiguousDollarProse(preparedSource);
+    const proseHeavy = isProseHeavyLatex(preparedSource, !!candidate?.displayMode);
+
+    let decision = 'render';
+    let reason = 'validated';
+    let preparation;
+
+    if (!formula || !preparedSource) {
+      decision = 'literal';
+      reason = 'empty';
+      preparation = skippedLatexPreparation(formula, reason);
+    } else if (codeLike) {
+      decision = 'literal';
+      reason = 'code-like';
+      preparation = skippedLatexPreparation(formula, reason);
+    } else if (proseLike || proseHeavy) {
+      decision = 'literal';
+      reason = proseLike ? 'ambiguous-prose' : 'prose-heavy';
+      preparation = skippedLatexPreparation(formula, reason);
+    } else {
+      preparation = prepareLatexForKatex(preparedSource, !!candidate?.displayMode);
+      if (!preparation.ok) {
+        decision = 'literal';
+        reason = 'invalid-latex';
+      } else if (preparation.repaired) {
+        reason = 'validated-after-repair';
+      }
+    }
+
+    let confidence = 'low';
+    if (decision === 'render') {
+      confidence = candidate?.delimiterConfidence === 'high' || signals.macroCount ||
+        signals.operatorCount || signals.hasStructure ? 'high' : 'medium';
+    }
+
+    runtimeDiagnostics.math.candidates++;
+    if (decision === 'render') {
+      runtimeDiagnostics.math.rendered++;
+      if (preparation.repaired) runtimeDiagnostics.math.repaired++;
+    } else {
+      runtimeDiagnostics.math.literal++;
+    }
+
+    return {
+      ...candidate,
+      formula,
+      renderFormula: preparation.ok ? preparation.formula : formula,
+      preparation,
+      decision,
+      reason,
+      confidence,
+      signals,
+    };
+  }
+
+  function structuredCandidateForFormula(text, displayMode, context = 'synthetic') {
+    const formula = String(text || '').trim();
+    const definition = MATH_DELIMITER_DEFINITIONS.find((item) => (
+      displayMode ? item.id === 'dollar-display' : item.id === 'dollar-inline'
+    ));
+    return classifyStructuredMathCandidate({
+      type: 'StructuredMathCandidate',
+      start: 0,
+      end: formula.length + definition.open.length + definition.close.length,
+      bodyStart: definition.open.length,
+      bodyEnd: definition.open.length + formula.length,
+      raw: `${definition.open}${formula}${definition.close}`,
+      body: formula,
+      formula,
+      open: definition.open,
+      close: definition.close,
+      delimiter: definition.id,
+      displayMode: !!displayMode,
+      delimiterConfidence: definition.confidence,
+      context,
     });
+  }
+
+  function isPreparedLatexFormula(text, displayMode) {
+    return structuredCandidateForFormula(text, displayMode, 'compatibility').decision === 'render';
+  }
+
+  function remarkSourceText(file) {
+    const normalized = file?.data?.__ceNormalizedMathSource;
+    if (typeof normalized === 'string') return normalized;
+    if (typeof file?.value === 'string') return file.value;
+    return '';
+  }
+
+  function structuredCandidateForRemarkNode(node, file) {
+    const displayMode = node.type === 'math';
+    const source = remarkSourceText(file);
+    const start = node?.position?.start?.offset;
+    const end = node?.position?.end?.offset;
+    if (source && Number.isInteger(start) && Number.isInteger(end) && end > start) {
+      const raw = source.slice(start, end);
+      const definition = MATH_DELIMITER_DEFINITIONS.find((item) => (
+        item.displayMode === displayMode && raw.startsWith(item.open) && raw.endsWith(item.close)
+      ));
+      if (definition) {
+        return classifyStructuredMathCandidate({
+          type: 'StructuredMathCandidate',
+          start,
+          end,
+          bodyStart: start + definition.open.length,
+          bodyEnd: end - definition.close.length,
+          raw,
+          body: node.value || '',
+          formula: node.value || '',
+          open: definition.open,
+          close: definition.close,
+          delimiter: definition.id,
+          displayMode,
+          delimiterConfidence: definition.confidence,
+          context: 'remark',
+        });
+      }
+    }
+    return structuredCandidateForFormula(node.value || '', displayMode, 'remark');
+  }
+
+  function demoteRemarkMathNode(node, candidate) {
+    node.type = 'text';
+    node.value = candidate.raw;
+    delete node.data;
+    delete node.meta;
+  }
+
+  function normalizeRemarkMathNodes(node, file) {
+    if (!node || typeof node !== 'object') return;
+    if (node.type === 'inlineMath' || node.type === 'math') {
+      const candidate = structuredCandidateForRemarkNode(node, file);
+      if (candidate.decision === 'literal') {
+        demoteRemarkMathNode(node, candidate);
+      } else {
+        node.value = candidate.renderFormula;
+      }
+      return;
+    }
+    if (Array.isArray(node.children)) node.children.forEach((child) => normalizeRemarkMathNodes(child, file));
+  }
+
+  function wrapRemarkMathClassifier() {
+    const original = window.__remarkMath;
+    if (typeof original !== 'function' || original.__ceClassifiedMathInput) return false;
+
+    const wrapped = function ceRemarkMathWithClassifiedInput() {
+      const originalTransformer = original.apply(this, arguments);
+      return function ceClassifiedMathTransformer(tree, file) {
+        const result = typeof originalTransformer === 'function'
+          ? originalTransformer.call(this, tree, file)
+          : undefined;
+
+        if (result && typeof result.then === 'function') {
+          return result.then((resolvedTree) => {
+            normalizeRemarkMathNodes(resolvedTree || tree, file);
+            return resolvedTree;
+          });
+        }
+
+        normalizeRemarkMathNodes(result && result.type ? result : tree, file);
+        return result;
+      };
+    };
+
+    wrapped.__ceClassifiedMathInput = true;
+    wrapped.__ceOriginalRemarkMath = original;
+    window.__remarkMath = wrapped;
+    return true;
+  }
+
+  function getHastClassNames(node) {
+    const className = node?.properties?.className;
+    if (Array.isArray(className)) return className.map(String);
+    if (typeof className === 'string') return className.split(/\s+/).filter(Boolean);
+    return [];
+  }
+
+  function isHastMathElement(node) {
+    const classes = getHastClassNames(node);
+    return classes.includes('language-math') ||
+      classes.includes('math-display') ||
+      classes.includes('math-inline');
+  }
+
+  function hastTextContent(node) {
+    if (!node || typeof node !== 'object') return '';
+    if (node.type === 'text') return String(node.value || '');
+    return Array.isArray(node.children) ? node.children.map(hastTextContent).join('') : '';
+  }
+
+  function replaceHastMathWithLiteral(node, parent, candidate) {
+    const target = parent?.tagName === 'pre' ? parent : node;
+    target.tagName = 'span';
+    target.properties = { className: ['ce-literal-math'] };
+    target.children = [{ type: 'text', value: candidate.raw }];
+  }
+
+  function normalizeHastMathNodes(node, parent = null) {
+    if (!node || typeof node !== 'object') return;
+    if (isHastMathElement(node)) {
+      const classes = getHastClassNames(node);
+      const displayMode = classes.includes('language-math') || classes.includes('math-display');
+      const candidate = structuredCandidateForFormula(hastTextContent(node), displayMode, 'hast');
+      if (candidate.decision === 'literal') {
+        replaceHastMathWithLiteral(node, parent, candidate);
+      } else {
+        node.children = [{ type: 'text', value: candidate.renderFormula }];
+      }
+      return;
+    }
+    if (Array.isArray(node.children)) {
+      node.children.forEach((child) => normalizeHastMathNodes(child, node));
+    }
+  }
+
+  function wrapRehypeKatexNormalizer() {
+    const original = window.__rehypeKatex;
+    if (typeof original !== 'function' || original.__ceNormalizedKatexInput) return false;
+
+    const wrapped = function ceRehypeKatexWithNormalizedInput() {
+      const transformer = original.apply(this, arguments);
+      if (typeof transformer !== 'function') return transformer;
+      return function ceNormalizedKatexTransformer(tree, file) {
+        normalizeHastMathNodes(tree);
+        return transformer.call(this, tree, file);
+      };
+    };
+
+    wrapped.__ceNormalizedKatexInput = true;
+    wrapped.__ceOriginalRehypeKatex = original;
+    window.__rehypeKatex = wrapped;
+    return true;
   }
 
   function looksLikeLatex(text) {
     const cleaned = text.replace(/\s+/g, ' ').trim();
     return cleaned.length <= 2 || cleaned.includes('\\') ||
-      cleaned.includes('^') || cleaned.includes('{') ||
+      /[_^{}=+\-*/<>×]/.test(cleaned) ||
+      /^[A-Za-z][A-Za-z0-9]*$/.test(cleaned) || /^\d+(?:\.\d+)?$/.test(cleaned) ||
       /\b(alpha|beta|gamma|delta|theta|lambda|mu|sigma|pi|omega|sum|int|frac|sqrt|nabla|mathbf|text|tilde)\b/i.test(cleaned);
   }
 
@@ -1004,7 +2072,7 @@
     const prosePunctuationCount = (cleaned.match(/[，。；：、]|[.!?]\s+[A-Z]/g) || []).length;
 
     if (!displayMode && cleaned.length > 240) return true;
-    if (cleaned.length > 120 && hasMarkdownUnderscoreEmphasis(cleaned)) return true;
+    if (cleaned.length > 120 && macroCount < 4 && hasMarkdownUnderscoreEmphasis(cleaned)) return true;
     if (cleaned.length > 120 && cjkCount > 12 && macroCount < 4) return true;
     if (cleaned.length > 180 && cjkCount > 12 && prosePunctuationCount > 1) return true;
     if (cleaned.length > 220 && wordCount > 20 && macroCount < 4) return true;
@@ -1012,7 +2080,7 @@
   }
 
   function isRenderableLatexFormula(text, displayMode) {
-    return looksLikeLatex(text) && !isProseHeavyLatex(text, displayMode);
+    return structuredCandidateForFormula(text, displayMode, 'compatibility').decision === 'render';
   }
 
   function isDimensionLatexFormula(text) {
@@ -1057,9 +2125,10 @@
 
   function renderLatexFragment(fragment, displayMode, fallback) {
     const latex = /<[^>]+>/.test(fragment) ? htmlFragmentToLatex(fragment) : fragment;
-    if (!isRenderableLatexFormula(latex, displayMode)) return fallback;
+    const candidate = structuredCandidateForFormula(latex, displayMode, 'html-fragment');
+    if (candidate.decision !== 'render') return fallback;
     try {
-      return renderLatexHtml(latex, displayMode);
+      return renderLatexHtml(candidate.renderFormula, displayMode);
     } catch {
       return fallback;
     }
@@ -1101,18 +2170,12 @@
     return slashCount % 2 === 1;
   }
 
-  function findClosingDelimiter(text, start, open, close) {
-    for (let i = start + open.length; i <= text.length - close.length; i++) {
-      if (text.startsWith(close, i) && !isEscapedDelimiter(text, i)) return i;
-    }
-    return -1;
-  }
-
   function isLikelyInlineDollarStart(text, index) {
     const next = text[index + 1];
     const prev = text[index - 1];
     if (!next || /\s/.test(next)) return false;
-    if (prev && !/\s|[(\[{,;:]/.test(prev) && !/\d/.test(next)) return false;
+    if (next === '{' && /[A-Za-z_$]/.test(text[index + 2] || '')) return false;
+    if (prev && !/\s|[(\[{,;:*_~>]/.test(prev) && !/\d/.test(next)) return false;
     return true;
   }
 
@@ -1122,71 +2185,32 @@
   }
 
   function isLikelyInlineDollarFormula(formula) {
-    const cleaned = formula.replace(/\s+/g, ' ').trim();
-    if (!cleaned) return false;
-
-    if (/^\d/.test(cleaned) && !/[\\{}_^=+\-*/<>×]/.test(cleaned)) return false;
-    return isRenderableLatexFormula(cleaned, false);
+    return structuredCandidateForFormula(formula, false, 'compatibility').decision === 'render';
   }
 
-  function findMathSpans(text) {
-    const spans = [];
-    let i = 0;
-    while (i < text.length) {
-      if (text.startsWith('$$', i) && !isEscapedDelimiter(text, i)) {
-        const end = findClosingDelimiter(text, i, '$$', '$$');
-        if (end !== -1) {
-          const formula = text.slice(i + 2, end);
-          if (isRenderableLatexFormula(formula, true)) spans.push({ start: i, end: end + 2, formula, displayMode: true });
-          i = end + 2;
-          continue;
-        }
-      }
-
-      if (text[i] === '$' && !isEscapedDelimiter(text, i) && isLikelyInlineDollarStart(text, i)) {
-        let end = i + 1;
-        while ((end = text.indexOf('$', end)) !== -1) {
-          if (!isEscapedDelimiter(text, end) && isLikelyInlineDollarEnd(text, end)) break;
-          end++;
-        }
-        if (end !== -1) {
-          const formula = text.slice(i + 1, end).trim();
-          if (isLikelyInlineDollarFormula(formula)) spans.push({ start: i, end: end + 1, formula, displayMode: false });
-          i = end + 1;
-          continue;
-        }
-      }
-
-      if (text.startsWith('\\(', i) && !isEscapedDelimiter(text, i)) {
-        const end = findClosingDelimiter(text, i, '\\(', '\\)');
-        if (end !== -1) {
-          const formula = text.slice(i + 2, end).trim();
-          if (isRenderableLatexFormula(formula, false)) spans.push({ start: i, end: end + 2, formula, displayMode: false });
-          i = end + 2;
-          continue;
-        }
-      }
-
-      if (text.startsWith('\\[', i) && !isEscapedDelimiter(text, i)) {
-        const end = findClosingDelimiter(text, i, '\\[', '\\]');
-        if (end !== -1) {
-          const formula = text.slice(i + 2, end);
-          if (isRenderableLatexFormula(formula, true)) spans.push({ start: i, end: end + 2, formula, displayMode: true });
-          i = end + 2;
-          continue;
-        }
-      }
-
-      i++;
-    }
-    return spans;
+  function findMathSpans(text, options = {}) {
+    return scanStructuredMath(text, {
+      markdown: options.markdown === true,
+      context: options.context || 'dom'
+    }).candidates
+      .filter((candidate) => candidate.decision === 'render')
+      .map((candidate) => ({
+        start: candidate.start,
+        end: candidate.end,
+        formula: candidate.formula,
+        renderFormula: candidate.renderFormula,
+        displayMode: candidate.displayMode,
+        raw: candidate.raw,
+        candidate,
+      }));
   }
 
   function shouldSkipMathElement(el) {
     return !el || el.nodeType !== 1 ||
       closestSafe(el, '.katex') ||
-      isInsideNonPreviewRegion(el) ||
-      ['SCRIPT', 'STYLE', 'CODE', 'PRE', 'BUTTON', 'INPUT', 'TEXTAREA'].includes(el.tagName);
+      isInsideMathExcludedRegion(el) ||
+      ['SCRIPT', 'STYLE', 'BUTTON', 'INPUT', 'TEXTAREA'].includes(el.tagName) ||
+      isMathCodeElement(el);
   }
 
   function markdownMarkerForElement(el) {
@@ -1231,7 +2255,7 @@
   }
 
   function replaceMathRange(span, refs) {
-    if (!isRenderableLatexFormula(span.formula, span.displayMode)) return false;
+    if (span.candidate?.decision === 'literal') return false;
 
     const startRef = refs[span.start];
     const endRef = refs[span.end - 1];
@@ -1239,7 +2263,7 @@
 
     let html;
     try {
-      html = renderLatexHtml(span.formula, span.displayMode);
+      html = renderLatexHtml(span.renderFormula || span.formula, span.displayMode);
     } catch {
       return false;
     }
@@ -1264,7 +2288,10 @@
     if (!textContent.includes('$') && !textContent.includes('\\(') && !textContent.includes('\\[')) return false;
 
     const { text, refs } = linearizeMathContainer(el);
-    const spans = findMathSpans(text);
+    const spans = findMathSpans(text, {
+      markdown: isInsideToolOutput(el),
+      context: isInsideToolOutput(el) ? 'dom-tool-output' : 'dom'
+    });
     if (!spans.length) return false;
 
     let changed = false;
@@ -1282,7 +2309,11 @@
 
   function renderMathInTextNode(textNode) {
     const text = textNode.textContent || '';
-    const spans = findMathSpans(text);
+    const toolOutput = isInsideToolOutput(textNode.parentElement);
+    const spans = findMathSpans(text, {
+      markdown: toolOutput,
+      context: toolOutput ? 'dom-tool-output' : 'dom'
+    });
     if (!spans.length) return false;
 
     const fragment = document.createDocumentFragment();
@@ -1296,7 +2327,7 @@
       }
 
       try {
-        appendHtmlFragment(fragment, renderLatexHtml(span.formula, span.displayMode));
+        appendHtmlFragment(fragment, renderLatexHtml(span.renderFormula || span.formula, span.displayMode));
         changed = true;
       } catch {
         fragment.appendChild(document.createTextNode(text.slice(span.start, span.end)));
@@ -1363,8 +2394,9 @@
           const parent = node.parentNode;
           if (!parent || parent.nodeType !== 1 ||
               closestSafe(parent, '.katex') ||
-              isInsideNonPreviewRegion(parent) ||
-              ['SCRIPT', 'STYLE', 'CODE', 'PRE', 'BUTTON', 'INPUT', 'TEXTAREA'].includes(parent.tagName)) {
+              isInsideMathExcludedRegion(parent) ||
+              ['SCRIPT', 'STYLE', 'BUTTON', 'INPUT', 'TEXTAREA'].includes(parent.tagName) ||
+              isMathCodeElement(parent)) {
             return NodeFilter.FILTER_REJECT;
           }
           const text = node.textContent || '';
@@ -1437,8 +2469,13 @@
           return;
         } catch {}
       }
-      if (!isProseHeavyLatex(text, true)) return;
-      el.replaceWith(document.createTextNode(text));
+      const displayMode = !!closestSafe(el, '.katex-display');
+      const preparation = prepareLatexForKatex(text, displayMode);
+      if (preparation.ok && !looksLikeCodeDollarFormula(text) &&
+          !looksLikeAmbiguousDollarProse(text) && !isProseHeavyLatex(text, displayMode)) return;
+
+      const delimiter = displayMode ? '$$' : '$';
+      el.replaceWith(document.createTextNode(`${delimiter}${text}${delimiter}`));
     });
   }
 
@@ -1566,7 +2603,7 @@
 
   function isOnlyMathInContainer(katexEl) {
     const container = closestSafe(katexEl, 'p, li, blockquote, td, th, div, section');
-    if (!container || container === document.body || isInsideNonPreviewRegion(container)) return false;
+    if (!container || container === document.body || isInsideMathExcludedRegion(container)) return false;
     const mathNodes = querySelectorAllSafe(container, '.katex:not(.katex-display .katex)')
       .filter((el) => !closestSafe(el, '.katex-display'));
     if (mathNodes.length !== 1 || mathNodes[0] !== katexEl) return false;
@@ -1575,7 +2612,7 @@
 
   function isOnlyMathInTableCell(katexEl) {
     const cell = closestSafe(katexEl, 'td, th');
-    if (!cell || isInsideNonPreviewRegion(cell)) return false;
+    if (!cell || isInsideMathExcludedRegion(cell)) return false;
     const mathNodes = querySelectorAllSafe(cell, '.katex:not(.katex-display .katex)')
       .filter((el) => !closestSafe(el, '.katex-display'));
     if (mathNodes.length !== 1 || mathNodes[0] !== katexEl) return false;
@@ -1585,7 +2622,7 @@
   function shouldPromoteInlineMath(katexEl) {
     if (!katexEl?.parentNode ||
         closestSafe(katexEl, '.katex-display') ||
-        isInsideNonPreviewRegion(katexEl)) {
+        isInsideMathExcludedRegion(katexEl)) {
       return false;
     }
     return isOnlyMathInTableCell(katexEl) ||
@@ -1595,7 +2632,7 @@
 
   function promoteStandaloneInlineMath(root) {
     const candidates = querySelectorAllSafe(root, '.katex:not(.katex-display .katex)')
-      .filter((el) => !closestSafe(el, '.katex-display') && !isInsideNonPreviewRegion(el));
+      .filter((el) => !closestSafe(el, '.katex-display') && !isInsideMathExcludedRegion(el));
 
     candidates.forEach((katexEl) => {
       if (katexEl.dataset.cePromoted) return;
@@ -1624,7 +2661,7 @@
 
   function adaptInlineMathSize(root) {
     const candidates = querySelectorAllSafe(root, '.katex')
-      .filter((el) => !closestSafe(el, '.katex-display') && !isInsideNonPreviewRegion(el));
+      .filter((el) => !closestSafe(el, '.katex-display') && !isInsideMathExcludedRegion(el));
 
     candidates.forEach((katexEl) => {
       // Per-element marker: measure each formula once. isLargeInlineMath calls
@@ -1837,8 +2874,9 @@
     el.setAttribute('data-ce-api-error-rendered', 'true');
   }
 
-  function renderApiErrors() {
-    getEnhanceRoots().forEach((root) => safeRun('renderApiErrors root', () => {
+  function renderApiErrors(scopes) {
+    if (!RUNTIME_CONFIG.apiErrorCards) return;
+    rootsForScopes(scopes, getEnhanceRoots).forEach((root) => safeRun('renderApiErrors root', () => {
       const walker = document.createTreeWalker(
         root,
         NodeFilter.SHOW_TEXT,
@@ -1876,6 +2914,7 @@
 
       containerJobs.forEach((info, el) => safeRun('renderApiError container', () => {
         replaceElementWithApiErrorCard(el, info);
+        runtimeDiagnostics.apiErrors++;
       }));
 
       fallbackNodes.forEach((textNode) => safeRun('renderApiError text', () => {
@@ -1890,17 +2929,18 @@
         if (start > 0) fragment.appendChild(document.createTextNode(text.slice(0, start)));
         fragment.appendChild(createApiErrorCard(info));
         textNode.parentNode?.replaceChild(fragment, textNode);
+        runtimeDiagnostics.apiErrors++;
       }));
     }));
   }
 
-  function renderLaTeX() {
+  function renderLaTeX(scopes) {
     if (typeof katex === 'undefined') return;
     if (window._claudeRenderingLaTeX) return;
     window._claudeRenderingLaTeX = true;
 
     try {
-      getEnhanceRoots().forEach((root) => safeRun('renderLaTeX root', () => {
+      rootsForScopes(scopes, getMathRoots).forEach((root) => safeRun('renderLaTeX root', () => {
 
         preprocessHTMLMath(root);
 
@@ -1913,8 +2953,9 @@
               if (!parent || parent.nodeType !== 1) return NodeFilter.FILTER_REJECT;
               if (parent.classList?.contains('katex') ||
                   closestSafe(parent, '.katex') ||
-                  isInsideNonPreviewRegion(parent) ||
-                  ['SCRIPT', 'STYLE', 'CODE', 'PRE', 'BUTTON', 'INPUT', 'TEXTAREA'].includes(parent.tagName)) {
+                  isInsideMathExcludedRegion(parent) ||
+                  ['SCRIPT', 'STYLE', 'BUTTON', 'INPUT', 'TEXTAREA'].includes(parent.tagName) ||
+                  isMathCodeElement(parent)) {
                 return NodeFilter.FILTER_REJECT;
               }
               const text = node.textContent;
@@ -2127,8 +3168,8 @@
       .trim(), '');
   }
 
-  function groupMessagesByTurn() {
-    const container = querySelectorAllSafe(document, '[class*="messagesContainer_"]')[0];
+  function groupMessagesByTurn(container) {
+    container = container || querySelectorAllSafe(document, MESSAGE_CONTAINER_SELECTOR)[0];
     if (!container) return [];
 
     const turns = [];
@@ -2155,6 +3196,7 @@
   }
 
   function addCopyButton(messageEl) {
+    if (!RUNTIME_CONFIG.copyButtons) return;
     if (!messageEl || messageEl.nodeType !== 1 || shouldSkipPreviewEnhancement(messageEl)) return;
     if (querySelectorAllSafe(messageEl, '.claude-copy-btn').length) return;
 
@@ -2190,17 +3232,26 @@
     messageEl.appendChild(btn);
   }
 
-  function scanAndAddCopyButtons() {
-    const turns = groupMessagesByTurn();
+  function copyContainersForScopes(scopes) {
+    if (!scopes) return querySelectorAllSafe(document, MESSAGE_CONTAINER_SELECTOR);
+    const containers = new Set();
+    (Array.isArray(scopes) ? scopes : [scopes]).forEach((scope) => {
+      if (matchesSafe(scope, MESSAGE_CONTAINER_SELECTOR)) containers.add(scope);
+      const container = closestSafe(scope, MESSAGE_CONTAINER_SELECTOR);
+      if (container) containers.add(container);
+    });
+    return Array.from(containers);
+  }
 
-    turns.forEach(turnMessages => {
-      if (turnMessages.length === 0) return;
-
-      const lastMessage = turnMessages[turnMessages.length - 1];
-
-      _turnMessagesMap.set(lastMessage, turnMessages);
-
-      safeRun('addCopyButton', () => addCopyButton(lastMessage));
+  function scanAndAddCopyButtons(scopes) {
+    if (!RUNTIME_CONFIG.copyButtons) return;
+    copyContainersForScopes(scopes).forEach((container) => {
+      groupMessagesByTurn(container).forEach(turnMessages => {
+        if (turnMessages.length === 0) return;
+        const lastMessage = turnMessages[turnMessages.length - 1];
+        _turnMessagesMap.set(lastMessage, turnMessages);
+        safeRun('addCopyButton', () => addCopyButton(lastMessage));
+      });
     });
   }
 
@@ -2231,11 +3282,11 @@
     }, { passive: false });
   }
 
-  function applyContentZoom(zoom) {
+  function applyContentZoom(zoom, scopes) {
     if (!document.body) return;
     document.body.style.zoom = '';
     const effectiveZoom = Number.isFinite(zoom) ? zoom * CONTENT_BASE_FONT_SCALE : CONTENT_BASE_FONT_SCALE;
-    getEnhanceRoots().forEach((root) => {
+    rootsForScopes(scopes, getEnhanceRoots).forEach((root) => {
       root.style.fontSize = `${effectiveZoom}em`;
     });
   }
@@ -2269,17 +3320,28 @@
 
   // ===== DOM observer =====
 
+  let enhancementScheduler = null;
+
+  function enqueueFullEnhancement(features, reason) {
+    if (!enhancementScheduler) return false;
+    enhancementScheduler.enqueue(null, features, { fullPass: true, reason });
+    runtimeDiagnostics.scheduler.pending = enhancementScheduler.getState();
+    return true;
+  }
+
   function setupObserver() {
     if (typeof MutationObserver === 'undefined' || !document.body) return;
-    let debounceTimer = null;
-    const DEBOUNCE_DELAY = 100;
+    const runtimeCore = window.__CLAUDE_ENHANCE_RUNTIME_CORE__;
+    if (!runtimeCore?.createIncrementalScheduler) {
+      warnOnce('incremental runtime unavailable', new Error('runtime-core.js did not load'));
+      return;
+    }
+    let queuedMutationBatches = 0;
 
     function isInsideKatex(node) {
       return !!closestSafe(node?.nodeType === Node.TEXT_NODE ? node.parentElement : node, '.katex, .katex-display, .katex-mathml');
     }
 
-    // Detect DOM changes produced by the enhancement script itself (KaTeX output, hljs,
-    // copy buttons, etc.) so they don't re-trigger the cycle and cause an infinite loop.
     // Detects DOM changes produced by the enhancement script itself (KaTeX output, highlighting,
     // copy buttons, etc.) so they don't re-trigger the cycle and cause an infinite render loop.
     function isSelfMutation(m) {
@@ -2299,77 +3361,65 @@
       return m.addedNodes.length > 0;
     }
 
-    function classifyMutations(mutations) {
-      let needFull = false;
-      let needMath = false;
-      let needHighlight = false;
-
-      for (const m of mutations) {
-        if (isSelfMutation(m)) continue;
-
-        if (m.type === 'characterData') {
-          const text = m.target?.textContent || '';
-          if (text.includes('$') || text.includes('\\(') || text.includes('\\[')) needMath = true;
-          if (text.includes('**')) needMath = true;
-        }
-
-        for (const node of m.addedNodes) {
-          if (node.nodeType === Node.TEXT_NODE) {
-            if (isInsideKatex(node)) continue;
-            const text = node.textContent || '';
-            if (text.includes('$') || text.includes('\\(') || text.includes('\\[')) needMath = true;
-            needFull = true;
-          }
-          if (node.nodeType === Node.ELEMENT_NODE) {
-            const cls = toClassName(node.className);
-            if (cls.includes('katex') || cls.includes('hljs') ||
-                cls.includes('zoom-indicator') || cls.includes('claude-code-copy-btn') ||
-                cls.includes('claude-copy-btn') || cls.includes('ce-api-error') ||
-                cls.includes('claude-enhance-root')) continue;
-            const tag = node.tagName;
-            if (tag === 'PRE' || tag === 'CODE') needHighlight = true;
-            needFull = true;
-          }
-        }
-        if (needFull) break;
+    function enqueueMutation(mutation, currentContainer) {
+      if (isSelfMutation(mutation)) return false;
+      const roots = new Set();
+      const targetRoot = findProcessingRoot(mutation.target, currentContainer);
+      if (targetRoot) roots.add(targetRoot);
+      for (const node of mutation.addedNodes || []) {
+        const root = findProcessingRoot(node, currentContainer);
+        if (root) roots.add(root);
       }
+      if (!roots.size) return false;
 
-      return { needFull, needMath, needHighlight };
+      const features = mutation.type === 'characterData'
+        ? ['apiErrors', 'math', 'zoom']
+        : ['apiErrors', 'code', 'math', 'copy', 'zoom'];
+      roots.forEach((root) => enhancementScheduler.enqueue(root, features, {
+        reason: mutation.type,
+      }));
+      return true;
     }
+
+    enhancementScheduler = runtimeCore.createIncrementalScheduler({
+      schedule(callback) {
+        return typeof requestAnimationFrame === 'function'
+          ? requestAnimationFrame(callback)
+          : setTimeout(callback, 16);
+      },
+      cancel(handle) {
+        if (typeof cancelAnimationFrame === 'function') cancelAnimationFrame(handle);
+        else clearTimeout(handle);
+      },
+      isUsableRoot(root) {
+        return !!root && root.nodeType === Node.ELEMENT_NODE && root.isConnected !== false;
+      },
+      flush(batch) {
+        runtimeDiagnostics.scheduler.coalescedBatches += queuedMutationBatches > 1 ? 1 : 0;
+        queuedMutationBatches = 0;
+        runtimeDiagnostics.scheduler.lastBatchAt = new Date().toISOString();
+        runtimeDiagnostics.scheduler.lastBatchReasons = batch.reasons;
+        runtimeDiagnostics.scheduler.pending = null;
+        runEnhancementCycle({
+          fullPass: batch.fullPass,
+          roots: batch.fullPass ? undefined : batch.roots,
+          features: batch.features,
+        });
+      },
+    });
 
     const observer = new MutationObserver((mutations) => {
       if (_enhancing) return;
-
       safeRun('mutation observer', () => {
-        const { needFull, needMath, needHighlight } = classifyMutations(mutations);
-        if (!needFull && !needMath && !needHighlight) return;
-
-        if (!debounceTimer) {
-
-          if (needFull) {
-            runEnhancementCycle();
-          } else if (needMath) {
-            _enhancing = true;
-            try {
-              scrollToBottomIfNeeded();
-              safeRun('renderLaTeX', renderLaTeX);
-              scrollToBottomIfNeeded();
-            } finally { _enhancing = false; }
-          } else if (needHighlight) {
-            _enhancing = true;
-            try {
-              scrollToBottomIfNeeded();
-              safeRun('highlightAllCode', highlightAllCode);
-              scrollToBottomIfNeeded();
-            } finally { _enhancing = false; }
-          }
+        runtimeDiagnostics.mutationBatches++;
+        let enqueued = false;
+        mutations.forEach((mutation) => {
+          enqueued = enqueueMutation(mutation, currentContainer) || enqueued;
+        });
+        if (enqueued) {
+          queuedMutationBatches++;
+          runtimeDiagnostics.scheduler.pending = enhancementScheduler.getState();
         }
-
-        clearTimeout(debounceTimer);
-        debounceTimer = setTimeout(() => {
-          debounceTimer = null;
-          if (needFull) runEnhancementCycle();
-        }, DEBOUNCE_DELAY);
       });
     });
 
@@ -2381,17 +3431,21 @@
       currentContainer = container;
       observer.observe(container, { childList: true, subtree: true, characterData: true });
       console.log('[Claude Enhance] Observer attached to messagesContainer');
-      runEnhancementCycle();
-      // Content may not be rendered yet when the container first appears.
-      setTimeout(runEnhancementCycle, 500);
+      enhancementScheduler.enqueue(null, undefined, {
+        fullPass: true,
+        reason: 'container-attached',
+      });
+      runtimeDiagnostics.scheduler.pending = enhancementScheduler.getState();
     }
 
     function ensureAttached() {
       // Fast path: still attached to a live container, nothing to do.
       if (currentContainer && currentContainer.isConnected) return;
-      const container = document.querySelector('[class*="messagesContainer_"]');
+      const container = document.querySelector(MESSAGE_CONTAINER_SELECTOR);
       if (container && container !== currentContainer) {
         attachToContainer(container);
+      } else if (!container) {
+        currentContainer = null;
       }
     }
 
@@ -2424,6 +3478,7 @@
     const result = {
       timestamp: new Date().toISOString(),
       url: window.location.href,
+      claudeEnhance: diagnosticsSnapshot(),
       rootClasses: [],
       messageContainers: [],
       allClassNames: new Set(),
@@ -2586,33 +3641,65 @@
     }
   }
 
-  let _lastContentHash = '';
+  const ENHANCEMENT_FEATURE_REGISTRY = Object.freeze([
+    {
+      id: 'apiErrors',
+      enabled: () => RUNTIME_CONFIG.apiErrorCards,
+      run: (roots) => renderApiErrors(roots),
+    },
+    {
+      id: 'code',
+      enabled: () => RUNTIME_CONFIG.syntaxHighlighting || RUNTIME_CONFIG.copyButtons,
+      run: (roots) => highlightAllCode(roots),
+    },
+    { id: 'math', enabled: () => true, run: (roots) => renderLaTeX(roots) },
+    {
+      id: 'copy',
+      enabled: () => RUNTIME_CONFIG.copyButtons,
+      run: (roots) => scanAndAddCopyButtons(roots),
+    },
+    {
+      id: 'zoom',
+      enabled: () => true,
+      run: (roots) => applyContentZoom(getStoredZoom(), roots),
+    },
+  ]);
 
-  function getContentHash() {
-    const roots = getEnhanceRoots();
-    if (!roots.length) return '';
-
-    return roots.map(r => `${r.textContent?.length || 0}:${(r.textContent || '').slice(0, 50)}`).join('|');
+  function runEnhancementFeature(feature, roots) {
+    if (!feature.enabled()) return;
+    const diagnostics = runtimeDiagnostics.features[feature.id];
+    diagnostics.attempts++;
+    try {
+      feature.run(roots);
+      diagnostics.succeeded++;
+    } catch (error) {
+      diagnostics.failed++;
+      warnOnce(`feature ${feature.id}`, error);
+    }
   }
 
-  // Full enhancement pass. Sets _enhancing so the Observer ignores the DOM
-  // changes it makes; zoom only re-applies when content actually changed.
-  function runEnhancementCycle() {
+  // One registry-driven pass over either the entire transcript or the dirty message roots.
+  function runEnhancementCycle(options = {}) {
+    const fullPass = options.fullPass !== false && !options.roots;
+    const roots = fullPass
+      ? getEnhanceRoots()
+      : topLevelRoots((options.roots || []).filter((root) => root?.isConnected !== false));
+    const requested = new Set(
+      window.__CLAUDE_ENHANCE_RUNTIME_CORE__?.normalizeFeatures(options.features) ||
+      ENHANCEMENT_FEATURE_REGISTRY.map((feature) => feature.id)
+    );
+
+    runtimeDiagnostics.enhancementCycles++;
+    runtimeDiagnostics.dirtyRootsProcessed += roots.length;
+    if (fullPass) runtimeDiagnostics.scheduler.fullPasses++;
+    else runtimeDiagnostics.scheduler.incrementalPasses++;
+
     _enhancing = true;
     try {
-
       scrollToBottomIfNeeded();
-      safeRun('renderApiErrors', renderApiErrors);
-      safeRun('highlightAllCode', highlightAllCode);
-      safeRun('renderLaTeX', renderLaTeX);
-      safeRun('scanAndAddCopyButtons', scanAndAddCopyButtons);
-
-      const hash = getContentHash();
-      if (hash !== _lastContentHash) {
-        _lastContentHash = hash;
-        safeRun('applyContentZoom', () => applyContentZoom(getStoredZoom()));
-      }
-
+      ENHANCEMENT_FEATURE_REGISTRY.forEach((feature) => {
+        if (requested.has(feature.id)) runEnhancementFeature(feature, roots);
+      });
       scrollToBottomIfNeeded();
     } finally {
       _enhancing = false;
@@ -2627,16 +3714,26 @@
     safeRun('setupZoom', setupZoom);
     safeRun('setupObserver', setupObserver);
     safeRun('setupDOMInspector', setupDOMInspector);
-
-    runEnhancementCycle();
-
-    setTimeout(runEnhancementCycle, 1000);
-    setTimeout(runEnhancementCycle, 3000);
   }
+
+  safeRun('installRemarkSourceNormalizer', installRemarkSourceNormalizer);
+  safeRun('wrapRemarkMathClassifier', wrapRemarkMathClassifier);
+  safeRun('wrapRehypeKatexNormalizer', wrapRehypeKatexNormalizer);
 
   if (window.__CLAUDE_ENHANCE_TEST_MODE__) {
     window.__CLAUDE_ENHANCE_TEST_API__ = {
       findMathSpans,
+      collectMarkdownProtectedRanges,
+      scanStructuredMath,
+      classifyStructuredMathCandidate,
+      structuredCandidateForFormula,
+      structuredCandidateForRemarkNode,
+      analyzeFormulaSignals,
+      hasPlausibleClosingDollar,
+      protectUnpairedNumericDollars,
+      recoverMathOnlyInlineCode,
+      normalizeMarkdownMathSource,
+      installRemarkSourceNormalizer,
       getCodeLanguage,
       hasMarkdownUnderscoreEmphasis,
       parseApiErrorText,
@@ -2646,7 +3743,24 @@
       isRenderableLatexFormula,
       looksLikeLatex,
       normalizeLatexForRender,
+      normalizeRemarkMathNodes,
+      wrapRemarkMathClassifier,
+      normalizeHastMathNodes,
+      wrapRehypeKatexNormalizer,
+      prepareLatexForKatex,
+      chooseRenderableLatexForKatex,
+      repairLatexForKatexError,
+      normalizeLatexTextCommands,
+      repairUnsupportedKatexMacros,
+      looksLikeCodeDollarFormula,
+      looksLikeAmbiguousDollarProse,
+      isPreparedLatexFormula,
       renderLatexHtml,
+      displayDollarRole,
+      isInsideMathExcludedRegion,
+      CODE_SURFACE_SELECTOR,
+      diagnosticsSnapshot,
+      enhancementFeatureIds: ENHANCEMENT_FEATURE_REGISTRY.map((feature) => feature.id),
     };
     return;
   }

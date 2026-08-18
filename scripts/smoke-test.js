@@ -50,6 +50,41 @@ for (const marker of [
   'claude-enhance-root',
   'shouldSkipPreviewEnhancement',
   'isProseHeavyLatex',
+  'escapeUnescapedUnderscores',
+  'escapeUnescapedTextSpecials',
+  'StructuredMathCandidate',
+  'MATH_DELIMITER_DEFINITIONS',
+  'collectMarkdownProtectedRanges',
+  'scanStructuredMath',
+  'normalizeToolOutputMathFormula',
+  'TOOL_OUTPUT_SELECTOR',
+  'isInsideToolOutput',
+  'isMathCodeElement',
+  'isInsideMathExcludedRegion',
+  'getMathRoots',
+  'classifyStructuredMathCandidate',
+  'structuredCandidateForFormula',
+  'structuredCandidateForRemarkNode',
+  'analyzeFormulaSignals',
+  'hasPlausibleClosingDollar',
+  'protectUnpairedNumericDollars',
+  'recoverMathOnlyInlineCode',
+  'normalizeMarkdownMathSource',
+  'installRemarkSourceNormalizer',
+  'MAX_LATEX_SOURCE_LENGTH',
+  'MAX_LATEX_PREPARATION_CACHE',
+  'repairLatexForKatexError',
+  'prepareLatexForKatex',
+  'chooseRenderableLatexForKatex',
+  'repairUnsupportedKatexMacros',
+  'findBalancedLatexGroupEnd',
+  'looksLikeCodeDollarFormula',
+  'looksLikeAmbiguousDollarProse',
+  'isPreparedLatexFormula',
+  'normalizeRemarkMathNodes',
+  'wrapRemarkMathClassifier',
+  'normalizeHastMathNodes',
+  'wrapRehypeKatexNormalizer',
   'isLikelyInlineDollarFormula',
   'isDimensionLatexFormula',
   'normalizeDimensionLatexFormula',
@@ -64,11 +99,18 @@ for (const marker of [
   'shouldPromoteInlineMath',
   'adaptInlineMathSize',
   'ce-large-inline-math',
-  'stable-runtime-guards',
+  'structural-transactional-incremental-runtime',
+  '__CLAUDE_ENHANCE_RUNTIME_CORE__',
+  'createIncrementalScheduler',
+  'ENHANCEMENT_FEATURE_REGISTRY',
+  'findProcessingRoot',
+  'dirtyRootsProcessed',
+  'claudeEnhance: diagnosticsSnapshot()',
   'safeRun',
   'CONTENT_BASE_FONT_SCALE',
   'zoom * CONTENT_BASE_FONT_SCALE',
   'NON_PREVIEW_SELECTOR',
+  'diffEditorWrapper_',
   'renderMathInTextNode',
   'runEnhancementCycle',
   'characterData: true',
@@ -87,12 +129,12 @@ for (const marker of [
   'width: fit-content',
   'margin: 0.35em 0',
   'clamp(8px, 0.65em, 14px)',
-  'font-size: 1.48em',
-  'font-size: 1.22em',
+  'mathFontSize(1.48)',
+  'mathFontSize(1.22)',
   '\\uE000',
   '__remarkPipeGuard',
   'meaningfulTextWithoutMath',
-  'font-size: 1.6em',
+  'mathFontSize(1.6)',
   'padding: 14px 18px',
   'min-height: 48px',
   'width: 100% !important',
@@ -197,7 +239,12 @@ function findLatestInstalledClaudeCodeFixture() {
 const installedFixture = findLatestInstalledClaudeCodeFixture();
 if (installedFixture) {
   const installedSource = fs.readFileSync(installedFixture.jsPath, 'utf8');
-  const installedHasRetentionCap = extension.MESSAGE_RETENTION_CONSTANTS_RE.test(installedSource);
+  let installedHasRetentionCap = false;
+  try {
+    installedHasRetentionCap = extension.findMessageRetentionTargets(
+      extension.parseBundle(installedSource)
+    ).length === 1;
+  } catch {}
   const localTmp = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-code-enhance-installed-'));
   const localWebview = path.join(localTmp, 'webview');
   fs.mkdirSync(localWebview);
@@ -208,7 +255,7 @@ if (installedFixture) {
     throw new Error('applyPatch returned false for installed Claude Code fixture: ' + installedFixture.name);
   }
   const localPatchedJs = fs.readFileSync(path.join(localWebview, 'index.js'), 'utf8');
-  for (const marker of ['stable-runtime-guards', 'safeRun', 'NON_PREVIEW_SELECTOR']) {
+  for (const marker of ['structural-transactional-incremental-runtime', 'createIncrementalScheduler', 'NON_PREVIEW_SELECTOR']) {
     if (!localPatchedJs.includes(marker)) {
       throw new Error('missing installed Claude Code marker: ' + marker);
     }

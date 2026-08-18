@@ -1,5 +1,27 @@
 # Changelog
 
+## [1.0.4] - 2026-08-18
+
+### Architecture
+- Replaced version-specific minified-bundle regex patching with Acorn AST discovery. Markdown and transcript-retention targets are matched semantically, transformed by source ranges, syntax-validated, and rejected when discovery is missing or ambiguous.
+- Added verified multi-file transactions for webview patches, restores, backup rotation, and uninstall cleanup, including SHA-256/version metadata, `fsync`, atomic renames, and rollback after partial commits.
+- Replaced immediate and delayed global rescans with a shared feature registry and animation-frame scheduler. Mutation batches now coalesce feature flags and process only dirty message roots; conversation replacement remains a full-pass fallback.
+
+### Configuration And Diagnostics
+- Added settings for full-transcript retention, content and math scale, tool-output math, syntax highlighting, copy controls, and API error cards.
+- Added the `Claude Code Enhance: Show Diagnostics` command and runtime diagnostics in the `Ctrl+Shift+D` DOM export.
+- Added explicit detection and recovery for incomplete JS/CSS patch states and safe backup rotation after in-place Claude Code updates.
+
+### Rich Content
+- Unified deterministic math candidate scanning across source, remark/rehype, and DOM fallback paths while preserving exact raw text for literal fallback.
+- Added context-aware recovery for line-numbered and blockquoted tool output, orphan display delimiters, HTML-adjacent equations, template substitutions, protected code spans, malformed dimensions, and unsupported KaTeX operators.
+- Prevented long valid display formulas with TeX subscripts from being mistaken for Markdown emphasis, recovered validated math-only inline-code spans, and excluded Claude's Edit/Monaco diff surfaces from tool-output math fallback.
+- Expanded API error cards, table math sizing/alignment, content readability, code highlighting, and copy behavior.
+
+### Validation
+- Added structural, transaction, configuration, scheduler, uninstall, and installed-version architecture regressions.
+- Added real-history validation for Claude and Codex assistant messages and tool results, including formula rendering, code-region exclusion, normalization idempotence, API errors, highlighting, and table pipes.
+
 ## [1.0.3] - 2026-07-14
 
 ### Fixed
