@@ -254,12 +254,26 @@
     const statusRoot = document.getElementById('status');
     const latestButton = document.getElementById('latest');
     const filterButtons = Array.from(document.querySelectorAll('[data-filter]'));
+    const persistedState = typeof vscode.getState === 'function' ? (vscode.getState() || {}) : {};
+    const persistedFilter = filterButtons.some((button) => button.dataset.filter === persistedState.filter)
+      ? persistedState.filter
+      : 'all';
     const state = {
       transcript: null,
       messages: [],
-      filter: 'all',
-      query: '',
+      filter: persistedFilter,
+      query: typeof persistedState.query === 'string' ? persistedState.query : '',
     };
+    let restoreScrollY = Number.isFinite(persistedState.scrollY) ? persistedState.scrollY : null;
+    searchInput.value = state.query;
+    for (const button of filterButtons) {
+      button.setAttribute('aria-pressed', String(button.dataset.filter === state.filter));
+    }
+
+    function persistUiState() {
+      if (typeof vscode.setState !== 'function') return;
+      vscode.setState({ filter: state.filter, query: state.query, scrollY: windowObject.scrollY });
+    }
 
     const allowedTags = new Set([
       'A', 'BLOCKQUOTE', 'BR', 'CODE', 'DEL', 'DIV', 'EM', 'H1', 'H2', 'H3',
@@ -578,6 +592,11 @@
       }
       renderSummary();
       applyFilters();
+      if (restoreScrollY !== null) {
+        const scrollY = restoreScrollY;
+        restoreScrollY = null;
+        windowObject.requestAnimationFrame(() => windowObject.scrollTo(0, scrollY));
+      }
     }
 
     function appendTranscript(metadata, messages) {
@@ -603,6 +622,7 @@
       windowObject.clearTimeout(searchTimer);
       searchTimer = windowObject.setTimeout(() => {
         state.query = searchInput.value.trim();
+        persistUiState();
         applyFilters();
       }, 100);
     });
@@ -612,6 +632,7 @@
         for (const candidate of filterButtons) {
           candidate.setAttribute('aria-pressed', String(candidate === button));
         }
+        persistUiState();
         applyFilters();
       });
     }
@@ -619,6 +640,11 @@
       top: document.body.scrollHeight,
       behavior: 'smooth',
     }));
+    let scrollTimer = null;
+    windowObject.addEventListener('scroll', () => {
+      windowObject.clearTimeout(scrollTimer);
+      scrollTimer = windowObject.setTimeout(persistUiState, 150);
+    }, { passive: true });
 
     windowObject.addEventListener('message', (event) => {
       const message = event.data;

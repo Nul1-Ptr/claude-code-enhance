@@ -9,6 +9,7 @@ const {
   findSubagentFiles,
   readSubagentTranscript,
   transcriptStatus,
+  updateSubagentTranscript,
 } = require('../lib/subagent-transcripts');
 const sidebar = require('../lib/subagent-sidebar');
 const marked = require('../vendor/marked.min.js');
@@ -99,6 +100,53 @@ function testFixtureParsing() {
   assert(transcript.messages[3].role === 'tool-result', 'tool results should have a distinct role');
   assert(transcript.messages[3].blocks[0].isError, 'tool result error metadata should survive parsing');
   assert(transcript.messages[4].error === 'server_error', 'API error metadata should survive parsing');
+
+  fs.appendFileSync(filePath, '}\n');
+  const completedPartial = updateSubagentTranscript(transcript, descriptor);
+  assert(completedPartial.append, 'completing a partial JSONL record should use an incremental read');
+  assert(!completedPartial.transcript.partialLine, 'completed partial JSONL should no longer be pending');
+  assert(completedPartial.transcript.messages.length === 5, 'non-message JSONL records should not add messages');
+
+  fs.appendFileSync(filePath, jsonLine({
+    type: 'assistant',
+    uuid: 'a4',
+    message: { role: 'assistant', stop_reason: 'end_turn', content: 'Incremental answer.' },
+  }));
+  const appended = updateSubagentTranscript(completedPartial.transcript, descriptor);
+  assert(appended.append && appended.appendedMessages.length === 1, 'new JSONL messages should be returned as a delta');
+  assert(appended.transcript.messages.length === 6, 'incremental reads should preserve prior messages');
+  assert(appended.appendedMessages[0].line === appended.transcript.lines, 'incremental line numbers should remain absolute');
+
+  fs.writeFileSync(filePath, jsonLine({
+    type: 'assistant',
+    uuid: 'replacement',
+    message: { role: 'assistant', content: 'Replacement transcript.' },
+  }));
+  const replaced = updateSubagentTranscript(appended.transcript, descriptor);
+  assert(!replaced.append, 'truncated or replaced JSONL should fall back to a full read');
+  assert(replaced.transcript.messages.length === 1, 'fallback reads should discard stale messages');
+
+  const otherProjectId = '-tmp-other-project';
+  const otherSessionId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+  const otherProject = path.join(root, otherProjectId);
+  const otherSubagents = path.join(otherProject, otherSessionId, 'subagents');
+  fs.mkdirSync(otherSubagents, { recursive: true });
+  fs.writeFileSync(path.join(otherProject, otherSessionId + '.jsonl'), jsonLine({
+    cwd: '/tmp/other-project',
+    message: { role: 'user', content: 'Other project.' },
+  }));
+  fs.writeFileSync(path.join(otherSubagents, 'agent-other.jsonl'), jsonLine({
+    cwd: '/tmp/other-project',
+    message: { role: 'user', content: 'Other agent.' },
+  }));
+  const selected = findSubagentFiles(root, { projectIds: new Set([projectId]) });
+  assert(selected.length === 1 && selected[0].projectId === projectId, 'selected discovery should scan only requested projects');
+  const parentSelected = findSubagentFiles(root, {
+    projectIds: new Set(['-tmp']),
+    includeDescendants: true,
+  });
+  assert(parentSelected.length === 2, 'selected discovery should optionally include projects below a workspace parent');
+  assert(findSubagentFiles(root).length === 2, 'unscoped discovery should continue to scan every project');
 }
 
 function testBlockExtractionAndStatus() {
@@ -160,6 +208,13 @@ function testSidebarHelpers() {
   const next = { filePath: '/a', messages: [{ id: '1' }, { id: '2' }] };
   assert(sidebar.isAppendOnly(previous, next), 'growing JSONL should use append updates');
   assert(!sidebar.isAppendOnly(next, previous), 'shrinking JSONL should force replacement');
+  const publicValue = sidebar.publicTranscript({
+    filePath: '/a',
+    messages: [{ id: '1' }],
+    readState: { completeBytes: 10 },
+  });
+  assert(!('readState' in publicValue), 'internal incremental read state should not enter webview payloads');
+  assert(publicValue.messages.length === 1, 'public transcript payloads should retain messages');
 
   const scoped = [
     { projectId: '-work-api', projectPath: '/work/api', filePath: '/api' },
