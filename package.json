@@ -2,7 +2,7 @@
   "name": "claude-code-enhance",
   "displayName": "Claude Code Enhance",
   "description": "Improves Claude Code rich rendering and exposes complete sub-agent transcripts in VS Code.",
-  "version": "1.0.6",
+  "version": "1.0.7",
   "publisher": "AlexisHe",
   "license": "MIT",
   "repository": {
@@ -70,6 +70,16 @@
         "command": "claude-code-enhance.refreshSubagents",
         "title": "Claude Code Enhance: Refresh Sub-agents",
         "icon": "$(refresh)"
+      },
+      {
+        "command": "claude-code-enhance.showAllSubagentProjects",
+        "title": "Claude Code Enhance: Show All Projects",
+        "icon": "$(list-tree)"
+      },
+      {
+        "command": "claude-code-enhance.showWorkspaceSubagentProjects",
+        "title": "Claude Code Enhance: Show Active Workspace",
+        "icon": "$(folder)"
       }
     ],
     "viewsContainers": {
@@ -93,9 +103,19 @@
     "menus": {
       "view/title": [
         {
+          "command": "claude-code-enhance.showAllSubagentProjects",
+          "when": "view == claude-code-enhance.subagents && claudeCodeEnhance.subagentScope == workspace",
+          "group": "navigation@1"
+        },
+        {
+          "command": "claude-code-enhance.showWorkspaceSubagentProjects",
+          "when": "view == claude-code-enhance.subagents && claudeCodeEnhance.subagentScope == all",
+          "group": "navigation@1"
+        },
+        {
           "command": "claude-code-enhance.refreshSubagents",
           "when": "view == claude-code-enhance.subagents",
-          "group": "navigation@1"
+          "group": "navigation@2"
         }
       ],
       "view/item/context": [

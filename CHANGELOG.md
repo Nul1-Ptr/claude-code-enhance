@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.0.7] - 2026-08-19
+
+### Sub-agent Project Scope
+- Filtered the sub-agent sidebar and transcript picker to the active VS Code workspace by default, including multi-root and nested working-directory histories.
+- Added panel commands to switch explicitly between the active workspace and all Claude projects, with automatic refresh when workspace folders change.
+
 ## [1.0.6] - 2026-08-18
 
 ### Sidebar Icon

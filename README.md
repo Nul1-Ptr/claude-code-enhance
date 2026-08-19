@@ -156,7 +156,7 @@ Press **Ctrl+Shift+D** inside the Claude Code webview to dump the DOM structure 
 
 ## Version
 
-Current local version: `1.0.6`
+Current local version: `1.0.7`
 
 The package version, internal patch build, and normalized configuration hash are stamped separately. A rebuild can therefore refresh stale injected code or settings without depending on a specific Claude Code version.
 
@@ -172,7 +172,7 @@ From this directory:
 
 ```bash
 npm run package
-code --install-extension claude-code-enhance-1.0.6.vsix --force
+code --install-extension claude-code-enhance-1.0.7.vsix --force
 ```
 
 Reload VS Code after installing. The extension patches Claude Code automatically on startup and reloads the Claude Code webview when it applies or refreshes the patch.
@@ -186,6 +186,8 @@ Open the command palette with `Ctrl+Shift+P`:
 - `Claude Code Enhance: Status`
 - `Claude Code Enhance: Show Diagnostics`
 - `Claude Code Enhance: Open Sub-agent Sidebar`
+- `Claude Code Enhance: Show All Projects`
+- `Claude Code Enhance: Show Active Workspace`
 - `Claude Code Enhance: Open Raw Sub-agent Transcript`
 - `Claude Code Enhance: Refresh Sub-agents`
 
@@ -200,7 +202,7 @@ Open the command palette with `Ctrl+Shift+P`:
 | `claudeCodeEnhance.syntaxHighlighting` | `true` | Apply bundled syntax highlighting. |
 | `claudeCodeEnhance.copyButtons` | `true` | Add code-block and assistant-turn copy controls. |
 | `claudeCodeEnhance.apiErrorCards` | `true` | Render API errors as structured diagnostic cards. |
-| `claudeCodeEnhance.subagentProjectsRoot` | empty | Override the Claude history root used by the sub-agent sidebar; empty uses `~/.claude/projects`. |
+| `claudeCodeEnhance.subagentProjectsRoot` | empty | Override the Claude history root used by the sub-agent sidebar; empty uses `~/.claude/projects`. The sidebar initially filters that root to the active workspace. |
 
 Setting changes are normalized, hashed into the patch stamp, and applied by a guarded webview refresh.
 

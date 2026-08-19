@@ -161,6 +161,41 @@ function testSidebarHelpers() {
   assert(sidebar.isAppendOnly(previous, next), 'growing JSONL should use append updates');
   assert(!sidebar.isAppendOnly(next, previous), 'shrinking JSONL should force replacement');
 
+  const scoped = [
+    { projectId: '-work-api', projectPath: '/work/api', filePath: '/api' },
+    { projectId: '-work-api-old', projectPath: '/work/api-old', filePath: '/api-old' },
+    { projectId: '-work-web', projectPath: '/work/web/packages/ui', filePath: '/web' },
+    { projectId: '-work-missing', projectPath: '', filePath: '/missing' },
+  ];
+  assert(
+    sidebar.filterWorkspaceDescriptors(scoped, ['/work/api']).map((item) => item.filePath).join() === '/api',
+    'workspace scope should reject similarly prefixed sibling projects'
+  );
+  assert(
+    sidebar.filterWorkspaceDescriptors(
+      [{ projectId: '-work', projectPath: '/work', filePath: '/parent' }],
+      ['/work/api']
+    ).length === 0,
+    'workspace scope should reject broad parent-directory histories'
+  );
+  assert(
+    sidebar.filterWorkspaceDescriptors(scoped, ['/work/web']).map((item) => item.filePath).join() === '/web',
+    'workspace scope should include transcript working directories below the workspace root'
+  );
+  assert(
+    sidebar.filterWorkspaceDescriptors(scoped, ['/work']).length === 3,
+    'workspace scope should include multiple projects inside an opened parent folder'
+  );
+  assert(
+    sidebar.filterWorkspaceDescriptors(scoped, []).length === 0,
+    'workspace scope should be empty when no folder is open'
+  );
+  assert(
+    sidebar.claudeProjectId('/work/missing') === '-work-missing' &&
+      sidebar.filterWorkspaceDescriptors(scoped, ['/work/missing']).at(0)?.filePath === '/missing',
+    'workspace scope should fall back to Claude project IDs when transcript cwd metadata is absent'
+  );
+
   const html = sidebar.transcriptHtml(
     { Uri: { joinPath: (base, ...segments) => [base, ...segments].join('/') } },
     { cspSource: 'vscode-webview:', asWebviewUri: (value) => value },
@@ -175,6 +210,7 @@ function testSidebarHelpers() {
 function testSidebarRegistration() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-subagent-sidebar-'));
   const commands = new Map();
+  const contexts = new Map();
   class EventEmitter {
     constructor() {
       this.listeners = [];
@@ -206,7 +242,10 @@ function testSidebarRegistration() {
       joinPath: (base, ...segments) => [base, ...segments].join('/'),
     },
     commands: {
-      executeCommand() { return Promise.resolve(); },
+      executeCommand(id, key, value) {
+        if (id === 'setContext') contexts.set(key, value);
+        return Promise.resolve();
+      },
       registerCommand(id, handler) {
         commands.set(id, handler);
         return { dispose: () => commands.delete(id) };
@@ -214,7 +253,9 @@ function testSidebarRegistration() {
     },
     workspace: {
       getConfiguration: () => ({ get: () => root }),
+      workspaceFolders: [{ uri: { fsPath: '/tmp/fixture-project' } }],
       onDidChangeConfiguration: () => ({ dispose() {} }),
+      onDidChangeWorkspaceFolders: () => ({ dispose() {} }),
       openTextDocument: () => Promise.resolve({}),
     },
     window: {
@@ -226,10 +267,19 @@ function testSidebarRegistration() {
   const context = { extensionUri: '/extension', subscriptions: [] };
   const registration = sidebar.registerSubagentSidebar(vscode, context);
   assert(registration.provider.root === root, 'sidebar should honor the configured history root');
+  assert(registration.provider.scope === sidebar.SCOPE_WORKSPACE, 'sidebar should default to active-workspace scope');
+  assert(contexts.get(sidebar.SCOPE_CONTEXT_KEY) === sidebar.SCOPE_WORKSPACE, 'workspace scope context should initialize');
   assert(commands.has(sidebar.OPEN_VIEW_COMMAND), 'open-sidebar command should register');
   assert(commands.has(sidebar.OPEN_TRANSCRIPT_COMMAND), 'open-transcript command should register');
   assert(commands.has(sidebar.OPEN_RAW_COMMAND), 'open-raw command should register');
   assert(commands.has(sidebar.REFRESH_COMMAND), 'refresh command should register');
+  assert(commands.has(sidebar.SHOW_ALL_COMMAND), 'show-all-projects command should register');
+  assert(commands.has(sidebar.SHOW_WORKSPACE_COMMAND), 'show-workspace command should register');
+  commands.get(sidebar.SHOW_ALL_COMMAND)();
+  assert(registration.provider.scope === sidebar.SCOPE_ALL, 'show-all command should expose all projects');
+  assert(contexts.get(sidebar.SCOPE_CONTEXT_KEY) === sidebar.SCOPE_ALL, 'show-all context should update');
+  commands.get(sidebar.SHOW_WORKSPACE_COMMAND)();
+  assert(registration.provider.scope === sidebar.SCOPE_WORKSPACE, 'show-workspace command should restore filtering');
   for (const disposable of [...new Set(context.subscriptions)].reverse()) disposable.dispose?.();
 }
 
