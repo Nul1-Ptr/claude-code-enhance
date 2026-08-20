@@ -1,18 +1,14 @@
 # Changelog
 
-## [1.0.7] - 2026-08-19
+## [1.0.5] - 2026-08-19
 
 ### Sub-agent Project Scope
 - Filtered the sub-agent sidebar and transcript picker to the active VS Code workspace by default, including multi-root and nested working-directory histories.
 - Added panel commands to switch explicitly between the active workspace and all Claude projects, with automatic refresh when workspace folders change.
 
-## [1.0.6] - 2026-08-18
-
 ### Sidebar Icon
 - Replaced the unsupported raster-embedded activity icon with a native 24px SVG and assigned an explicit visible stroke color.
 - Bumped the extension version so VS Code loads the corrected icon from a fresh extension resource path instead of a cached `1.0.5` asset.
-
-## [1.0.5] - 2026-08-18
 
 ### Sub-agent Transcripts
 - Added a native activity-bar tree that groups Claude Code child-agent histories by project and parent session, with prompt labels, agent type, status, size, and raw JSONL access.
