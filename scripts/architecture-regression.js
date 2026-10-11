@@ -66,6 +66,21 @@ function testStructuralTransforms() {
   assert(!ambiguous.ok && ambiguous.reason === 'ambiguous-markdown-renderer', 'ambiguous renderers should fail closed');
   assert(ambiguous.body === ambiguousSource, 'ambiguous renderer should leave source untouched');
 
+  const spreadSource = 'function getOpts(p){return{remarkPlugins:[gfm]}}h(M,{...getOpts(p),components:{c}},v);';
+  const spreadResult = transformClaudeBundle(spreadSource, { fullTranscript: false });
+  assert(spreadResult.ok, 'spread Markdown renderer should transform');
+  assert(spreadResult.body.includes('__remarkMath'), 'remark math should be injected for spread target');
+  assert(spreadResult.body.includes('__rehypeKatex'), 'rehype KaTeX should be injected for spread target');
+
+  const spreadWithRehype = 'function getOpts(p){return{remarkPlugins:[gfm]}}h(M,{...getOpts(p),rehypePlugins:k,components:{c}},v);';
+  const spreadRehypeResult = transformClaudeBundle(spreadWithRehype, { fullTranscript: false });
+  assert(spreadRehypeResult.ok, 'spread Markdown renderer with explicit rehypePlugins should transform');
+  assert(/\(k\)\.concat\([^)]*__rehypeKatex/.test(spreadRehypeResult.body), 'explicit rehypePlugins should be extended');
+
+  const ambiguousSpread = `${spreadSource}\nh(M,{...getOpts(p),components:{c}},v);`;
+  const ambiguousSpreadRes = transformClaudeBundle(ambiguousSpread);
+  assert(!ambiguousSpreadRes.ok && ambiguousSpreadRes.reason === 'ambiguous-markdown-renderer', 'ambiguous spread renderers should fail closed');
+
   const disabled = transformClaudeBundle(source, { fullTranscript: false });
   assert(disabled.ok && !disabled.body.includes('claude-code-enhance-full-transcript'), 'disabled full transcript should preserve retention');
   assert(!disabled.diagnostics.retentionApplied, 'disabled full transcript should report no retention transform');

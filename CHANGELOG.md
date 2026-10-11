@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.0.6] - 2026-10-11
+
+### Compatibility
+- Added support for Claude Code 2.1.296+ bundles where ReactMarkdown props pass plugin configurations via spread options (`...fn(links, platform)`) rather than direct `remarkPlugins` object properties.
+- Wrapped spread options safely to inject KaTeX and remark-math plugins while preserving all runtime options (such as Windows link transforms).
+- Added AST discovery and architecture regression tests for spread Markdown renderer targets.
+
 ## [1.0.5] - 2026-08-19
 
 ### Sub-agent Project Scope

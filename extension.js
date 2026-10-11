@@ -29,7 +29,7 @@ const EXTENSION_VERSION = require('./package.json').version;
 const PATCH_VERSION_PREFIX = '/* katex-ext-version: ';
 // Internal patch revision. Changing this forces a refresh even when the
 // package version is unchanged.
-const PATCH_BUILD_ID = 'structural-transactional-incremental-runtime-2026-08-18.3';
+const PATCH_BUILD_ID = 'structural-transactional-incremental-runtime-2026-10-11.1';
 const PATCH_BUILD_PREFIX = '/* enhance-patch-build: ';
 const PATCH_CONFIG_PREFIX = '/* enhance-patch-config: ';
 const FULL_TRANSCRIPT_MARKER = 'claude-code-enhance-full-transcript';
