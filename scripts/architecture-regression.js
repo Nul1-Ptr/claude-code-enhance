@@ -81,6 +81,15 @@ function testStructuralTransforms() {
   const ambiguousSpreadRes = transformClaudeBundle(ambiguousSpread);
   assert(!ambiguousSpreadRes.ok && ambiguousSpreadRes.reason === 'ambiguous-markdown-renderer', 'ambiguous spread renderers should fail closed');
 
+  const multiTargetWithAuxiliary = `
+    function getOpts(p){return{remarkPlugins:[gfm]}}
+    const aux = h(M, { remarkPlugins: [gfm], components: { a: A } }, v);
+    const main = h(M, { ...getOpts(p), components: { a: A, code: C, pre: P } }, v);
+  `;
+  const disambiguated = transformClaudeBundle(multiTargetWithAuxiliary);
+  assert(disambiguated.ok, 'multi-target with conversation renderer should disambiguate');
+  assert(disambiguated.diagnostics.markdownTargets === 1, 'disambiguated target should report 1 Markdown target');
+
   const disabled = transformClaudeBundle(source, { fullTranscript: false });
   assert(disabled.ok && !disabled.body.includes('claude-code-enhance-full-transcript'), 'disabled full transcript should preserve retention');
   assert(!disabled.diagnostics.retentionApplied, 'disabled full transcript should report no retention transform');

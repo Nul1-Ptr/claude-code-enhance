@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.0.7] - 2026-10-15
+
+### Compatibility
+- Added disambiguation for Claude Code 2.1.300+ bundles containing multiple Markdown renderers (such as auxiliary `data-engine-markdown` widgets alongside the primary conversation renderer).
+- Targeted the primary conversation renderer by inspecting Markdown component signatures (`code` and `pre` overrides) while keeping ambiguous synthetic targets protected against false positives.
+- Added multi-target regression tests covering bundles with both auxiliary and conversation Markdown renderers.
+
 ## [1.0.6] - 2026-10-11
 
 ### Compatibility
