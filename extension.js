@@ -4,6 +4,7 @@ const path = require('path');
 const {
   findMarkdownRenderTargets,
   findMessageRetentionTargets,
+  findVirtualTurnTargets,
   parseBundle,
   patchMessageRetentionCap: patchRetentionStructurally,
   transformClaudeBundle,
@@ -29,15 +30,18 @@ const EXTENSION_VERSION = require('./package.json').version;
 const PATCH_VERSION_PREFIX = '/* katex-ext-version: ';
 // Internal patch revision. Changing this forces a refresh even when the
 // package version is unchanged.
-const PATCH_BUILD_ID = 'structural-transactional-incremental-runtime-2026-10-15.1';
+const PATCH_BUILD_ID = 'structural-transactional-incremental-runtime-2026-11-04.10';
 const PATCH_BUILD_PREFIX = '/* enhance-patch-build: ';
 const PATCH_CONFIG_PREFIX = '/* enhance-patch-config: ';
+const PATCH_RUNTIME_STATE_PREFIX = '/* enhance-runtime-state: ';
 const FULL_TRANSCRIPT_MARKER = 'claude-code-enhance-full-transcript';
+const VIRTUAL_TURNS_RUNTIME_MARKER = 'root.__CLAUDE_ENHANCE_VIRTUAL_TURNS__ = api';
 const BACKUP_METADATA_FILE = '.claude-enhance-backup.json';
 const PATCH_SCHEMA_VERSION = 2;
 
 const DEFAULT_RUNTIME_CONFIG = Object.freeze({
   fullTranscript: true,
+  virtualTurns: true,
   contentScale: 1.1,
   mathScale: 1.0,
   toolOutputMath: true,
@@ -59,6 +63,7 @@ function normalizePatchOptions(options = {}) {
   const supplied = options.runtimeConfig || {};
   const runtimeConfig = {
     fullTranscript: options.fullTranscript ?? supplied.fullTranscript ?? DEFAULT_RUNTIME_CONFIG.fullTranscript,
+    virtualTurns: options.virtualTurns ?? supplied.virtualTurns ?? DEFAULT_RUNTIME_CONFIG.virtualTurns,
     contentScale: finiteSetting(supplied.contentScale, DEFAULT_RUNTIME_CONFIG.contentScale, 0.8, 1.5),
     mathScale: finiteSetting(supplied.mathScale, DEFAULT_RUNTIME_CONFIG.mathScale, 0.8, 1.6),
     toolOutputMath: supplied.toolOutputMath ?? DEFAULT_RUNTIME_CONFIG.toolOutputMath,
@@ -78,6 +83,7 @@ function readPatchOptions() {
   return normalizePatchOptions({
     runtimeConfig: {
       fullTranscript: get('fullTranscript'),
+      virtualTurns: get('virtualTurns'),
       contentScale: get('contentScale'),
       mathScale: get('mathScale'),
       toolOutputMath: get('toolOutputMath'),
@@ -90,6 +96,64 @@ function readPatchOptions() {
 
 function patchConfigHash(options = {}) {
   return sha256(JSON.stringify(normalizePatchOptions(options).runtimeConfig)).slice(0, 16);
+}
+
+function runtimeStateFromDiagnostics(options = {}, diagnostics = {}, reason = null) {
+  const normalizedOptions = normalizePatchOptions(options);
+  const requested = normalizedOptions.runtimeConfig;
+  const fullTranscriptRequested = requested.fullTranscript === true;
+  const virtualTurnsRequested = requested.virtualTurns === true;
+  const fullTranscript = fullTranscriptRequested && diagnostics.retentionApplied === true;
+  const virtualTurns = virtualTurnsRequested && diagnostics.virtualTurnsApplied === true;
+  const fullTranscriptFallbackReason = fullTranscriptRequested && !fullTranscript
+    ? diagnostics.fullTranscriptFallbackReason || reason || 'full-transcript-not-applied'
+    : null;
+  return {
+    fullTranscriptRequested,
+    fullTranscript,
+    virtualTurnsRequested,
+    virtualTurns,
+    fullTranscriptFallbackReason,
+  };
+}
+
+function effectiveRuntimeConfig(options = {}, diagnostics = {}, reason = null) {
+  const normalizedOptions = normalizePatchOptions(options);
+  const runtimeState = runtimeStateFromDiagnostics(normalizedOptions, diagnostics, reason);
+  return {
+    ...normalizedOptions.runtimeConfig,
+    fullTranscript: runtimeState.fullTranscript,
+    virtualTurns: runtimeState.virtualTurns,
+    fullTranscriptRequested: runtimeState.fullTranscriptRequested,
+    virtualTurnsRequested: runtimeState.virtualTurnsRequested,
+    fullTranscriptFallbackReason: runtimeState.fullTranscriptFallbackReason,
+  };
+}
+
+const FALLBACK_REASON_LABELS = Object.freeze({
+  'message-retention-not-found': 'retention target not found',
+  'ambiguous-retention-target': 'retention target is ambiguous',
+  'virtual-turns-disabled': 'turn virtualization is disabled',
+  'no-compatible-target': 'turn renderer not found',
+  'ambiguous-turn-renderer': 'turn renderer is ambiguous',
+  'identifier-collision': 'virtualization identifier collision',
+  'overlapping-transform': 'bundle transforms overlap',
+  'transformed-bundle-parse-error': 'transformed bundle failed validation',
+  'full-transcript-not-applied': 'full transcript was not applied',
+});
+
+function fallbackReasonLabel(reason) {
+  if (!reason) return 'unknown reason';
+  return FALLBACK_REASON_LABELS[reason] || String(reason).replace(/-/g, ' ');
+}
+
+function historyStatusLabel(runtimeState) {
+  if (!runtimeState) return 'History Unknown';
+  if (runtimeState.fullTranscript) return 'History Full';
+  if (runtimeState.fullTranscriptRequested) {
+    return `History Native (${fallbackReasonLabel(runtimeState.fullTranscriptFallbackReason)})`;
+  }
+  return 'History Native';
 }
 
 function patchMessageRetentionCap(body) {
@@ -158,6 +222,21 @@ function getPatchedConfigHash(extDir) {
     const rest = js.slice(start + PATCH_CONFIG_PREFIX.length);
     const end = rest.indexOf(' */');
     return end === -1 ? null : rest.slice(0, end).trim();
+  } catch {
+    return null;
+  }
+}
+
+function getPatchedRuntimeState(extDir) {
+  try {
+    const js = fs.readFileSync(path.join(extDir, 'webview', 'index.js'), 'utf8');
+    const start = js.indexOf(PATCH_RUNTIME_STATE_PREFIX);
+    if (start === -1) return null;
+    const rest = js.slice(start + PATCH_RUNTIME_STATE_PREFIX.length);
+    const end = rest.indexOf(' */');
+    if (end === -1) return null;
+    const value = JSON.parse(rest.slice(0, end));
+    return value && typeof value === 'object' ? value : null;
   } catch {
     return null;
   }
@@ -255,14 +334,28 @@ function inspectCompatibility(extDir, options = {}) {
     const normalizedOptions = normalizePatchOptions(options);
     const transformed = transformClaudeBundle(fs.readFileSync(sourcePath, 'utf8'), {
       fullTranscript: normalizedOptions.fullTranscript,
+      virtualTurns: normalizedOptions.runtimeConfig.virtualTurns,
+      requireVirtualTurnsForFullTranscript: true,
       fullTranscriptMarker: FULL_TRANSCRIPT_MARKER,
     });
+    const runtimeState = runtimeStateFromDiagnostics(
+      normalizedOptions,
+      transformed.diagnostics,
+      transformed.ok ? null : transformed.reason
+    );
     return {
       supported: transformed.ok,
       reason: transformed.reason,
       claudeVersion: getClaudeCodeVersion(extDir),
       sourcePath,
       ...transformed.diagnostics,
+      requestedRuntimeConfig: normalizedOptions.runtimeConfig,
+      effectiveRuntimeConfig: effectiveRuntimeConfig(
+        normalizedOptions,
+        transformed.diagnostics,
+        transformed.ok ? null : transformed.reason
+      ),
+      runtimeState,
     };
   } catch (error) {
     return {
@@ -327,13 +420,28 @@ function applyPatch(extDir, vendorDir, options = {}) {
   const normalizedOptions = normalizePatchOptions(options);
   const transformed = transformClaudeBundle(body, {
     fullTranscript: normalizedOptions.fullTranscript,
+    virtualTurns: normalizedOptions.runtimeConfig.virtualTurns,
+    requireVirtualTurnsForFullTranscript: true,
     fullTranscriptMarker: FULL_TRANSCRIPT_MARKER,
   });
+  const runtimeState = runtimeStateFromDiagnostics(
+    normalizedOptions,
+    transformed.diagnostics,
+    transformed.ok ? null : transformed.reason
+  );
+  const runtimeConfig = effectiveRuntimeConfig(
+    normalizedOptions,
+    transformed.diagnostics,
+    transformed.ok ? null : transformed.reason
+  );
   lastPatchDiagnostics = {
     supported: transformed.ok,
     reason: transformed.reason,
     claudeVersion: getClaudeCodeVersion(extDir),
     ...transformed.diagnostics,
+    requestedRuntimeConfig: normalizedOptions.runtimeConfig,
+    effectiveRuntimeConfig: runtimeConfig,
+    runtimeState,
   };
   if (!transformed.ok) return false;
 
@@ -362,16 +470,23 @@ function applyPatch(extDir, vendorDir, options = {}) {
   const highlightCore = fs.readFileSync(path.join(vendorDir, 'highlight.min.js'), 'utf8');
   const v2Bundle = fs.readFileSync(path.join(vendorDir, 'remark-math-bundle.js'), 'utf8');
   const runtimeCore = fs.readFileSync(path.join(vendorDir, 'runtime-core.js'), 'utf8');
+  const virtualTurnsRuntime = transformed.diagnostics.virtualTurnsApplied
+    ? fs.readFileSync(path.join(vendorDir, 'virtual-turns.js'), 'utf8')
+    : '';
   const enhanceCode = fs.readFileSync(path.join(vendorDir, 'enhance.js'), 'utf8');
   const patchedJs =
     `${PATCH_MARKER}\n${PATCH_VERSION_PREFIX}${EXTENSION_VERSION} */\n` +
     `${PATCH_BUILD_PREFIX}${PATCH_BUILD_ID} */\n` +
     `${PATCH_CONFIG_PREFIX}${patchConfigHash(normalizedOptions)} */\n` +
-    `window.__CLAUDE_ENHANCE_CONFIG__=Object.freeze(${JSON.stringify(normalizedOptions.runtimeConfig)});\n` +
+    `${PATCH_RUNTIME_STATE_PREFIX}${JSON.stringify(runtimeState)} */\n` +
+    `window.__CLAUDE_ENHANCE_CONFIG__=Object.freeze(${JSON.stringify(runtimeConfig)});\n` +
     `/* KaTeX Core - MIT License - https://katex.org */\n${katexCore}\n` +
     `/* Highlight.js Core - BSD-3-Clause License - https://highlightjs.org */\n${highlightCore}\n` +
     `/* remark-math + rehype-katex pipeline */\n${v2Bundle}\n` +
     `/* Claude Code Enhance incremental runtime */\n${runtimeCore}\n` +
+    (virtualTurnsRuntime
+      ? `/* Claude Code Enhance turn virtualization */\n${virtualTurnsRuntime}\n`
+      : '') +
     `/* Claude Code output preview enhancer */\n${enhanceCode}\n` +
     `/* === End KaTeX/Enhance Patch — Claude Code bundle follows === */\n` +
     transformed.body;
@@ -388,8 +503,13 @@ function applyPatch(extDir, vendorDir, options = {}) {
     const temporaryJs = fs.readFileSync(temporaryFiles.get(paths.jsPath), 'utf8');
     const temporaryCss = fs.readFileSync(temporaryFiles.get(paths.cssPath), 'utf8');
     if (!temporaryJs.includes(PATCH_MARKER) || !temporaryJs.includes(PATCH_BUILD_ID) ||
+        !temporaryJs.includes(PATCH_RUNTIME_STATE_PREFIX) ||
         !temporaryJs.includes('__remarkMath') || !temporaryJs.includes('__rehypeKatex')) {
       throw new Error('Patched Claude Code JavaScript failed marker verification.');
+    }
+    if (transformed.diagnostics.virtualTurnsApplied &&
+        !temporaryJs.includes(VIRTUAL_TURNS_RUNTIME_MARKER)) {
+      throw new Error('Patched Claude Code JavaScript is missing the turn virtualization runtime.');
     }
     if (!temporaryCss.includes(PATCH_CSS_MARKER)) {
       throw new Error('Patched Claude Code CSS failed marker verification.');
@@ -493,10 +613,12 @@ function ensurePatched(extDir, vendorDir, options = {}) {
 // immediately. A webview reload re-fetches the patched bundle; a full window
 // reload is not required. The notification keeps manual fallbacks for the rare
 // case the auto-reload did not take.
-function reloadWebviewAndNotify(message) {
+function reloadWebviewAndNotify(message, severity = 'information') {
   vscode.commands.executeCommand('workbench.action.webview.reloadWebviewAction');
-  vscode.window
-    .showInformationMessage(message, 'Reload Webview', 'Reload Window')
+  const showMessage = severity === 'warning'
+    ? vscode.window.showWarningMessage.bind(vscode.window)
+    : vscode.window.showInformationMessage.bind(vscode.window);
+  showMessage(message, 'Reload Webview', 'Reload Window')
     .then(function(choice) {
       if (choice === 'Reload Webview') {
         vscode.commands.executeCommand('workbench.action.webview.reloadWebviewAction');
@@ -504,6 +626,22 @@ function reloadWebviewAndNotify(message) {
         vscode.commands.executeCommand('workbench.action.reloadWindow');
       }
     });
+}
+
+function fullTranscriptFallbackMessage(diagnostics = lastPatchDiagnostics) {
+  const runtimeState = diagnostics?.runtimeState;
+  if (!runtimeState?.fullTranscriptRequested || runtimeState.fullTranscript) return '';
+  return 'Full history was not enabled safely (' +
+    `${fallbackReasonLabel(runtimeState.fullTranscriptFallbackReason)}); ` +
+    "Claude Code's native history retention remains active.";
+}
+
+function reloadPatchedWebviewAndNotify(message) {
+  const fallbackMessage = fullTranscriptFallbackMessage();
+  reloadWebviewAndNotify(
+    fallbackMessage ? `${message} ${fallbackMessage}` : message,
+    fallbackMessage ? 'warning' : 'information'
+  );
 }
 
 // Shown when applyPatch reports the react-markdown injection point is gone
@@ -533,6 +671,7 @@ function collectDiagnostics(extDir, options = readPatchOptions()) {
   }
   const paths = patchPaths(extDir);
   const normalizedOptions = normalizePatchOptions(options);
+  const compatibility = inspectCompatibility(extDir, normalizedOptions);
   return {
     extensionVersion: EXTENSION_VERSION,
     buildId: PATCH_BUILD_ID,
@@ -544,11 +683,14 @@ function collectDiagnostics(extDir, options = readPatchOptions()) {
     patchedVersion: getPatchedVersion(extDir),
     patchedBuildId: getPatchedBuildId(extDir),
     patchedConfigHash: getPatchedConfigHash(extDir),
+    patchedRuntimeState: getPatchedRuntimeState(extDir),
     expectedConfigHash: patchConfigHash(normalizedOptions),
     canRestoreOriginals: canRestoreOriginals(extDir),
     backupMetadata: backupMetadata(extDir, paths),
-    compatibility: inspectCompatibility(extDir, normalizedOptions),
-    runtimeConfig: normalizedOptions.runtimeConfig,
+    compatibility,
+    requestedRuntimeConfig: normalizedOptions.runtimeConfig,
+    effectiveRuntimeConfig: compatibility.effectiveRuntimeConfig,
+    runtimeConfig: compatibility.effectiveRuntimeConfig,
     lastPatch: lastPatchDiagnostics,
   };
 }
@@ -569,9 +711,9 @@ function activate(context) {
     try {
       const result = ensurePatched(extDir, vendorDir, readPatchOptions());
       if (result === 'fresh') {
-        reloadWebviewAndNotify('Claude Code Enhance enabled. The webview was reloaded; reload again if any math still looks unrendered.');
+        reloadPatchedWebviewAndNotify('Claude Code Enhance enabled. The webview was reloaded; reload again if any math still looks unrendered.');
       } else if (result === 'refreshed') {
-        reloadWebviewAndNotify('Claude Code Enhance updated. The webview was reloaded; reload again if any math still looks unrendered.');
+        reloadPatchedWebviewAndNotify('Claude Code Enhance updated. The webview was reloaded; reload again if any math still looks unrendered.');
       } else if (result === 'unsupported') {
         notifyUnsupported();
       }
@@ -597,7 +739,7 @@ function activate(context) {
       try {
         const result = ensurePatched(dir, vendorDir, readPatchOptions());
         if (result === 'fresh' || result === 'refreshed') {
-          reloadWebviewAndNotify('Claude Code Enhance enabled. The webview was reloaded; reload again if any math still looks unrendered.');
+          reloadPatchedWebviewAndNotify('Claude Code Enhance enabled. The webview was reloaded; reload again if any math still looks unrendered.');
         } else if (result === 'skipped') {
           vscode.window.showErrorMessage('Claude Code Enhance found an incomplete patch but could not verify its backups. No files were changed.');
         } else if (result === 'unsupported') {
@@ -641,9 +783,12 @@ function activate(context) {
       const diagnostics = collectDiagnostics(dir);
       const compatibility = diagnostics.compatibility?.supported ? 'Compatible' : 'Unsupported';
       const configuration = diagnostics.patchedConfigHash === diagnostics.expectedConfigHash ? 'Current' : 'Stale';
+      const runtimeState = diagnostics.patched
+        ? diagnostics.patchedRuntimeState || diagnostics.compatibility?.runtimeState
+        : diagnostics.compatibility?.runtimeState;
       vscode.window.showInformationMessage(
         `Claude Code Enhance: ${diagnostics.patchState === 'partial' ? 'Incomplete patch' : (diagnostics.patched ? 'Active' : 'Not active')} | ` +
-        `Claude ${diagnostics.claudeVersion} | ${compatibility} | Config ${configuration}`
+        `Claude ${diagnostics.claudeVersion} | ${compatibility} | ${historyStatusLabel(runtimeState)} | Config ${configuration}`
       );
     })
   );
@@ -675,8 +820,11 @@ function activate(context) {
     const dir = findClaudeCodeExtDir();
     const patchState = dir ? getPatchState(dir) : 'unavailable';
     if (patchState === 'patched') {
-      statusBarItem.text = '$(symbol-operator) LaTeX';
-      statusBarItem.tooltip = 'Claude Code Enhance is active. Click for status.';
+      const runtimeState = getPatchedRuntimeState(dir);
+      const historyStatus = historyStatusLabel(runtimeState);
+      const fallback = runtimeState?.fullTranscriptRequested && !runtimeState.fullTranscript;
+      statusBarItem.text = fallback ? '$(warning) LaTeX' : '$(symbol-operator) LaTeX';
+      statusBarItem.tooltip = `Claude Code Enhance is active. ${historyStatus}. Click for status.`;
     } else if (patchState === 'partial') {
       statusBarItem.text = '$(warning) LaTeX';
       statusBarItem.tooltip = 'Claude Code Enhance found an incomplete patch. Click for diagnostics.';
@@ -701,7 +849,7 @@ function activate(context) {
         try {
           const result = ensurePatched(dir, vendorDir, readPatchOptions());
           if (result === 'fresh' || result === 'refreshed') {
-            reloadWebviewAndNotify('Claude Code Enhance re-applied after a Claude Code update. The webview was reloaded; reload again if any math still looks unrendered.');
+            reloadPatchedWebviewAndNotify('Claude Code Enhance re-applied after a Claude Code update. The webview was reloaded; reload again if any math still looks unrendered.');
           } else if (result === 'unsupported') {
             notifyUnsupported();
           }
@@ -722,7 +870,7 @@ function activate(context) {
         try {
           const result = ensurePatched(dir, vendorDir, readPatchOptions());
           if (result === 'fresh' || result === 'refreshed') {
-            reloadWebviewAndNotify('Claude Code Enhance settings updated. The webview was reloaded.');
+            reloadPatchedWebviewAndNotify('Claude Code Enhance settings updated. The webview was reloaded.');
           } else if (result === 'unsupported') {
             notifyUnsupported();
           }
@@ -750,11 +898,13 @@ module.exports._test = {
   getPatchState,
   getPatchedVersion,
   getPatchedBuildId,
+  getPatchedRuntimeState,
   canRestoreOriginals,
   applyPatch,
   removePatch,
   ensurePatched,
   reloadWebviewAndNotify,
+  reloadPatchedWebviewAndNotify,
   notifyUnsupported,
   patchMessageRetentionCap,
   inspectCompatibility,
@@ -765,10 +915,15 @@ module.exports._test = {
   ensureBackupFiles,
   findMarkdownRenderTargets,
   findMessageRetentionTargets,
+  findVirtualTurnTargets,
   parseBundle,
   transformClaudeBundle,
   validateBundleSyntax,
   normalizePatchOptions,
+  runtimeStateFromDiagnostics,
+  effectiveRuntimeConfig,
+  fallbackReasonLabel,
+  historyStatusLabel,
   readPatchOptions,
   patchConfigHash,
   getPatchedConfigHash,
@@ -781,7 +936,9 @@ module.exports._test = {
   PATCH_CSS_MARKER,
   PATCH_VERSION_PREFIX,
   PATCH_BUILD_PREFIX,
+  PATCH_RUNTIME_STATE_PREFIX,
   FULL_TRANSCRIPT_MARKER,
+  VIRTUAL_TURNS_RUNTIME_MARKER,
   BACKUP_METADATA_FILE,
   PATCH_SCHEMA_VERSION,
   ISSUES_URL,

@@ -1,5 +1,37 @@
 # Changelog
 
+## [1.0.8] - 2026-11-04
+
+### Compatibility
+- Validated the structural retention, virtual-turn, and Markdown discovery paths against Claude Code 2.1.318. Its minified identifiers changed again, but the recognized message-retention and turn-renderer structures remain compatible.
+- Added structural discovery for Claude Code 2.1.312+ message-list retention functions that return `{ messages, removedIndices }` instead of slicing an array. The new retention entry point is neutralized once, so its replay and append wrappers inherit the complete message list without version-specific patching.
+- Added structural retention-target selection with explicit `retentionReason` diagnostics and fail-closed handling when multiple candidates are ambiguous.
+- Made full-transcript patching fail closed when Claude's capacity-retention entry point is missing or ambiguous, and added a regression check against the installed Claude bundle.
+- Kept semantic eviction of explicitly superseded or retracted messages separate from capacity retention, avoiding duplicate or withdrawn rows in the main chat.
+- Added requested-versus-effective runtime state, status reporting, and a warning when full history safely falls back to Claude Code's native retention.
+- Added support for Claude Code 2.1.308+ bundles where conversation Markdown components are memoized (`useMemo`) into an identifier (`components: B`) rather than passed as an inline object literal.
+- Enhanced `componentsHasCodeOrPre` to trace identifier declarations and inspect memoized component mappings for `code` and `pre` overrides.
+- Added regression tests for identifier-backed and memoized Markdown component overrides.
+- Resolved minified identifiers and retention constants through lexical scope, preventing unrelated same-named bindings from selecting the wrong Markdown, hook, or retention target.
+
+### Performance
+- Added tail-first turn virtualization for long conversations: complete message data stays available while the main chat mounts only the active window plus the latest turn.
+- Added keyed scroll anchoring and spacer-based pagination so moving the render window does not jump the reader's position or pull them back to the tail.
+- Coupled default full-transcript retention to verified turn virtualization: if the turn renderer cannot be identified safely, only full-transcript retention is skipped while independent rich-rendering patches remain available.
+- Kept streaming updates attached to the live tail even while older history is being browsed, and limited Markdown, KaTeX, highlighting, layout, and enhancement work to mounted turns.
+- Virtual-turn discovery fails closed: ambiguous or changed Claude bundles keep the native message list while the Markdown enhancement still applies.
+- Added a bounded recent-turn runtime fallback so an unexpected virtualizer failure cannot mount an unbounded retained transcript.
+- Scoped copy-button maintenance to the dirty turn instead of rescanning the entire message container on every mutation.
+- Added `content-visibility` containment for off-screen historical turns.
+- Rate-limited syntax highlighting while a code block is still streaming.
+- Cached scroll-container discovery to avoid repeated computed-style walks during enhancement cycles.
+- Reduced enhancement-cycle scroll layout reads and invalidated virtual height estimates after viewport or zoom changes.
+- Added per-turn measurement boundaries so date separators contribute to spacer heights without accidentally counting container headers or engine surfaces.
+- Bounded append-only virtual-height indexing so adding a turn does not reread every historical turn key or retain the source turn array.
+- Recomputed copy controls at the affected turn when the last message is removed, keeping turn-level copy state correct without a full transcript scan.
+- Preserved the sub-agent empty state when an append contains metadata or non-renderable JSONL records but no new messages.
+- Reused the sub-agent panel's owned message array during incremental reads and skipped off-screen message layout, avoiding cumulative host-side array copies while the panel is open.
+
 ## [1.0.7] - 2026-10-15
 
 ### Compatibility

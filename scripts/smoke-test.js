@@ -28,7 +28,27 @@ const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-code-enhance-'));
 const webview = path.join(tmp, 'webview');
 fs.mkdirSync(webview);
 
-const fixtureJs = 'var Nrt=600,Art=500;function jS(e){if(e.length>Nrt){let t=e.length-Art;return e.slice(t)}return e}const gfm=a;createElement(Md,{remarkPlugins:[gfm],components:{}},text);';
+const fixtureJs = `
+var Nrt=600,Art=500;
+function jS(e){if(e.length>Nrt){let t=e.length-Art;return e.slice(t)}return e}
+const gfm=a;
+createElement(Md,{remarkPlugins:[gfm],components:{}},text);
+const hookState=function(initial){return React.useState(initial)};
+const h=React.createElement;
+const m=React.createElement;
+const Fragment=React.Fragment;
+const primaryTurns=[];
+const secondaryTurns=[];
+const usePrimary=false;
+const listRef={current:null};
+function Chat({session:e}){
+  let [opened,setOpened]=hookState(false);
+  return h("div",{ref:listRef,className:"messagesContainer_test",children:[
+    usePrimary
+      ? primaryTurns.map((turn,index)=>{return h(Fragment,{children:[turn.banner,m("div",{className:"turn_test",children:[]})]},turn.key)})
+      : secondaryTurns.map((turn,index)=>{return h(Fragment,{children:[turn.banner,m("div",{className:"turn_test",children:[]})]},turn.key)})
+  ]});
+}`;
 const fixtureCss = '/* css */';
 fs.writeFileSync(path.join(webview, 'index.js'), fixtureJs);
 fs.writeFileSync(path.join(webview, 'index.css'), fixtureCss);
@@ -105,6 +125,20 @@ for (const marker of [
   'ENHANCEMENT_FEATURE_REGISTRY',
   'findProcessingRoot',
   'dirtyRootsProcessed',
+  'copyWork',
+  'scopedTurnScans',
+  'fullContainerScans',
+  'CODE_HIGHLIGHT_MIN_INTERVAL_MS',
+  'addCopyButtonForTurn',
+  'addCopyButtonForMessage',
+  'TURN_SELECTOR',
+  'content-visibility',
+  'contain-intrinsic-size',
+  '_scrollContainerCache',
+  'turn virtualization',
+  '__CLAUDE_ENHANCE_VIRTUAL_TURNS__',
+  'root.__CLAUDE_ENHANCE_VIRTUAL_TURNS__ = api',
+  'data-ce-virtual-spacer',
   'claudeEnhance: diagnosticsSnapshot()',
   'safeRun',
   'CONTENT_BASE_FONT_SCALE',
@@ -114,6 +148,7 @@ for (const marker of [
   'renderMathInTextNode',
   'runEnhancementCycle',
   'characterData: true',
+  'childList-removal',
   'let currentContainer = null',
   'currentContainer && currentContainer.isConnected',
   'observer.disconnect()',
@@ -239,12 +274,6 @@ function findLatestInstalledClaudeCodeFixture() {
 const installedFixture = findLatestInstalledClaudeCodeFixture();
 if (installedFixture) {
   const installedSource = fs.readFileSync(installedFixture.jsPath, 'utf8');
-  let installedHasRetentionCap = false;
-  try {
-    installedHasRetentionCap = extension.findMessageRetentionTargets(
-      extension.parseBundle(installedSource)
-    ).length === 1;
-  } catch {}
   const localTmp = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-code-enhance-installed-'));
   const localWebview = path.join(localTmp, 'webview');
   fs.mkdirSync(localWebview);
@@ -254,14 +283,24 @@ if (installedFixture) {
   if (!extension.applyPatch(localTmp, path.join(__dirname, '..', 'vendor'))) {
     throw new Error('applyPatch returned false for installed Claude Code fixture: ' + installedFixture.name);
   }
+  const installedDiagnostics = extension.getLastPatchDiagnostics();
   const localPatchedJs = fs.readFileSync(path.join(localWebview, 'index.js'), 'utf8');
-  for (const marker of ['structural-transactional-incremental-runtime', 'createIncrementalScheduler', 'NON_PREVIEW_SELECTOR']) {
+  for (const marker of [
+    'structural-transactional-incremental-runtime',
+    'createIncrementalScheduler',
+    'NON_PREVIEW_SELECTOR',
+    'root.__CLAUDE_ENHANCE_VIRTUAL_TURNS__ = api',
+  ]) {
     if (!localPatchedJs.includes(marker)) {
       throw new Error('missing installed Claude Code marker: ' + marker);
     }
   }
-  if (installedHasRetentionCap && !localPatchedJs.includes(extension.FULL_TRANSCRIPT_MARKER)) {
+  if (!installedDiagnostics.retentionApplied || !localPatchedJs.includes(extension.FULL_TRANSCRIPT_MARKER)) {
     throw new Error('missing installed Claude Code full-transcript retention marker');
+  }
+  if (!installedDiagnostics.virtualTurnsApplied ||
+      !localPatchedJs.includes('__claudeEnhanceVirtualRuntime')) {
+    throw new Error('installed Claude Code turn virtualization is missing');
   }
   extension.removePatch(localTmp);
 }

@@ -137,9 +137,9 @@ A status bar item (right-aligned) shows the current state:
 
 | Indicator | Meaning |
 |---|---|
-| `LaTeX` (with operator symbol) | Enhancement patch is active |
+| `LaTeX` (with operator symbol) | Enhancement patch is active and requested full history is verified |
 | `LaTeX (off)` | Patch is not applied |
-| `LaTeX` (with warning symbol) | Only part of the patch is present; open diagnostics |
+| `LaTeX` (with warning symbol) | Patch is incomplete, or full history safely fell back to Claude's native retention |
 | `LaTeX (no CC)` | Claude Code extension is not installed |
 
 Click the status bar item to run the status command, which reports the current patch state in detail.
@@ -156,7 +156,7 @@ Press **Ctrl+Shift+D** inside the Claude Code webview to dump the DOM structure 
 
 ## Version
 
-Current local version: `1.0.5`
+Current local version: `1.0.8`
 
 The package version, internal patch build, and normalized configuration hash are stamped separately. A rebuild can therefore refresh stale injected code or settings without depending on a specific Claude Code version.
 
@@ -172,7 +172,7 @@ From this directory:
 
 ```bash
 npm run package
-code --install-extension claude-code-enhance-1.0.5.vsix --force
+code --install-extension claude-code-enhance-1.0.8.vsix --force
 ```
 
 Reload VS Code after installing. The extension patches Claude Code automatically on startup and reloads the Claude Code webview when it applies or refreshes the patch.
@@ -195,7 +195,8 @@ Open the command palette with `Ctrl+Shift+P`:
 
 | Setting | Default | Purpose |
 |---|---:|---|
-| `claudeCodeEnhance.fullTranscript` | `true` | Keep the full conversation mounted; disable this for Claude Code's built-in retention cap. |
+| `claudeCodeEnhance.fullTranscript` | `true` | Keep the full conversation data instead of applying Claude Code's retention cap. The main chat renders only a virtualized turn window. |
+| `claudeCodeEnhance.virtualTurns` | `true` | Render a tail-first virtual window while keeping the latest turn mounted. Disable `fullTranscript` before disabling this setting. |
 | `claudeCodeEnhance.contentScale` | `1.1` | Scale rendered conversation content (`0.8`-`1.5`). |
 | `claudeCodeEnhance.mathScale` | `1.0` | Additional inline/display math scale (`0.8`-`1.6`). |
 | `claudeCodeEnhance.toolOutputMath` | `true` | Render validated math in prose-oriented tool output while preserving code regions. |
@@ -219,7 +220,17 @@ Before patching, it creates backups:
 - `webview/index.css.katex-bak`
 - `webview/.claude-enhance-backup.json`
 
-The extension discovers the Markdown renderer and transcript-retention function through an Acorn syntax tree rather than a version-specific minified-code string. Discovery fails closed if no unique target exists. JS/CSS updates use verified temporary files, `fsync`, atomic renames, and rollback; backup metadata records Claude's version and SHA-256 hashes.
+The extension discovers the Markdown renderer and transcript-retention function through an Acorn syntax tree rather than a version-specific minified-code string. Both the legacy slice-based retention function and the newer structured message-list retention function are recognized. When `fullTranscript` is enabled, a missing or ambiguous retention target fails closed instead of silently claiming that complete history is active. JS/CSS updates use verified temporary files, `fsync`, atomic renames, and rollback; backup metadata records Claude's version and SHA-256 hashes.
+
+The retention patch disables only Claude Code's capacity-based history trimming. Claude's semantic cleanup of explicitly superseded or retracted messages remains active so the main chat does not reintroduce duplicate or withdrawn rows.
+
+For the installed Claude Code 2.1.314, 2.1.317, and 2.1.318 bundles, the capacity entry points are `BKe`, `tGe`, and `oGe`. Their replay/append wrappers (`zfe`/`Hfe`, `$fe`/`jfe`, and `qfe`/`Kfe`) call those entry points and inherit the patch automatically. Semantic cleanup (`Xhe`/`IKe`, `ope`/`$Ke`, and `spe`/`KKe`) is intentionally left unchanged. Minified names are diagnostic examples only; matching is structural and fails closed when the shape is missing or ambiguous.
+
+Long conversations use a tail-first virtual turn window. Complete message data remains available, but only the active window plus the newest turn are mounted in the main chat. Moving the window preserves a keyed scroll anchor, so reading older history does not jump or pull back to streaming output. When both `fullTranscript` and `virtualTurns` are enabled, a future Claude bundle must match both the retention and turn-list signatures; otherwise only full-transcript retention is skipped and Claude's native retention remains active. Markdown, math, highlighting, and any independently verified virtualization patch still apply.
+
+The status command and diagnostics distinguish requested settings from effective settings. If runtime virtualization unexpectedly fails after a verified patch, the message list falls back to a bounded recent-turn window instead of mounting the complete retained history.
+
+`fullTranscript` controls the Webview's retained message data. It does not force Claude's model backend to resend every historical token; server-side context compaction and summarization remain Claude Code behavior.
 
 The sub-agent sidebar does not patch Claude Code. It runs in this extension's host process and reads the public JSONL history layout, so its project/session/agent view is independent of Claude Code's minified webview bundle.
 
@@ -234,6 +245,10 @@ $$\tilde{F}_{ij} = \sum_k S^{\xi_i}_k \cdot F_{kj}$$
 ```
 
 The bundled `enhance.js` also runs inside the webview to improve output styling, copy behavior, zoom, tables, code blocks, API errors, and fallback math rendering. A shared feature registry processes dirty message roots once per animation frame; conversation-container replacement is the deliberate full-pass fallback.
+
+For long sessions, copy-button maintenance is scoped to changed turns, off-screen historical turns use `content-visibility`, streaming code highlighting is rate-limited, and the scroll container lookup is cached. With `virtualTurns` enabled, Claude's message arrays stay complete while only the active turn window is mounted. If `fullTranscript=true` is combined with `virtualTurns=false`, the extension keeps Claude's native retention cap instead of creating an unbounded full-DOM transcript.
+
+Browser `Ctrl+F` searches only mounted turns. Claude's own message focus/highlight path can reveal an unmounted historical turn, but a separate full-history search index is not included. Claude still performs linear message-key, grouping, and turn-building work before the virtual DOM boundary; those data-layer paths remain unpatched because they are less expensive and materially more version-sensitive than the React/DOM work removed here.
 
 ## Theme Behavior
 

@@ -15,6 +15,10 @@
   };
   const RUNTIME_CONFIG = Object.freeze({
     fullTranscript: suppliedConfig.fullTranscript !== false,
+    virtualTurns: suppliedConfig.virtualTurns !== false,
+    fullTranscriptRequested: suppliedConfig.fullTranscriptRequested ?? suppliedConfig.fullTranscript !== false,
+    virtualTurnsRequested: suppliedConfig.virtualTurnsRequested ?? suppliedConfig.virtualTurns !== false,
+    fullTranscriptFallbackReason: suppliedConfig.fullTranscriptFallbackReason || null,
     contentScale: finiteConfig(suppliedConfig.contentScale, 1.1, 0.8, 1.5),
     mathScale: finiteConfig(suppliedConfig.mathScale, 1.0, 0.8, 1.6),
     toolOutputMath: suppliedConfig.toolOutputMath !== false,
@@ -48,13 +52,21 @@
     },
     warnings: 0,
     math: { candidates: 0, rendered: 0, literal: 0, repaired: 0, domRendered: 0, failed: 0 },
-    codeBlocks: { highlighted: 0, plain: 0 },
+    codeBlocks: { highlighted: 0, plain: 0, deferred: 0 },
+    copyWork: { scopedTurnScans: 0, cachedMessageUpdates: 0, fullContainerScans: 0 },
+    history: {
+      fullTranscriptRequested: RUNTIME_CONFIG.fullTranscriptRequested,
+      fullTranscript: RUNTIME_CONFIG.fullTranscript,
+      fallbackReason: RUNTIME_CONFIG.fullTranscriptFallbackReason,
+    },
+    virtualTurns: { enabled: RUNTIME_CONFIG.virtualTurns, stores: [] },
     apiErrors: 0,
   };
   window.__CLAUDE_ENHANCE_DIAGNOSTICS__ = runtimeDiagnostics;
 
   // Guard flag: while an enhancement cycle runs, the Observer ignores its own DOM changes.
   let _enhancing = false;
+  let _scrollContainerCache = null;
 
   // ===== Utilities =====
 
@@ -97,6 +109,13 @@
   }
 
   function diagnosticsSnapshot() {
+    const virtualRuntime = window.__CLAUDE_ENHANCE_VIRTUAL_TURNS__;
+    runtimeDiagnostics.virtualTurns = {
+      enabled: RUNTIME_CONFIG.virtualTurns && !!virtualRuntime,
+      stores: typeof virtualRuntime?.diagnostics === 'function'
+        ? virtualRuntime.diagnostics()
+        : [],
+    };
     return JSON.parse(JSON.stringify(runtimeDiagnostics));
   }
 
@@ -653,6 +672,15 @@
         border: 1px solid var(--ce-border);
       }
 
+      /* Skip layout/paint for mounted but off-screen turns. */
+      [class*="messagesContainer_"] > [class^="turn_"],
+      [class*="messagesContainer_"] > [class*=" turn_"],
+      [class*="messagesContainer_"] > [class^="turn-"],
+      [class*="messagesContainer_"] > [class*=" turn-"] {
+        content-visibility: auto;
+        contain-intrinsic-size: auto 600px;
+      }
+
       /* API error cards: summarize Claude API failures instead of exposing a
          wall of raw validation payload text in the main transcript flow. */
       .ce-api-error {
@@ -899,8 +927,15 @@
   }
 
   const MESSAGE_CONTAINER_SELECTOR = '[class*="messagesContainer_"]';
+  const TURN_SELECTOR = [
+    '[class^="turn_"]',
+    '[class*=" turn_"]',
+    '[class^="turn-"]',
+    '[class*=" turn-"]',
+  ].join(',');
+  const TIMELINE_MESSAGE_SELECTOR = '[class*="timelineMessage_"]';
   const MESSAGE_PROCESSING_SELECTOR = [
-    '[class*="timelineMessage_"]',
+    TIMELINE_MESSAGE_SELECTOR,
     '[class*="messageContent_"]',
     '[class*="assistantMessage_"]',
     '.rendered-markdown',
@@ -927,6 +962,15 @@
     )));
   }
 
+  function narrowDirtyRoots(roots) {
+    const unique = Array.from(new Set(roots));
+    const withoutBroadContainers = unique.filter((root) => (
+      !matchesSafe(root, MESSAGE_CONTAINER_SELECTOR) ||
+      !unique.some((candidate) => candidate !== root && root.contains?.(candidate))
+    ));
+    return topLevelRoots(withoutBroadContainers);
+  }
+
   function getEnhanceRoots(scope = document) {
     const roots = candidateRoots(scope, ENHANCE_ROOT_SELECTOR)
       .filter((el) => !closestSafe(el, NON_PREVIEW_SELECTOR) && !isInsideDialog(el));
@@ -950,8 +994,11 @@
   function findProcessingRoot(node, container) {
     const element = node?.nodeType === Node.TEXT_NODE ? node.parentElement : node;
     if (!element || element.nodeType !== Node.ELEMENT_NODE) return null;
+    if (matchesSafe(element, '[data-ce-virtual-spacer], [data-ce-turn-start]')) return null;
     const messageRoot = closestSafe(element, MESSAGE_PROCESSING_SELECTOR);
     if (messageRoot && (!container || container.contains(messageRoot))) return messageRoot;
+    const turnRoot = closestSafe(element, TURN_SELECTOR);
+    if (turnRoot && (!container || container.contains(turnRoot))) return turnRoot;
     const messageContainer = closestSafe(element, MESSAGE_CONTAINER_SELECTOR);
     return messageContainer && (!container || messageContainer === container) ? messageContainer : null;
   }
@@ -969,6 +1016,7 @@
           if (RUNTIME_CONFIG.copyButtons) addCodeBlockCopyButton(block);
           if (result === 'highlighted') runtimeDiagnostics.codeBlocks.highlighted++;
           if (result === 'plain') runtimeDiagnostics.codeBlocks.plain++;
+          if (result === 'deferred') runtimeDiagnostics.codeBlocks.deferred++;
         });
       });
     });
@@ -1007,6 +1055,22 @@
     return `${text.length}:${text.slice(0, 80)}:${text.slice(-80)}`;
   }
 
+  const CODE_HIGHLIGHT_MIN_INTERVAL_MS = 120;
+  const codeHighlightStates = new WeakMap();
+
+  function scheduleDeferredCodeHighlight(block) {
+    const state = codeHighlightStates.get(block);
+    if (!state || state.timer) return;
+
+    const elapsed = Date.now() - state.lastHighlightAt;
+    const delay = Math.max(0, CODE_HIGHLIGHT_MIN_INTERVAL_MS - elapsed);
+    state.timer = setTimeout(() => {
+      state.timer = null;
+      if (block.isConnected === false) return;
+      safeRun('deferred highlightCodeBlock', () => highlightCodeBlock(block));
+    }, delay);
+  }
+
   function markCodeBlockPlain(block, text, language) {
     block.textContent = text;
     block.classList.add('hljs');
@@ -1028,6 +1092,27 @@
 
     const fingerprint = getCodeFingerprint(text);
     if (block.dataset.ceHighlighted === fingerprint) return 'unchanged';
+
+    const state = codeHighlightStates.get(block) || {
+      lastHighlightAt: 0,
+      lastLength: 0,
+      timer: null,
+    };
+    const now = Date.now();
+    if (state.lastHighlightAt &&
+        text.length >= state.lastLength &&
+        now - state.lastHighlightAt < CODE_HIGHLIGHT_MIN_INTERVAL_MS) {
+      codeHighlightStates.set(block, state);
+      scheduleDeferredCodeHighlight(block);
+      return 'deferred';
+    }
+    if (state.timer) {
+      clearTimeout(state.timer);
+      state.timer = null;
+    }
+    state.lastHighlightAt = now;
+    state.lastLength = text.length;
+    codeHighlightStates.set(block, state);
 
     const language = getCodeLanguage(block) || 'markdown';
     if (!language || !hljs.getLanguage(language)) {
@@ -2994,6 +3079,7 @@
   // ===== Conversation copy =====
 
   const _turnMessagesMap = new WeakMap();
+  const _copyTurnState = new WeakMap();
 
   const EXCLUDE_PREFIXES = [
     'thinking_',
@@ -3195,6 +3281,73 @@
     return turns;
   }
 
+  function addCopyButtonForTurn(turn, changedMessage = null) {
+    if (!turn) return;
+    const cached = _copyTurnState.get(turn);
+    if (cached && changedMessage) {
+      if (cached.messages.includes(changedMessage) && changedMessage !== cached.lastMessage) return;
+      if (changedMessage === cached.lastMessage && cached.lastMessage?.isConnected !== false) {
+        runtimeDiagnostics.copyWork.cachedMessageUpdates++;
+        _turnMessagesMap.set(cached.lastMessage, cached.messages);
+        if (querySelectorAllSafe(cached.lastMessage, '.claude-copy-btn').length === 1) return;
+        safeRun('addCopyButton', () => addCopyButton(cached.lastMessage));
+        return;
+      }
+    }
+
+    const messages = querySelectorAllSafe(turn, TIMELINE_MESSAGE_SELECTOR)
+      .filter((message) => closestSafe(message, TURN_SELECTOR) === turn);
+    if (!messages.length) {
+      _copyTurnState.delete(turn);
+      return;
+    }
+
+    const lastMessage = messages[messages.length - 1];
+    const buttons = querySelectorAllSafe(turn, '.claude-copy-btn');
+    _copyTurnState.set(turn, { messages, lastMessage });
+    _turnMessagesMap.set(lastMessage, messages);
+    if (buttons.length === 1 && buttons[0].parentElement === lastMessage) return;
+    buttons.forEach((button) => button.remove());
+
+    safeRun('addCopyButton', () => addCopyButton(lastMessage));
+  }
+
+  function addCopyButtonForMessage(message) {
+    if (!message) return;
+    const turn = closestSafe(message, TURN_SELECTOR);
+    if (turn) {
+      addCopyButtonForTurn(turn, message);
+      return;
+    }
+    const container = closestSafe(message, MESSAGE_CONTAINER_SELECTOR);
+    if (!container) return;
+    const children = Array.from(container.children || []);
+    const directIndex = children.findIndex((child) => child === message || child.contains?.(message));
+    if (directIndex === -1) return;
+    let first = children[directIndex];
+    while (first.previousElementSibling &&
+           !toClassName(first.previousElementSibling.className).includes('userMessage')) {
+      first = first.previousElementSibling;
+    }
+    const messages = [];
+    let last = first;
+    while (last && last !== container) {
+      if (toClassName(last.className).includes('timelineMessage')) messages.push(last);
+      const next = last.nextElementSibling;
+      if (!next || toClassName(next.className).includes('userMessage')) break;
+      last = next;
+    }
+    if (!messages.length) return;
+
+    const lastMessage = messages[messages.length - 1];
+    if (message !== lastMessage) return;
+    const buttons = messages.flatMap((item) => querySelectorAllSafe(item, '.claude-copy-btn'));
+    _turnMessagesMap.set(lastMessage, messages);
+    if (buttons.length === 1 && buttons[0].parentElement === lastMessage) return;
+    buttons.forEach((button) => button.remove());
+    safeRun('addCopyButton', () => addCopyButton(lastMessage));
+  }
+
   function addCopyButton(messageEl) {
     if (!RUNTIME_CONFIG.copyButtons) return;
     if (!messageEl || messageEl.nodeType !== 1 || shouldSkipPreviewEnhancement(messageEl)) return;
@@ -3245,7 +3398,64 @@
 
   function scanAndAddCopyButtons(scopes) {
     if (!RUNTIME_CONFIG.copyButtons) return;
-    copyContainersForScopes(scopes).forEach((container) => {
+
+    if (!scopes) {
+      runtimeDiagnostics.copyWork.fullContainerScans++;
+      copyContainersForScopes(null).forEach((container) => {
+        const turns = querySelectorAllSafe(container, TURN_SELECTOR);
+        if (turns.length) {
+          turns.forEach((turn) => safeRun('addCopyButtonForTurn', () => addCopyButtonForTurn(turn)));
+          return;
+        }
+        groupMessagesByTurn(container).forEach(turnMessages => {
+          if (turnMessages.length === 0) return;
+          const lastMessage = turnMessages[turnMessages.length - 1];
+          _turnMessagesMap.set(lastMessage, turnMessages);
+          safeRun('addCopyButton', () => addCopyButton(lastMessage));
+        });
+      });
+      return;
+    }
+
+    const turns = new Set();
+    const messages = new Set();
+    const fallbackContainers = new Set();
+    for (const scope of Array.isArray(scopes) ? scopes : [scopes]) {
+      const message = closestSafe(scope, TIMELINE_MESSAGE_SELECTOR) ||
+        (matchesSafe(scope, TIMELINE_MESSAGE_SELECTOR) ? scope : null);
+      if (message) {
+        messages.add(message);
+        continue;
+      }
+      const enclosingTurn = closestSafe(scope, TURN_SELECTOR);
+      if (enclosingTurn) {
+        turns.add(enclosingTurn);
+        continue;
+      }
+      const nestedTurns = querySelectorAllSafe(scope, TURN_SELECTOR);
+      if (nestedTurns.length) {
+        nestedTurns.forEach((turn) => turns.add(turn));
+        continue;
+      }
+      if (matchesSafe(scope, MESSAGE_CONTAINER_SELECTOR)) {
+        fallbackContainers.add(scope);
+        continue;
+      }
+      const nestedMessages = querySelectorAllSafe(scope, TIMELINE_MESSAGE_SELECTOR);
+      if (nestedMessages.length) {
+        nestedMessages.forEach((nestedMessage) => messages.add(nestedMessage));
+        continue;
+      }
+      const container = closestSafe(scope, MESSAGE_CONTAINER_SELECTOR);
+      if (container) fallbackContainers.add(container);
+    }
+
+    runtimeDiagnostics.copyWork.scopedTurnScans += turns.size;
+    turns.forEach((turn) => safeRun('addCopyButtonForTurn', () => addCopyButtonForTurn(turn)));
+    messages.forEach((message) => safeRun('addCopyButtonForMessage', () => addCopyButtonForMessage(message)));
+
+    fallbackContainers.forEach((container) => {
+      runtimeDiagnostics.copyWork.fullContainerScans++;
       groupMessagesByTurn(container).forEach(turnMessages => {
         if (turnMessages.length === 0) return;
         const lastMessage = turnMessages[turnMessages.length - 1];
@@ -3266,8 +3476,15 @@
     safeRun('write zoom', () => localStorage.setItem('claude-zoom', zoom.toString()));
   }
 
+  function invalidateVirtualTurnMeasurements() {
+    safeRun('invalidate virtual turn measurements', () => {
+      window.__CLAUDE_ENHANCE_VIRTUAL_TURNS__?.invalidateMeasurements?.();
+    });
+  }
+
   function setupZoom() {
     let zoom = getStoredZoom();
+    invalidateVirtualTurnMeasurements();
     applyContentZoom(zoom);
 
     document.addEventListener('wheel', (e) => {
@@ -3275,6 +3492,7 @@
         e.preventDefault();
         const delta = e.deltaY > 0 ? -0.1 : 0.1;
         zoom = Math.max(0.5, Math.min(2.0, zoom + delta));
+        invalidateVirtualTurnMeasurements();
         applyContentZoom(zoom);
         setStoredZoom(zoom);
         showZoomIndicator(zoom);
@@ -3363,17 +3581,32 @@
 
     function enqueueMutation(mutation, currentContainer) {
       if (isSelfMutation(mutation)) return false;
+      if (mutation.type === 'childList' && !(mutation.addedNodes?.length > 0)) {
+        const deletionRoot = findProcessingRoot(mutation.target, currentContainer);
+        if (!deletionRoot || matchesSafe(deletionRoot, MESSAGE_CONTAINER_SELECTOR)) return false;
+        enhancementScheduler.enqueue(deletionRoot, ['copy'], { reason: 'childList-removal' });
+        return true;
+      }
       const roots = new Set();
-      const targetRoot = findProcessingRoot(mutation.target, currentContainer);
-      if (targetRoot) roots.add(targetRoot);
       for (const node of mutation.addedNodes || []) {
         const root = findProcessingRoot(node, currentContainer);
         if (root) roots.add(root);
       }
+      const targetRoot = findProcessingRoot(mutation.target, currentContainer);
+      const targetIsAncestor = targetRoot && Array.from(roots).some((root) => (
+        root === targetRoot || targetRoot.contains(root)
+      ));
+      if (targetRoot && !targetIsAncestor) roots.add(targetRoot);
+      for (const root of Array.from(roots)) {
+        if (!matchesSafe(root, MESSAGE_CONTAINER_SELECTOR)) continue;
+        if (Array.from(roots).some((candidate) => candidate !== root && root.contains(candidate))) {
+          roots.delete(root);
+        }
+      }
       if (!roots.size) return false;
 
       const features = mutation.type === 'characterData'
-        ? ['apiErrors', 'math', 'zoom']
+        ? ['apiErrors', 'code', 'math', 'zoom']
         : ['apiErrors', 'code', 'math', 'copy', 'zoom'];
       roots.forEach((root) => enhancementScheduler.enqueue(root, features, {
         reason: mutation.type,
@@ -3429,6 +3662,7 @@
     function attachToContainer(container) {
       observer.disconnect();
       currentContainer = container;
+      _scrollContainerCache = null;
       observer.observe(container, { childList: true, subtree: true, characterData: true });
       console.log('[Claude Enhance] Observer attached to messagesContainer');
       enhancementScheduler.enqueue(null, undefined, {
@@ -3618,9 +3852,12 @@
 
   // ===== Enhancement cycle and init =====
 
-  function scrollToBottomIfNeeded() {
+  function getScrollContainer() {
+    if (_scrollContainerCache && _scrollContainerCache.isConnected !== false) {
+      return _scrollContainerCache;
+    }
 
-    const msgContainer = document.querySelector('[class*="messagesContainer_"]');
+    const msgContainer = document.querySelector(MESSAGE_CONTAINER_SELECTOR);
     let container = msgContainer;
     while (container && container !== document.body) {
       const style = window.getComputedStyle(container);
@@ -3630,15 +3867,27 @@
     if (!container || container === document.body) {
       container = document.scrollingElement || document.documentElement;
     }
-    if (!container) return;
+    _scrollContainerCache = container || null;
+    return _scrollContainerCache;
+  }
 
+  function captureBottomFollow() {
+    const container = getScrollContainer();
+    if (!container) return null;
     const threshold = 150;
-    const atBottom = container.scrollHeight - container.scrollTop - container.clientHeight < threshold;
-    if (atBottom) {
-      requestAnimationFrame(() => {
-        container.scrollTop = container.scrollHeight;
-      });
-    }
+    return {
+      container,
+      atBottom: container.scrollHeight - container.scrollTop - container.clientHeight < threshold,
+    };
+  }
+
+  function restoreBottomFollow(snapshot) {
+    if (!snapshot?.atBottom || snapshot.container.isConnected === false) return;
+    requestAnimationFrame(() => {
+      if (snapshot.container.isConnected !== false) {
+        snapshot.container.scrollTop = snapshot.container.scrollHeight;
+      }
+    });
   }
 
   const ENHANCEMENT_FEATURE_REGISTRY = Object.freeze([
@@ -3683,7 +3932,7 @@
     const fullPass = options.fullPass !== false && !options.roots;
     const roots = fullPass
       ? getEnhanceRoots()
-      : topLevelRoots((options.roots || []).filter((root) => root?.isConnected !== false));
+      : narrowDirtyRoots((options.roots || []).filter((root) => root?.isConnected !== false));
     const requested = new Set(
       window.__CLAUDE_ENHANCE_RUNTIME_CORE__?.normalizeFeatures(options.features) ||
       ENHANCEMENT_FEATURE_REGISTRY.map((feature) => feature.id)
@@ -3696,11 +3945,11 @@
 
     _enhancing = true;
     try {
-      scrollToBottomIfNeeded();
+      const bottomFollow = captureBottomFollow();
       ENHANCEMENT_FEATURE_REGISTRY.forEach((feature) => {
         if (requested.has(feature.id)) runEnhancementFeature(feature, roots);
       });
-      scrollToBottomIfNeeded();
+      restoreBottomFollow(bottomFollow);
     } finally {
       _enhancing = false;
     }
@@ -3758,6 +4007,8 @@
       renderLatexHtml,
       displayDollarRole,
       isInsideMathExcludedRegion,
+      scanAndAddCopyButtons,
+      narrowDirtyRoots,
       CODE_SURFACE_SELECTOR,
       diagnosticsSnapshot,
       enhancementFeatureIds: ENHANCEMENT_FEATURE_REGISTRY.map((feature) => feature.id),

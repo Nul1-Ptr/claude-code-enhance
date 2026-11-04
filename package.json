@@ -2,7 +2,7 @@
   "name": "claude-code-enhance",
   "displayName": "Claude Code Enhance",
   "description": "Improves Claude Code rich rendering and exposes complete sub-agent transcripts in VS Code.",
-  "version": "1.0.7",
+  "version": "1.0.8",
   "publisher": "AlexisHe",
   "license": "MIT",
   "repository": {
@@ -132,7 +132,12 @@
         "claudeCodeEnhance.fullTranscript": {
           "type": "boolean",
           "default": true,
-          "description": "Keep the full Claude conversation mounted instead of applying Claude Code's built-in retention cap. This can use substantial memory in very long sessions."
+          "description": "Keep the full Claude conversation data instead of applying Claude Code's built-in retention cap. With virtualTurns enabled, patching fails closed unless both retention and virtual turn targets are verified."
+        },
+        "claudeCodeEnhance.virtualTurns": {
+          "type": "boolean",
+          "default": true,
+          "description": "Render a tail-first virtual window of conversation turns while keeping the latest turn mounted. When disabled, fullTranscript safely falls back to Claude Code's native retention cap."
         },
         "claudeCodeEnhance.contentScale": {
           "type": "number",

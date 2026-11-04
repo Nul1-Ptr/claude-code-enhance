@@ -20,6 +20,23 @@ function createEnhanceTestApi() {
     },
     katex,
     Node: { ELEMENT_NODE: 1, TEXT_NODE: 3 },
+    document: {
+      createElement(tagName) {
+        return {
+          nodeType: 1,
+          tagName: String(tagName || '').toUpperCase(),
+          className: '',
+          textContent: '',
+          title: '',
+          parentElement: null,
+          classList: { add() {}, remove() {} },
+          addEventListener() {},
+          remove() {
+            this.parentElement?.removeChild?.(this);
+          },
+        };
+      },
+    },
     window: {
       __CLAUDE_ENHANCE_TEST_MODE__: true,
       __remarkMath() {
@@ -145,6 +162,71 @@ function fakeClosestElement(ancestorClassNames) {
   };
 }
 
+function fakeCopyTurn(id, messageCount = 1) {
+  const messages = Array.from({ length: messageCount }, (_, index) => {
+    const children = [];
+    return {
+      nodeType: 1,
+      parentElement: null,
+      className: `timelineMessage_${id}_${index}`,
+      isConnected: true,
+      querySelectorAll(selector) {
+        return String(selector).includes('.claude-copy-btn')
+          ? children.filter((child) => child.className === 'claude-copy-btn')
+          : [];
+      },
+      appendChild(child) {
+        child.parentElement = this;
+        children.push(child);
+      },
+      removeChild(child) {
+        const childIndex = children.indexOf(child);
+        if (childIndex >= 0) children.splice(childIndex, 1);
+        child.parentElement = null;
+      },
+      contains(node) { return node === this || children.includes(node); },
+      closest(selector) {
+        if (String(selector).includes('turn_') || String(selector).includes('turn-')) return this.parentElement;
+        if (String(selector).includes('messagesContainer_')) return this.parentElement?.parentElement;
+        if (String(selector).includes('timelineMessage_')) return this;
+        return null;
+      },
+      matches(selector) {
+        return String(selector).includes('timelineMessage_');
+      },
+    };
+  });
+  const turn = {
+    nodeType: 1,
+    parentElement: null,
+    className: `turn_${id}`,
+    querySelectorAll(selector) {
+      if (String(selector).includes('timelineMessage_')) return messages;
+      if (String(selector).includes('.claude-copy-btn')) {
+        return messages.flatMap((message) => message.querySelectorAll(selector));
+      }
+      return [];
+    },
+    closest(selector) {
+      if (String(selector).includes('turn_') || String(selector).includes('turn-')) return this;
+      if (String(selector).includes('messagesContainer_')) return this.parentElement;
+      return null;
+    },
+    matches(selector) {
+      return String(selector).includes('turn_') || String(selector).includes('turn-');
+    },
+    contains(node) { return node === this || messages.some((message) => message.contains(node)); },
+    removeMessage(message) {
+      const index = messages.indexOf(message);
+      if (index >= 0) messages.splice(index, 1);
+      message.parentElement = null;
+      message.isConnected = false;
+    },
+  };
+  messages.forEach((message) => { message.parentElement = turn; });
+  return turn;
+}
+
 function collectTextContent(content) {
   if (typeof content === 'string') return [content];
   if (!Array.isArray(content)) return [];
@@ -242,6 +324,56 @@ const embeddedVllmApiErrors = [
 
 const api = createEnhanceTestApi();
 const remarkApi = createRemarkBundleTestApi();
+
+const copyTurnA = fakeCopyTurn('a');
+const copyTurnB = fakeCopyTurn('b');
+const copyContainer = {
+  nodeType: 1,
+  parentElement: null,
+  className: 'messagesContainer_test',
+  querySelectorAll(selector) {
+    if (String(selector).includes('turn_') || String(selector).includes('turn-')) {
+      return [copyTurnA, copyTurnB];
+    }
+    return [];
+  },
+  closest(selector) {
+    return String(selector).includes('messagesContainer_') ? this : null;
+  },
+  matches(selector) {
+    return String(selector).includes('messagesContainer_');
+  },
+  contains(node) { return node === this || node === copyTurnA || node === copyTurnB; },
+};
+copyTurnA.parentElement = copyContainer;
+copyTurnB.parentElement = copyContainer;
+const copyBefore = api.diagnosticsSnapshot().copyWork.scopedTurnScans;
+api.scanAndAddCopyButtons([copyContainer]);
+const copyAfter = api.diagnosticsSnapshot().copyWork.scopedTurnScans;
+assert(copyAfter - copyBefore === 2,
+  'container-scoped copy maintenance should process every mounted turn');
+const cachedCopyBefore = api.diagnosticsSnapshot().copyWork.cachedMessageUpdates;
+api.scanAndAddCopyButtons([copyTurnA.querySelectorAll('[class*="timelineMessage_"]')[0]]);
+const cachedCopyAfter = api.diagnosticsSnapshot().copyWork.cachedMessageUpdates;
+assert(cachedCopyAfter - cachedCopyBefore === 1,
+  'streaming updates should reuse the current turn copy grouping');
+const narrowedRoots = api.narrowDirtyRoots([copyContainer, copyTurnA, copyTurnB]);
+assert(narrowedRoots.length === 2 && narrowedRoots.includes(copyTurnA) && narrowedRoots.includes(copyTurnB),
+  'incremental enhancement should prefer specific turns over the whole message container');
+
+const deletionTurn = fakeCopyTurn('deletion', 2);
+deletionTurn.parentElement = copyContainer;
+api.scanAndAddCopyButtons([deletionTurn]);
+const deletionMessages = deletionTurn.querySelectorAll('[class*="timelineMessage_"]');
+assert(deletionMessages[1].querySelectorAll('.claude-copy-btn').length === 1,
+  'the copy control should initially attach to the last message in a turn');
+const fullScansBeforeDeletion = api.diagnosticsSnapshot().copyWork.fullContainerScans;
+deletionTurn.removeMessage(deletionMessages[1]);
+api.scanAndAddCopyButtons([deletionTurn]);
+assert(deletionMessages[0].querySelectorAll('.claude-copy-btn').length === 1,
+  'removing the last message should move the copy control to the new last message');
+assert(api.diagnosticsSnapshot().copyWork.fullContainerScans === fullScansBeforeDeletion,
+  'last-message removal should stay scoped to the affected turn');
 
 const remarkData = {};
 const integratedRemarkTransformer = remarkApi.remarkMath.call({

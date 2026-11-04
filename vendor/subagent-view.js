@@ -263,6 +263,7 @@
       messages: [],
       filter: persistedFilter,
       query: typeof persistedState.query === 'string' ? persistedState.query : '',
+      shownMessages: 0,
     };
     let restoreScrollY = Number.isFinite(persistedState.scrollY) ? persistedState.scrollY : null;
     searchInput.value = state.query;
@@ -564,21 +565,25 @@
       return `${(value / (1024 * 1024)).toFixed(1)} MB`;
     }
 
-    function applyFilters() {
+    function applyFilters(articles = null) {
       const query = state.query.toLocaleLowerCase();
-      let shown = 0;
-      for (const article of transcriptRoot.querySelectorAll('.message')) {
+      const incremental = Array.isArray(articles);
+      let shown = incremental ? state.shownMessages : 0;
+      const candidates = articles || transcriptRoot.querySelectorAll('.message');
+      for (const article of candidates) {
         const filterMatch = state.filter === 'all' || article.dataset.facets.split(' ').includes(state.filter);
         const searchMatch = !query || article.textContent.toLocaleLowerCase().includes(query);
         article.hidden = !(filterMatch && searchMatch);
         if (!article.hidden) shown++;
       }
+      state.shownMessages = Math.max(0, shown);
       statusRoot.textContent = query || state.filter !== 'all' ? `${shown} messages shown` : '';
     }
 
     function replaceTranscript(transcript) {
       state.transcript = transcript;
       state.messages = transcript.messages || [];
+      state.shownMessages = 0;
       transcriptRoot.replaceChildren();
       const fragment = document.createDocumentFragment();
       for (const message of state.messages) fragment.appendChild(renderMessage(message));
@@ -602,6 +607,7 @@
     function appendTranscript(metadata, messages) {
       const nearBottom = document.documentElement.scrollHeight -
         (windowObject.scrollY + windowObject.innerHeight) < 180;
+      if (messages.length) transcriptRoot.querySelector('.empty-state')?.remove();
       state.messages.push(...messages);
       state.transcript = {
         ...state.transcript,
@@ -610,10 +616,15 @@
         messages: state.messages,
       };
       const fragment = document.createDocumentFragment();
-      for (const message of messages) fragment.appendChild(renderMessage(message));
+      const articles = [];
+      for (const message of messages) {
+        const article = renderMessage(message);
+        articles.push(article);
+        fragment.appendChild(article);
+      }
       transcriptRoot.appendChild(fragment);
       renderSummary();
-      applyFilters();
+      applyFilters(articles);
       if (nearBottom) windowObject.requestAnimationFrame(() => windowObject.scrollTo(0, document.body.scrollHeight));
     }
 

@@ -106,6 +106,7 @@ function testFixtureParsing() {
   assert(completedPartial.append, 'completing a partial JSONL record should use an incremental read');
   assert(!completedPartial.transcript.partialLine, 'completed partial JSONL should no longer be pending');
   assert(completedPartial.transcript.messages.length === 5, 'non-message JSONL records should not add messages');
+  const immutableMessages = completedPartial.transcript.messages;
 
   fs.appendFileSync(filePath, jsonLine({
     type: 'assistant',
@@ -116,13 +117,27 @@ function testFixtureParsing() {
   assert(appended.append && appended.appendedMessages.length === 1, 'new JSONL messages should be returned as a delta');
   assert(appended.transcript.messages.length === 6, 'incremental reads should preserve prior messages');
   assert(appended.appendedMessages[0].line === appended.transcript.lines, 'incremental line numbers should remain absolute');
+  assert(appended.transcript.messages !== immutableMessages && immutableMessages.length === 5,
+    'default incremental reads should preserve immutable transcript snapshots');
+
+  fs.appendFileSync(filePath, jsonLine({
+    type: 'assistant',
+    uuid: 'a5',
+    message: { role: 'assistant', stop_reason: 'end_turn', content: 'Owned incremental answer.' },
+  }));
+  const ownedMessages = appended.transcript.messages;
+  const reused = updateSubagentTranscript(appended.transcript, descriptor, { reuseMessages: true });
+  assert(reused.append && reused.transcript.messages === ownedMessages,
+    'panel-owned incremental reads should reuse their message array');
+  assert(reused.transcript.messages.length === 7 && reused.appendedMessages.length === 1,
+    'panel-owned incremental reads should append only the parsed delta');
 
   fs.writeFileSync(filePath, jsonLine({
     type: 'assistant',
     uuid: 'replacement',
     message: { role: 'assistant', content: 'Replacement transcript.' },
   }));
-  const replaced = updateSubagentTranscript(appended.transcript, descriptor);
+  const replaced = updateSubagentTranscript(reused.transcript, descriptor);
   assert(!replaced.append, 'truncated or replaced JSONL should fall back to a full read');
   assert(replaced.transcript.messages.length === 1, 'fallback reads should discard stale messages');
 
