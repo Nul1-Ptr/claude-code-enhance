@@ -10,6 +10,7 @@
 
   const PIPE_SENTINEL = '\uE000';
   const MAX_FORMULA_LENGTH = 100000;
+  const MAX_HIGHLIGHT_LENGTH = 500 * 1024;
   const LANGUAGE_ALIASES = Object.freeze({
     bash: 'bash',
     c: 'c',
@@ -242,6 +243,130 @@
     return looksLikeMath(candidate.formula, candidate.display) ? candidate : null;
   }
 
+  const VIRTUAL_WINDOW_MESSAGES = 60;
+  const VIRTUAL_WINDOW_OVERSCAN = 12;
+  const VIRTUAL_MAX_MESSAGES = 100;
+  const VIRTUAL_ESTIMATED_MESSAGE_HEIGHT = 240;
+  const VIRTUAL_HEIGHT_BLOCK_SIZE = 128;
+
+  function messageFacets(message) {
+    return [
+      message?.role === 'assistant' ? 'assistant' : '',
+      message?.blocks?.some((block) => block.kind === 'thinking') ? 'thinking' : '',
+      message?.blocks?.some((block) => ['tool', 'tool-result'].includes(block.kind)) ? 'tools' : '',
+      message?.error || message?.blocks?.some((block) => block.isError || block.kind === 'api-error')
+        ? 'errors'
+        : '',
+    ].filter(Boolean);
+  }
+
+  function messageSearchText(message) {
+    const values = [
+      message?.role,
+      message?.agentType,
+      message?.model,
+      message?.error,
+      message?.stopReason,
+      message?.timestamp,
+      ...(message?.blocks || []).flatMap((block) => [block.kind, block.name, block.text]),
+    ];
+    return values.filter(Boolean).join('\n').toLocaleLowerCase();
+  }
+
+  function createMessageRecord(message, sourceIndex) {
+    const facets = messageFacets(message);
+    return {
+      message,
+      sourceIndex,
+      key: `${message?.id ?? 'message'}:${message?.line ?? sourceIndex}:${sourceIndex}`,
+      facets,
+      facetSet: new Set(facets),
+      searchText: null,
+    };
+  }
+
+  function recordSearchText(record) {
+    if (record.searchText === null) record.searchText = messageSearchText(record.message);
+    return record.searchText;
+  }
+
+  function recordMatches(record, filter, query) {
+    const filterMatch = filter === 'all' || record.facetSet.has(filter);
+    return filterMatch && (!query || recordSearchText(record).includes(query));
+  }
+
+  function createHeightIndex(records, heightCache, estimate = VIRTUAL_ESTIMATED_MESSAGE_HEIGHT) {
+    const values = records.map((record) => heightCache.get(record.key) || estimate);
+    const blocks = [];
+
+    function rebuildBlock(blockIndex) {
+      const start = blockIndex * VIRTUAL_HEIGHT_BLOCK_SIZE;
+      const end = Math.min(values.length, start + VIRTUAL_HEIGHT_BLOCK_SIZE);
+      let total = 0;
+      for (let index = start; index < end; index++) total += values[index];
+      blocks[blockIndex] = total;
+    }
+
+    function rebuildBlocks() {
+      blocks.length = Math.ceil(values.length / VIRTUAL_HEIGHT_BLOCK_SIZE);
+      for (let blockIndex = 0; blockIndex < blocks.length; blockIndex++) rebuildBlock(blockIndex);
+    }
+
+    function sum(start, end) {
+      const safeStart = Math.max(0, Math.min(values.length, Number(start) || 0));
+      const safeEnd = Math.max(safeStart, Math.min(values.length, Number(end) || 0));
+      let cursor = safeStart;
+      let total = 0;
+      while (cursor < safeEnd && cursor % VIRTUAL_HEIGHT_BLOCK_SIZE) total += values[cursor++];
+      while (cursor + VIRTUAL_HEIGHT_BLOCK_SIZE <= safeEnd) {
+        total += blocks[Math.floor(cursor / VIRTUAL_HEIGHT_BLOCK_SIZE)] || 0;
+        cursor += VIRTUAL_HEIGHT_BLOCK_SIZE;
+      }
+      while (cursor < safeEnd) total += values[cursor++];
+      return total;
+    }
+
+    function update(index, height) {
+      const safeHeight = Number(height);
+      if (!Number.isFinite(safeHeight) || safeHeight <= 0 || index < 0 || index >= values.length) {
+        return false;
+      }
+      if (Math.abs(values[index] - safeHeight) < 0.5) return false;
+      values[index] = safeHeight;
+      rebuildBlock(Math.floor(index / VIRTUAL_HEIGHT_BLOCK_SIZE));
+      return true;
+    }
+
+    function append(record) {
+      values.push(heightCache.get(record.key) || estimate);
+      rebuildBlock(Math.floor((values.length - 1) / VIRTUAL_HEIGHT_BLOCK_SIZE));
+    }
+
+    function indexAt(offset) {
+      if (!values.length) return 0;
+      let remaining = Math.max(0, Number(offset) || 0);
+      let blockIndex = 0;
+      while (blockIndex < blocks.length && remaining >= blocks[blockIndex]) {
+        remaining -= blocks[blockIndex];
+        blockIndex++;
+      }
+      let index = blockIndex * VIRTUAL_HEIGHT_BLOCK_SIZE;
+      const limit = Math.min(values.length, index + VIRTUAL_HEIGHT_BLOCK_SIZE);
+      while (index < limit && remaining >= values[index]) remaining -= values[index++];
+      return Math.max(0, Math.min(values.length - 1, index));
+    }
+
+    rebuildBlocks();
+    return Object.freeze({
+      get length() { return values.length; },
+      append,
+      indexAt,
+      sum,
+      update,
+      values,
+    });
+  }
+
   function start(windowObject) {
     const document = windowObject.document;
     const vscode = typeof windowObject.acquireVsCodeApi === 'function'
@@ -261,10 +386,28 @@
     const state = {
       transcript: null,
       messages: [],
+      records: [],
+      filteredRecords: [],
       filter: persistedFilter,
       query: typeof persistedState.query === 'string' ? persistedState.query : '',
       shownMessages: 0,
+      heightCache: new Map(),
+      heightIndex: null,
+      renderStart: -1,
+      renderEnd: -1,
+      renderScheduled: false,
+      measureScheduled: false,
+      followingTail: false,
+      tailRequested: false,
+      mountedArticles: new Map(),
+      pendingAnchor: null,
+      restoringScroll: false,
+      filtering: false,
+      filterGeneration: 0,
+      loadingReplacement: false,
+      pendingScrollRestore: null,
     };
+    state.heightIndex = createHeightIndex([], state.heightCache);
     let restoreScrollY = Number.isFinite(persistedState.scrollY) ? persistedState.scrollY : null;
     searchInput.value = state.query;
     for (const button of filterButtons) {
@@ -273,7 +416,12 @@
 
     function persistUiState() {
       if (typeof vscode.setState !== 'function') return;
-      vscode.setState({ filter: state.filter, query: state.query, scrollY: windowObject.scrollY });
+      vscode.setState({
+        filter: state.filter,
+        query: state.query,
+        scrollY: windowObject.scrollY,
+        filePath: state.transcript?.filePath || null,
+      });
     }
 
     const allowedTags = new Set([
@@ -370,7 +518,7 @@
         const className = Array.from(code.classList).find((name) => name.startsWith('language-'));
         const requested = className ? className.slice('language-'.length).toLowerCase() : '';
         const language = LANGUAGE_ALIASES[requested] || requested;
-        if (language && windowObject.hljs?.getLanguage?.(language)) {
+        if (raw.length <= MAX_HIGHLIGHT_LENGTH && language && windowObject.hljs?.getLanguage?.(language)) {
           try {
             code.innerHTML = windowObject.hljs.highlight(raw, {
               language,
@@ -380,6 +528,8 @@
           } catch {
             code.textContent = raw;
           }
+        } else if (raw.length > MAX_HIGHLIGHT_LENGTH) {
+          code.dataset.highlightSkipped = 'oversized';
         }
         const pre = code.parentElement;
         if (!pre || pre.parentElement?.classList.contains('code-shell')) continue;
@@ -393,7 +543,7 @@
         copy.textContent = 'Copy';
         copy.addEventListener('click', async () => {
           try {
-            await windowObject.navigator.clipboard.writeText(raw);
+            await windowObject.navigator.clipboard.writeText(code.textContent || '');
             copy.textContent = 'Copied';
           } catch {
             copy.textContent = 'Failed';
@@ -515,12 +665,7 @@
       article.className = `message message-${message.role || 'event'}`;
       article.dataset.messageId = message.id;
       article.dataset.role = message.role || 'event';
-      article.dataset.facets = [
-        message.role === 'assistant' ? 'assistant' : '',
-        message.blocks.some((block) => block.kind === 'thinking') ? 'thinking' : '',
-        message.blocks.some((block) => ['tool', 'tool-result'].includes(block.kind)) ? 'tools' : '',
-        message.error || message.blocks.some((block) => block.isError || block.kind === 'api-error') ? 'errors' : '',
-      ].filter(Boolean).join(' ');
+      article.dataset.facets = messageFacets(message).join(' ');
       if (article.dataset.facets.includes('errors')) article.classList.add('message-error');
 
       const header = document.createElement('header');
@@ -533,6 +678,238 @@
       article.appendChild(header);
       for (const block of message.blocks) article.appendChild(blockElement(block));
       return article;
+    }
+
+    const resizeObserver = typeof windowObject.ResizeObserver === 'function'
+      ? new windowObject.ResizeObserver(() => scheduleMeasureRenderedMessages())
+      : null;
+
+    function createVirtualSpacer(edge, height) {
+      const spacer = document.createElement('div');
+      spacer.className = 'virtual-spacer';
+      spacer.dataset.virtualSpacer = edge;
+      spacer.setAttribute('aria-hidden', 'true');
+      spacer.style.height = `${Math.max(0, Math.round(height))}px`;
+      return spacer;
+    }
+
+    function visibleRange() {
+      const total = state.filteredRecords.length;
+      if (!total) return { start: 0, end: 0 };
+      if (state.followingTail) {
+        return { start: Math.max(0, total - VIRTUAL_WINDOW_MESSAGES), end: total };
+      }
+      const scrollTop = Math.max(0, Number(windowObject.scrollY) || 0);
+      const viewportHeight = Math.max(1, Number(windowObject.innerHeight) || 800);
+      const summaryOffset = transcriptRoot.offsetTop || 0;
+      const relativeTop = Math.max(0, scrollTop - summaryOffset);
+      const first = state.heightIndex.indexAt(relativeTop);
+      const last = state.heightIndex.indexAt(relativeTop + viewportHeight);
+      let start = Math.max(0, first - VIRTUAL_WINDOW_OVERSCAN);
+      let end = Math.min(total, Math.max(first + 1, last + VIRTUAL_WINDOW_OVERSCAN + 1));
+      if (end - start < VIRTUAL_WINDOW_MESSAGES) {
+        const missing = VIRTUAL_WINDOW_MESSAGES - (end - start);
+        start = Math.max(0, start - Math.ceil(missing / 2));
+        end = Math.min(total, Math.max(end, start + VIRTUAL_WINDOW_MESSAGES));
+        start = Math.max(0, Math.min(start, end - VIRTUAL_WINDOW_MESSAGES));
+      }
+      if (end - start > VIRTUAL_MAX_MESSAGES) {
+        start = Math.max(0, Math.min(first - VIRTUAL_WINDOW_OVERSCAN, total - VIRTUAL_MAX_MESSAGES));
+        end = Math.min(total, start + VIRTUAL_MAX_MESSAGES);
+      }
+      return {
+        start,
+        end,
+      };
+    }
+
+    function scheduleMeasureRenderedMessages() {
+      if (state.measureScheduled) return;
+      state.measureScheduled = true;
+      windowObject.requestAnimationFrame(() => {
+        state.measureScheduled = false;
+        measureRenderedMessages();
+      });
+    }
+
+    function captureVirtualAnchor() {
+      if (state.followingTail) return null;
+      for (const article of transcriptRoot.querySelectorAll('.message[data-message-key]')) {
+        const rect = article.getBoundingClientRect?.();
+        if (!rect || rect.bottom <= 0 || rect.top >= windowObject.innerHeight) continue;
+        return { key: article.dataset.messageKey, offset: rect.top };
+      }
+      return null;
+    }
+
+    function restoreVirtualAnchor() {
+      const anchor = state.pendingAnchor;
+      state.pendingAnchor = null;
+      if (!anchor || state.followingTail) return;
+      const article = state.mountedArticles.get(anchor.key);
+      const rect = article?.getBoundingClientRect?.();
+      if (!rect) return;
+      const delta = rect.top - anchor.offset;
+      if (Math.abs(delta) >= 0.5) windowObject.scrollTo(0, windowObject.scrollY + delta);
+    }
+
+    function measureRenderedMessages() {
+      let changed = false;
+      let heightDeltaAboveViewport = 0;
+      const articles = transcriptRoot.querySelectorAll('.message[data-virtual-index]');
+      for (const article of articles) {
+        const index = Number(article.dataset.virtualIndex);
+        const record = state.filteredRecords[index];
+        if (!record) continue;
+        const rect = article.getBoundingClientRect?.();
+        const height = rect?.height || article.offsetHeight || 0;
+        const previousHeight = state.heightIndex.values[index];
+        if (!state.heightIndex.update(index, height)) continue;
+        state.heightCache.set(record.key, height);
+        const previousBottom = rect ? rect.top + previousHeight : Infinity;
+        if (!state.followingTail && previousBottom <= 0) {
+          heightDeltaAboveViewport += height - previousHeight;
+        }
+        changed = true;
+      }
+      if (changed) {
+        if (Math.abs(heightDeltaAboveViewport) >= 0.5) {
+          windowObject.scrollTo(0, Math.max(0, windowObject.scrollY + heightDeltaAboveViewport));
+        }
+        state.pendingAnchor = captureVirtualAnchor();
+        scheduleVirtualRender(true);
+      }
+    }
+
+    function scheduleVirtualRender(force = false) {
+      if (force) state.renderStart = -1;
+      if (state.renderScheduled) return;
+      state.renderScheduled = true;
+      windowObject.requestAnimationFrame(() => {
+        state.renderScheduled = false;
+        renderVirtualWindow();
+      });
+    }
+
+    function renderVirtualWindow() {
+      const range = visibleRange();
+      if (range.start === state.renderStart && range.end === state.renderEnd) return;
+      state.renderStart = range.start;
+      state.renderEnd = range.end;
+      resizeObserver?.disconnect?.();
+      const previousArticles = state.mountedArticles;
+      const nextArticles = new Map();
+      transcriptRoot.replaceChildren();
+
+      if (!state.filteredRecords.length) {
+        state.mountedArticles = nextArticles;
+        const empty = document.createElement('div');
+        empty.className = 'empty-state';
+        empty.textContent = state.messages.length
+          ? 'No messages match the current search and filter.'
+          : 'No renderable messages in this transcript.';
+        transcriptRoot.appendChild(empty);
+        return;
+      }
+
+      const fragment = document.createDocumentFragment();
+      const topHeight = state.heightIndex.sum(0, range.start);
+      if (topHeight > 0) fragment.appendChild(createVirtualSpacer('top', topHeight));
+      for (let index = range.start; index < range.end; index++) {
+        const record = state.filteredRecords[index];
+        const article = previousArticles.get(record.key) || renderMessage(record.message);
+        article.dataset.virtualIndex = String(index);
+        article.dataset.messageKey = record.key;
+        nextArticles.set(record.key, article);
+        fragment.appendChild(article);
+      }
+      const bottomHeight = state.heightIndex.sum(range.end, state.filteredRecords.length);
+      if (bottomHeight > 0) fragment.appendChild(createVirtualSpacer('bottom', bottomHeight));
+      transcriptRoot.appendChild(fragment);
+      state.mountedArticles = nextArticles;
+      for (const article of transcriptRoot.querySelectorAll('.message[data-virtual-index]')) {
+        resizeObserver?.observe?.(article);
+      }
+      scheduleMeasureRenderedMessages();
+      if (state.followingTail) {
+        windowObject.requestAnimationFrame(() => windowObject.scrollTo(0, document.body.scrollHeight));
+      } else if (state.pendingAnchor) {
+        windowObject.requestAnimationFrame(() => restoreVirtualAnchor());
+      }
+    }
+
+    function runWhenIdle(callback) {
+      if (typeof windowObject.requestIdleCallback === 'function') {
+        return windowObject.requestIdleCallback(callback, { timeout: 50 });
+      }
+      return windowObject.setTimeout(() => callback({
+        didTimeout: true,
+        timeRemaining: () => 8,
+      }), 0);
+    }
+
+    function rebuildFilteredRecords(options = {}) {
+      const generation = ++state.filterGeneration;
+      const query = state.query.toLocaleLowerCase();
+      const filtered = [];
+      let index = 0;
+      state.filtering = true;
+      statusRoot.textContent = 'Searching transcript...';
+      if (options.resetScroll) {
+        state.pendingAnchor = null;
+        state.pendingScrollRestore = null;
+        state.restoringScroll = false;
+        windowObject.scrollTo(0, transcriptRoot.offsetTop || 0);
+      }
+      const processSlice = (deadline) => {
+        if (generation !== state.filterGeneration) return;
+        let processed = 0;
+        while (index < state.records.length &&
+            (processed < 400 || deadline.timeRemaining() > 2)) {
+          const record = state.records[index++];
+          if (!query) record.searchText = null;
+          if (recordMatches(record, state.filter, query)) filtered.push(record);
+          processed++;
+        }
+        if (index < state.records.length) {
+          runWhenIdle(processSlice);
+          return;
+        }
+        state.filtering = false;
+        state.filteredRecords = filtered;
+        state.shownMessages = filtered.length;
+        state.heightIndex = createHeightIndex(filtered, state.heightCache);
+        state.renderStart = -1;
+        state.renderEnd = -1;
+        statusRoot.textContent = query || state.filter !== 'all'
+          ? `${state.shownMessages} messages shown`
+          : (state.loadingReplacement ? 'Loading transcript...' : '');
+        scheduleVirtualRender(true);
+        if (state.pendingScrollRestore) {
+          const restore = state.pendingScrollRestore;
+          state.pendingScrollRestore = null;
+          windowObject.requestAnimationFrame(() => {
+            if (restore.mode === 'anchor') {
+              const anchorIndex = state.filteredRecords.findIndex((record) => record.key === restore.key);
+              if (anchorIndex >= 0) {
+                const target = (transcriptRoot.offsetTop || 0) +
+                  state.heightIndex.sum(0, anchorIndex) - restore.offset;
+                state.pendingAnchor = { key: restore.key, offset: restore.offset };
+                windowObject.scrollTo(0, Math.max(0, target));
+              } else {
+                windowObject.scrollTo(0, restore.value);
+              }
+            } else {
+              windowObject.scrollTo(0, restore.mode === 'top' ? 0 : restore.value);
+            }
+            scheduleVirtualRender(true);
+            windowObject.requestAnimationFrame(() => {
+              windowObject.requestAnimationFrame(() => { state.restoringScroll = false; });
+            });
+          });
+        }
+      };
+      runWhenIdle(processSlice);
     }
 
     function renderSummary() {
@@ -553,7 +930,7 @@
       const malformed = transcript.malformedLines ? ` | ${transcript.malformedLines} malformed` : '';
       const partial = transcript.partialLine ? ' | receiving data' : '';
       metadata.textContent = `${descriptor.agentType || descriptor.agentId || 'sub-agent'} | ` +
-        `${transcript.messages?.length ?? state.messages.length} messages | ${transcript.lines} JSONL lines | ` +
+        `${state.messages.length} messages | ${transcript.lines || 0} JSONL lines | ` +
         `${formatBytes(transcript.bytes)} | ${descriptor.status || 'idle'}${malformed}${partial}`;
       summaryRoot.append(heading, metadata);
     }
@@ -565,67 +942,99 @@
       return `${(value / (1024 * 1024)).toFixed(1)} MB`;
     }
 
-    function applyFilters(articles = null) {
-      const query = state.query.toLocaleLowerCase();
-      const incremental = Array.isArray(articles);
-      let shown = incremental ? state.shownMessages : 0;
-      const candidates = articles || transcriptRoot.querySelectorAll('.message');
-      for (const article of candidates) {
-        const filterMatch = state.filter === 'all' || article.dataset.facets.split(' ').includes(state.filter);
-        const searchMatch = !query || article.textContent.toLocaleLowerCase().includes(query);
-        article.hidden = !(filterMatch && searchMatch);
-        if (!article.hidden) shown++;
-      }
-      state.shownMessages = Math.max(0, shown);
-      statusRoot.textContent = query || state.filter !== 'all' ? `${shown} messages shown` : '';
-    }
-
-    function replaceTranscript(transcript) {
+    function startTranscriptReplacement(transcript) {
+      const previousFilePath = state.transcript?.filePath || persistedState.filePath || null;
+      const changedTranscript = !!previousFilePath && previousFilePath !== transcript.filePath;
+      const currentScrollY = Math.max(0, Number(windowObject.scrollY) || 0);
+      const currentAnchor = changedTranscript ? null : captureVirtualAnchor();
       state.transcript = transcript;
-      state.messages = transcript.messages || [];
-      state.shownMessages = 0;
-      transcriptRoot.replaceChildren();
-      const fragment = document.createDocumentFragment();
-      for (const message of state.messages) fragment.appendChild(renderMessage(message));
-      transcriptRoot.appendChild(fragment);
-      transcriptRoot.setAttribute('aria-busy', 'false');
-      if (!state.messages.length) {
-        const empty = document.createElement('div');
-        empty.className = 'empty-state';
-        empty.textContent = 'No renderable messages in this transcript.';
-        transcriptRoot.appendChild(empty);
-      }
+      state.messages = [];
+      if (changedTranscript) state.heightCache.clear();
+      state.records = [];
+      state.filteredRecords = [];
+      state.heightIndex = createHeightIndex([], state.heightCache);
+      state.mountedArticles.clear();
+      state.followingTail = false;
+      state.tailRequested = false;
+      state.restoringScroll = true;
+      state.loadingReplacement = true;
+      state.filterGeneration++;
+      state.filtering = false;
+      state.renderStart = -1;
+      state.renderEnd = -1;
+      state.pendingScrollRestore = changedTranscript
+        ? { mode: 'top' }
+        : (currentAnchor ? {
+            mode: 'anchor',
+            key: currentAnchor.key,
+            offset: currentAnchor.offset,
+            value: restoreScrollY !== null ? restoreScrollY : currentScrollY,
+          } : {
+            mode: 'position',
+            value: restoreScrollY !== null ? restoreScrollY : currentScrollY,
+          });
+      restoreScrollY = null;
+      transcriptRoot.setAttribute('aria-busy', 'true');
       renderSummary();
-      applyFilters();
-      if (restoreScrollY !== null) {
-        const scrollY = restoreScrollY;
-        restoreScrollY = null;
-        windowObject.requestAnimationFrame(() => windowObject.scrollTo(0, scrollY));
-      }
+      statusRoot.textContent = 'Loading transcript...';
+      scheduleVirtualRender(true);
     }
 
-    function appendTranscript(metadata, messages) {
+    function appendMessageBatch(messages, options = {}) {
+      if (!messages.length) return;
       const nearBottom = document.documentElement.scrollHeight -
         (windowObject.scrollY + windowObject.innerHeight) < 180;
-      if (messages.length) transcriptRoot.querySelector('.empty-state')?.remove();
+      const startIndex = state.messages.length;
       state.messages.push(...messages);
+      const appendedRecords = messages.map((message, index) => (
+        createMessageRecord(message, startIndex + index)
+      ));
+      state.records.push(...appendedRecords);
+      const query = state.query.toLocaleLowerCase();
+      if (!state.filtering) {
+        for (const record of appendedRecords) {
+          if (!recordMatches(record, state.filter, query)) continue;
+          state.filteredRecords.push(record);
+          state.heightIndex.append(record);
+        }
+      }
+      state.shownMessages = state.filteredRecords.length;
+      statusRoot.textContent = state.loadingReplacement
+        ? `Loading transcript... ${state.messages.length} messages`
+        : (query || state.filter !== 'all'
+        ? `${state.shownMessages} messages shown`
+        : '');
+      state.followingTail = options.followTail !== false && nearBottom;
+      renderSummary();
+      scheduleVirtualRender(true);
+    }
+
+    function completeTranscriptReplacement(transcript) {
+      state.transcript = {
+        ...state.transcript,
+        ...transcript,
+        descriptor: { ...state.transcript?.descriptor, ...transcript.descriptor },
+      };
+      state.loadingReplacement = false;
+      transcriptRoot.setAttribute('aria-busy', 'false');
+      renderSummary();
+      rebuildFilteredRecords();
+    }
+
+    function appendTranscriptMetadata(metadata) {
       state.transcript = {
         ...state.transcript,
         ...metadata,
         descriptor: { ...state.transcript?.descriptor, ...metadata.descriptor },
-        messages: state.messages,
       };
-      const fragment = document.createDocumentFragment();
-      const articles = [];
-      for (const message of messages) {
-        const article = renderMessage(message);
-        articles.push(article);
-        fragment.appendChild(article);
-      }
-      transcriptRoot.appendChild(fragment);
+      transcriptRoot.setAttribute('aria-busy', 'false');
       renderSummary();
-      applyFilters(articles);
-      if (nearBottom) windowObject.requestAnimationFrame(() => windowObject.scrollTo(0, document.body.scrollHeight));
+    }
+
+    function replaceTranscript(transcript) {
+      startTranscriptReplacement(transcript);
+      appendMessageBatch(transcript.messages || [], { followTail: false });
+      completeTranscriptReplacement(transcript);
     }
 
     let searchTimer = null;
@@ -634,7 +1043,9 @@
       searchTimer = windowObject.setTimeout(() => {
         state.query = searchInput.value.trim();
         persistUiState();
-        applyFilters();
+        state.followingTail = false;
+        state.tailRequested = false;
+        rebuildFilteredRecords({ resetScroll: true });
       }, 100);
     });
     for (const button of filterButtons) {
@@ -644,26 +1055,59 @@
           candidate.setAttribute('aria-pressed', String(candidate === button));
         }
         persistUiState();
-        applyFilters();
+        state.followingTail = false;
+        state.tailRequested = false;
+        rebuildFilteredRecords({ resetScroll: true });
       });
     }
-    latestButton.addEventListener('click', () => windowObject.scrollTo({
-      top: document.body.scrollHeight,
-      behavior: 'smooth',
-    }));
+    latestButton.addEventListener('click', () => {
+      state.followingTail = true;
+      state.tailRequested = true;
+      scheduleVirtualRender(true);
+      windowObject.requestAnimationFrame(() => windowObject.scrollTo({
+        top: document.body.scrollHeight,
+        behavior: 'smooth',
+      }));
+    });
     let scrollTimer = null;
     windowObject.addEventListener('scroll', () => {
+      if (state.restoringScroll) {
+        scheduleVirtualRender();
+        return;
+      }
+      const bottomDistance = document.documentElement.scrollHeight -
+        (windowObject.scrollY + windowObject.innerHeight);
+      if (state.tailRequested) {
+        state.followingTail = true;
+        if (bottomDistance < 180) state.tailRequested = false;
+      } else {
+        state.followingTail = bottomDistance < 180;
+      }
+      scheduleVirtualRender();
       windowObject.clearTimeout(scrollTimer);
       scrollTimer = windowObject.setTimeout(persistUiState, 150);
     }, { passive: true });
+    windowObject.addEventListener('resize', () => scheduleVirtualRender(true), { passive: true });
 
     windowObject.addEventListener('message', (event) => {
       const message = event.data;
-      if (message?.type === 'replace') {
+      if (message?.type === 'replaceStart') {
+        startTranscriptReplacement(message.transcript || {});
+      } else if (message?.type === 'replaceChunk') {
+        appendMessageBatch(message.messages || [], { followTail: false });
+      } else if (message?.type === 'replaceComplete') {
+        completeTranscriptReplacement(message.transcript || {});
+      } else if (message?.type === 'appendStart') {
+        appendTranscriptMetadata(message.transcript || {});
+      } else if (message?.type === 'appendComplete') {
+        appendTranscriptMetadata(message.transcript || {});
+      } else if (message?.type === 'replace') {
         replaceTranscript(message.transcript);
       } else if (message?.type === 'append') {
-        appendTranscript(message.transcript || {}, message.messages || []);
+        appendMessageBatch(message.messages || []);
+        if (message.transcript) appendTranscriptMetadata(message.transcript);
       } else if (message?.type === 'error') {
+        state.restoringScroll = false;
         transcriptRoot.setAttribute('aria-busy', 'false');
         const error = document.createElement('div');
         error.className = 'api-error error-block';
@@ -684,8 +1128,20 @@
     formulaSignals,
     guardMathPipes,
     looksLikeMath,
+    messageFacets,
+    messageSearchText,
     parseMarkdown,
+    createHeightIndex,
+    createMessageRecord,
+    recordSearchText,
+    recordMatches,
     start,
     wholeMathCandidate,
+    VIRTUAL_ESTIMATED_MESSAGE_HEIGHT,
+    VIRTUAL_HEIGHT_BLOCK_SIZE,
+    VIRTUAL_WINDOW_MESSAGES,
+    VIRTUAL_WINDOW_OVERSCAN,
+    VIRTUAL_MAX_MESSAGES,
+    MAX_HIGHLIGHT_LENGTH,
   });
 });

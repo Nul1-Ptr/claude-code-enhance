@@ -15,6 +15,7 @@ const {
   readJsonFile,
   sha256,
   transactionalWriteFilesSync,
+  withFileLockSync,
 } = require('./lib/file-transaction');
 const { registerSubagentSidebar } = require('./lib/subagent-sidebar');
 
@@ -30,13 +31,15 @@ const EXTENSION_VERSION = require('./package.json').version;
 const PATCH_VERSION_PREFIX = '/* katex-ext-version: ';
 // Internal patch revision. Changing this forces a refresh even when the
 // package version is unchanged.
-const PATCH_BUILD_ID = 'structural-transactional-incremental-runtime-2026-11-04.10';
+const PATCH_BUILD_ID = 'structural-transactional-incremental-runtime-2026-11-04.15';
 const PATCH_BUILD_PREFIX = '/* enhance-patch-build: ';
 const PATCH_CONFIG_PREFIX = '/* enhance-patch-config: ';
 const PATCH_RUNTIME_STATE_PREFIX = '/* enhance-runtime-state: ';
 const FULL_TRANSCRIPT_MARKER = 'claude-code-enhance-full-transcript';
 const VIRTUAL_TURNS_RUNTIME_MARKER = 'root.__CLAUDE_ENHANCE_VIRTUAL_TURNS__ = api';
 const BACKUP_METADATA_FILE = '.claude-enhance-backup.json';
+const PATCH_LOCK_FILE = '.claude-enhance.lock';
+const PATCH_FONTS_DIRECTORY = 'claude-enhance-fonts';
 const PATCH_SCHEMA_VERSION = 2;
 
 const DEFAULT_RUNTIME_CONFIG = Object.freeze({
@@ -51,7 +54,7 @@ const DEFAULT_RUNTIME_CONFIG = Object.freeze({
 });
 
 // Where users report a Claude Code build the patch no longer fits.
-const ISSUES_URL = 'https://github.com/MahammadNuriyev62/claude-code-enhance/issues';
+const ISSUES_URL = 'https://github.com/Nul1-Ptr/claude-code-enhance/issues';
 
 function finiteSetting(value, fallback, minimum, maximum) {
   const parsed = Number(value);
@@ -259,7 +262,13 @@ function patchPaths(extDir) {
     jsBackup: path.join(webviewDir, 'index.js.katex-bak'),
     cssBackup: path.join(webviewDir, 'index.css.katex-bak'),
     metadataPath: path.join(webviewDir, BACKUP_METADATA_FILE),
+    lockPath: path.join(webviewDir, PATCH_LOCK_FILE),
+    fontsDir: path.join(webviewDir, PATCH_FONTS_DIRECTORY),
   };
+}
+
+function withPatchLock(extDir, callback) {
+  return withFileLockSync(patchPaths(extDir).lockPath, callback);
 }
 
 function backupMetadata(extDir, paths = patchPaths(extDir)) {
@@ -285,14 +294,15 @@ function ensureBackupFiles(extDir, originalJs, originalCss) {
     throw new Error('Claude Code backup metadata does not match the backup files.');
   }
 
-  const versionChanged = existing && existing.claudeVersion !== 'unknown' && currentVersion !== 'unknown' &&
-    existing.claudeVersion !== currentVersion;
   if (!existing && hasBothBackups &&
       (sha256(backupJs) !== sha256(originalJsBuffer) || sha256(backupCss) !== sha256(originalCssBuffer))) {
     throw new Error('Legacy Claude Code backups do not match the current pristine webview files.');
   }
 
-  const replaceBackups = !hasBothBackups || versionChanged;
+  const pristineHashesChanged = existing &&
+    (existing.jsSha256 !== sha256(originalJsBuffer) || existing.cssSha256 !== sha256(originalCssBuffer));
+  const versionChanged = existing && existing.claudeVersion !== currentVersion;
+  const replaceBackups = !hasBothBackups || pristineHashesChanged || versionChanged;
   const metadata = replaceBackups || !existing ? {
     schemaVersion: PATCH_SCHEMA_VERSION,
     claudeVersion: currentVersion,
@@ -369,9 +379,10 @@ function inspectCompatibility(extDir, options = {}) {
 }
 
 function buildCssPatch(katexCss, highlightCss) {
+  const isolatedKatexCss = katexCss.replace(/url\(fonts\//g, `url(${PATCH_FONTS_DIRECTORY}/`);
   return `
 ${PATCH_CSS_MARKER}
-${katexCss}
+${isolatedKatexCss}
 ${highlightCss}
 .katex-display {
   display: block !important;
@@ -411,7 +422,7 @@ ${highlightCss}
 // point was not found (a future Claude Code reshaped its bundle) — in which
 // case nothing on disk is touched and the caller surfaces an "unsupported"
 // message.
-function applyPatch(extDir, vendorDir, options = {}) {
+function applyPatchUnlocked(extDir, vendorDir, options = {}) {
   const paths = patchPaths(extDir);
   const body = fs.readFileSync(paths.jsPath, 'utf8');
   const originalCss = fs.readFileSync(paths.cssPath, 'utf8');
@@ -447,14 +458,10 @@ function applyPatch(extDir, vendorDir, options = {}) {
 
   ensureBackupFiles(extDir, body, originalCss);
 
-  // Copy KaTeX fonts
-  const fontsTarget = path.join(paths.webviewDir, 'fonts');
+  // Copy KaTeX fonts into an extension-owned directory. Claude Code ships its
+  // own webview/fonts tree, so patch removal must never touch that directory.
+  const fontsTarget = paths.fontsDir;
   const fontsSrc = path.join(vendorDir, 'fonts');
-  fs.mkdirSync(fontsTarget, { recursive: true });
-  for (const font of fs.readdirSync(fontsSrc)) {
-    fs.copyFileSync(path.join(fontsSrc, font), path.join(fontsTarget, font));
-  }
-
   // Patch index.js — inject remark-math + rehype-katex into Claude Code's
   // react-markdown call, then prepend KaTeX core, Highlight.js, the
   // remark-math bundle, and the preview enhancer.
@@ -492,36 +499,57 @@ function applyPatch(extDir, vendorDir, options = {}) {
     transformed.body;
 
   // Patch index.css — KaTeX and syntax-highlight styles
-  const katexCss = fs.readFileSync(path.join(vendorDir, 'katex.min.css'), 'utf8');
+  const katexCss = fs.readFileSync(path.join(vendorDir, 'katex-woff2.min.css'), 'utf8');
   const highlightCss = fs.readFileSync(path.join(vendorDir, 'highlight-vs2015.min.css'), 'utf8');
   const cssPatch = buildCssPatch(katexCss, highlightCss);
+  if (cssPatch.includes('format("woff")') || cssPatch.includes('format("truetype")')) {
+    throw new Error('KaTeX CSS contains legacy font formats; expected WOFF2-only assets.');
+  }
   const patchedCss = originalCss + cssPatch;
-  transactionalWriteFilesSync([
-    { path: paths.jsPath, content: patchedJs },
-    { path: paths.cssPath, content: patchedCss },
-  ], (temporaryFiles) => {
-    const temporaryJs = fs.readFileSync(temporaryFiles.get(paths.jsPath), 'utf8');
-    const temporaryCss = fs.readFileSync(temporaryFiles.get(paths.cssPath), 'utf8');
-    if (!temporaryJs.includes(PATCH_MARKER) || !temporaryJs.includes(PATCH_BUILD_ID) ||
-        !temporaryJs.includes(PATCH_RUNTIME_STATE_PREFIX) ||
-        !temporaryJs.includes('__remarkMath') || !temporaryJs.includes('__rehypeKatex')) {
-      throw new Error('Patched Claude Code JavaScript failed marker verification.');
+  try {
+    fs.rmSync(fontsTarget, { recursive: true, force: true });
+    fs.mkdirSync(fontsTarget, { recursive: true });
+    for (const font of fs.readdirSync(fontsSrc)) {
+      if (!font.endsWith('.woff2')) continue;
+      fs.copyFileSync(path.join(fontsSrc, font), path.join(fontsTarget, font));
     }
-    if (transformed.diagnostics.virtualTurnsApplied &&
-        !temporaryJs.includes(VIRTUAL_TURNS_RUNTIME_MARKER)) {
-      throw new Error('Patched Claude Code JavaScript is missing the turn virtualization runtime.');
-    }
-    if (!temporaryCss.includes(PATCH_CSS_MARKER)) {
-      throw new Error('Patched Claude Code CSS failed marker verification.');
-    }
-    validateBundleSyntax(temporaryJs, temporaryFiles.get(paths.jsPath));
-  });
+    transactionalWriteFilesSync([
+      { path: paths.jsPath, content: patchedJs },
+      { path: paths.cssPath, content: patchedCss },
+    ], (temporaryFiles) => {
+      const temporaryJs = fs.readFileSync(temporaryFiles.get(paths.jsPath), 'utf8');
+      const temporaryCss = fs.readFileSync(temporaryFiles.get(paths.cssPath), 'utf8');
+      if (!temporaryJs.includes(PATCH_MARKER) || !temporaryJs.includes(PATCH_BUILD_ID) ||
+          !temporaryJs.includes(PATCH_RUNTIME_STATE_PREFIX) ||
+          !temporaryJs.includes('__remarkMath') || !temporaryJs.includes('__rehypeKatex')) {
+        throw new Error('Patched Claude Code JavaScript failed marker verification.');
+      }
+      if (transformed.diagnostics.virtualTurnsApplied &&
+          !temporaryJs.includes(VIRTUAL_TURNS_RUNTIME_MARKER)) {
+        throw new Error('Patched Claude Code JavaScript is missing the turn virtualization runtime.');
+      }
+      if (!temporaryCss.includes(PATCH_CSS_MARKER)) {
+        throw new Error('Patched Claude Code CSS failed WOFF2-only verification.');
+      }
+      validateBundleSyntax(temporaryJs, temporaryFiles.get(paths.jsPath));
+    });
+  } catch (error) {
+    fs.rmSync(fontsTarget, { recursive: true, force: true });
+    throw error;
+  }
 
   return true;
 }
 
-function removePatch(extDir) {
+function applyPatch(extDir, vendorDir, options = {}) {
+  return withPatchLock(extDir, () => applyPatchUnlocked(extDir, vendorDir, options));
+}
+
+function removePatchUnlocked(extDir) {
   const paths = patchPaths(extDir);
+  const patchState = getPatchState(extDir);
+  if (patchState === 'partial' && !partialPatchMatchesBackups(extDir)) return false;
+  if (patchState !== 'patched' && patchState !== 'partial') return false;
   if (!canRestoreOriginals(extDir)) return false;
 
   transactionalWriteFilesSync([
@@ -536,11 +564,14 @@ function removePatch(extDir) {
     validateBundleSyntax(restoredJs, temporaryFiles.get(paths.jsPath));
   });
 
-  const fontsDir = path.join(paths.webviewDir, 'fonts');
-  if (fs.existsSync(fontsDir)) {
-    fs.rmSync(fontsDir, { recursive: true });
+  if (fs.existsSync(paths.fontsDir)) {
+    fs.rmSync(paths.fontsDir, { recursive: true });
   }
   return true;
+}
+
+function removePatch(extDir) {
+  return withPatchLock(extDir, () => removePatchUnlocked(extDir));
 }
 
 // True only when the `.katex-bak` originals exist AND are themselves unpatched,
@@ -558,11 +589,29 @@ function canRestoreOriginals(extDir) {
     }
 
     const metadata = backupMetadata(extDir, paths);
-    if (!metadata) return true;
+    if (!metadata) return false;
     if (metadata.jsSha256 !== sha256(backupJs) || metadata.cssSha256 !== sha256(backupCss)) return false;
     const currentClaudeVersion = getClaudeCodeVersion(extDir);
     if (metadata.claudeVersion !== 'unknown' && currentClaudeVersion !== 'unknown' &&
         metadata.claudeVersion !== currentClaudeVersion) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function partialPatchMatchesBackups(extDir) {
+  const paths = patchPaths(extDir);
+  try {
+    if (!canRestoreOriginals(extDir)) return false;
+    const metadata = backupMetadata(extDir, paths);
+    const currentJs = fs.readFileSync(paths.jsPath);
+    const currentCss = fs.readFileSync(paths.cssPath);
+    const jsPatched = currentJs.includes(Buffer.from(PATCH_MARKER));
+    const cssPatched = currentCss.includes(Buffer.from(PATCH_CSS_MARKER));
+    if (jsPatched === cssPatched) return false;
+    if (!jsPatched && sha256(currentJs) !== metadata.jsSha256) return false;
+    if (!cssPatched && sha256(currentCss) !== metadata.cssSha256) return false;
     return true;
   } catch {
     return false;
@@ -577,36 +626,35 @@ function canRestoreOriginals(extDir) {
 //   'unsupported' - the react-markdown injection point was not found
 // May throw on filesystem errors from applyPatch/removePatch; callers handle.
 function ensurePatched(extDir, vendorDir, options = {}) {
-  const normalizedOptions = normalizePatchOptions(options);
-  const patchState = getPatchState(extDir);
-  if (patchState === 'partial') {
-    if (!canRestoreOriginals(extDir)) return 'skipped';
-    removePatch(extDir);
-    if (getPatchState(extDir) !== 'unpatched') return 'skipped';
-    return applyPatch(extDir, vendorDir, normalizedOptions) ? 'refreshed' : 'unsupported';
-  }
-  if (patchState === 'unpatched') {
-    return applyPatch(extDir, vendorDir, normalizedOptions) ? 'fresh' : 'unsupported';
-  }
-  if (patchState === 'unavailable') return 'unsupported';
-  if (getPatchedVersion(extDir) === EXTENSION_VERSION &&
-      getPatchedBuildId(extDir) === PATCH_BUILD_ID &&
-      getPatchedConfigHash(extDir) === patchConfigHash(normalizedOptions)) {
-    return 'current';
-  }
-  // A patch from an older (or pre-versioning) build is present. Refresh it so
-  // the injected code matches this build — but only if the pristine originals
-  // can be safely restored first.
-  if (!canRestoreOriginals(extDir)) {
-    console.warn('[Claude Code Enhance] Webview carries a stale patch but the original backup is missing or invalid; leaving the existing patch in place.');
-    return 'skipped';
-  }
-  removePatch(extDir);
-  if (isPatched(extDir)) {
-    console.error('[Claude Code Enhance] Restore did not clear the old patch; not re-applying.');
-    return 'skipped';
-  }
-  return applyPatch(extDir, vendorDir, normalizedOptions) ? 'refreshed' : 'unsupported';
+  return withPatchLock(extDir, () => {
+    const normalizedOptions = normalizePatchOptions(options);
+    const patchState = getPatchState(extDir);
+    if (patchState === 'partial') {
+      if (!partialPatchMatchesBackups(extDir)) return 'skipped';
+      removePatchUnlocked(extDir);
+      if (getPatchState(extDir) !== 'unpatched') return 'skipped';
+      return applyPatchUnlocked(extDir, vendorDir, normalizedOptions) ? 'refreshed' : 'unsupported';
+    }
+    if (patchState === 'unpatched') {
+      return applyPatchUnlocked(extDir, vendorDir, normalizedOptions) ? 'fresh' : 'unsupported';
+    }
+    if (patchState === 'unavailable') return 'unsupported';
+    if (getPatchedVersion(extDir) === EXTENSION_VERSION &&
+        getPatchedBuildId(extDir) === PATCH_BUILD_ID &&
+        getPatchedConfigHash(extDir) === patchConfigHash(normalizedOptions)) {
+      return 'current';
+    }
+    if (!canRestoreOriginals(extDir)) {
+      console.warn('[Claude Code Enhance] Webview carries a stale patch but the original backup is missing or invalid; leaving the existing patch in place.');
+      return 'skipped';
+    }
+    removePatchUnlocked(extDir);
+    if (isPatched(extDir)) {
+      console.error('[Claude Code Enhance] Restore did not clear the old patch; not re-applying.');
+      return 'skipped';
+    }
+    return applyPatchUnlocked(extDir, vendorDir, normalizedOptions) ? 'refreshed' : 'unsupported';
+  });
 }
 
 // Reloads the Claude Code webview so an on-disk patch change takes effect
@@ -732,14 +780,12 @@ function activate(context) {
         vscode.window.showErrorMessage('Claude Code extension not found.');
         return;
       }
-      if (isPatched(dir)) {
-        vscode.window.showInformationMessage('Claude Code Enhance is already active.');
-        return;
-      }
       try {
         const result = ensurePatched(dir, vendorDir, readPatchOptions());
         if (result === 'fresh' || result === 'refreshed') {
           reloadPatchedWebviewAndNotify('Claude Code Enhance enabled. The webview was reloaded; reload again if any math still looks unrendered.');
+        } else if (result === 'current') {
+          vscode.window.showInformationMessage('Claude Code Enhance is already active and current.');
         } else if (result === 'skipped') {
           vscode.window.showErrorMessage('Claude Code Enhance found an incomplete patch but could not verify its backups. No files were changed.');
         } else if (result === 'unsupported') {
@@ -747,6 +793,8 @@ function activate(context) {
         }
       } catch (e) {
         vscode.window.showErrorMessage('Failed to apply patch: ' + e.message);
+      } finally {
+        refreshStatusBar();
       }
     })
   );
@@ -764,10 +812,15 @@ function activate(context) {
         return;
       }
       try {
-        removePatch(dir);
-        reloadWebviewAndNotify('Claude Code Enhance disabled. The webview was reloaded.');
+        if (removePatch(dir)) {
+          reloadWebviewAndNotify('Claude Code Enhance disabled. The webview was reloaded.');
+        } else {
+          vscode.window.showErrorMessage('Claude Code Enhance could not verify the original backups. No files were changed.');
+        }
       } catch (e) {
         vscode.window.showErrorMessage('Failed to remove patch: ' + e.message);
+      } finally {
+        refreshStatusBar();
       }
     })
   );
@@ -900,6 +953,7 @@ module.exports._test = {
   getPatchedBuildId,
   getPatchedRuntimeState,
   canRestoreOriginals,
+  partialPatchMatchesBackups,
   applyPatch,
   removePatch,
   ensurePatched,

@@ -1,5 +1,33 @@
 # Changelog
 
+## [1.0.9] - 2026-11-04
+
+### Performance
+- Deferred Markdown fallback math, API-error, and code enhancement until the affected message is near the viewport and has been quiet for 280 ms, while keeping copy-button maintenance incremental and immediate.
+- Added size-aware streaming code highlighting: blocks above 50 KB use a longer quiet period, blocks above 200 KB wait longer again, and blocks above 500 KB remain plain text with copy support.
+- Added true sub-agent transcript virtualization with measured top and bottom spacers, a 60-message target window, 12-message overscan, and a 100-message hard DOM cap.
+- Moved sub-agent search and filters to cached message records instead of scanning rendered DOM, and lazily builds lowercase search text only when a query is active.
+- Reused mounted transcript articles across overlapping windows so scrolling does not repeat Markdown, KaTeX, and Highlight.js work for unchanged messages.
+- Replaced synchronous sub-agent discovery and whole-file reads with visibility-gated async discovery, file watchers, byte-range JSONL streaming, and 300-message Webview batches.
+- Kept only transcript cursors and metadata in the extension host; complete message data now lives in the virtualized Webview and search/filter indexing runs in cancellable idle slices.
+- Added bounded active-window key validation for same-length turn revisions plus an idle full-key consistency audit, preserving the append-only height-index fast path without synchronously rescanning long histories.
+- Skipped scroll-layout reads for copy-only mutation batches and validated dirty equal-length code updates before reusing bounded fingerprints.
+
+### Reliability
+- Added an atomic cross-process patch lock shared by enable, disable, refresh, and uninstall restore operations.
+- Rotated pristine backups when same-version Claude bundles change content, and made legacy backup restore fail closed unless pristine hashes can be verified and migrated.
+- Isolated copied KaTeX fonts under `webview/claude-enhance-fonts`, so disable and uninstall never delete Claude Code's native font directory.
+- Made Markdown spread injection fail closed unless a unique `remarkPlugins` source is identifiable, enhanced final merged props, and rejected overlapping AST replacements globally.
+- Added cursor-tail validation for in-place JSONL rewrites, bounded history watchers, watcher reattachment, and semantic-anchor restoration across same-file transcript reloads.
+- Extended one-sided Claude update protection to direct disable and uninstall restore paths, and cleaned partial font assets after failed patch transactions.
+- Corrected command status updates, stale-patch refresh behavior, the issue tracker URL, and release publishing so only matching `v*` tags create GitHub releases.
+- Pinned the Node 22 build to Playwright 1.64.1 and VSCE 4.1.0 with a committed lockfile and WOFF2-only package assets.
+
+### Diagnostics
+- Added per-feature total, maximum, and latest execution time, processed-root counts, rich-enhancement queue state, and code-character volume counters.
+- Added 10,000-message virtual-height, lazy-search, visibility, timing, and oversized-code regression coverage.
+- Added committed structural fixtures for Claude Code 2.1.314, 2.1.317, and 2.1.318 plus a real Chromium regression for transcript DOM limits, scrolling, resize anchoring, filtering, search, and append behavior.
+
 ## [1.0.8] - 2026-11-04
 
 ### Compatibility

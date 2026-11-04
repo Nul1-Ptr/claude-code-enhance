@@ -39,20 +39,33 @@
       fullPasses: 0,
       incrementalPasses: 0,
       coalescedBatches: 0,
+      richQueued: 0,
+      richRuns: 0,
+      richOffscreenDeferrals: 0,
+      richDropped: 0,
+      richPending: 0,
       lastBatchAt: null,
       lastBatchReasons: [],
       pending: null,
     },
     features: {
-      apiErrors: { attempts: 0, succeeded: 0, failed: 0 },
-      code: { attempts: 0, succeeded: 0, failed: 0 },
-      math: { attempts: 0, succeeded: 0, failed: 0 },
-      copy: { attempts: 0, succeeded: 0, failed: 0 },
-      zoom: { attempts: 0, succeeded: 0, failed: 0 },
+      apiErrors: { attempts: 0, succeeded: 0, failed: 0, totalMs: 0, maxMs: 0, lastMs: 0, lastRoots: 0 },
+      code: { attempts: 0, succeeded: 0, failed: 0, totalMs: 0, maxMs: 0, lastMs: 0, lastRoots: 0 },
+      math: { attempts: 0, succeeded: 0, failed: 0, totalMs: 0, maxMs: 0, lastMs: 0, lastRoots: 0 },
+      copy: { attempts: 0, succeeded: 0, failed: 0, totalMs: 0, maxMs: 0, lastMs: 0, lastRoots: 0 },
+      zoom: { attempts: 0, succeeded: 0, failed: 0, totalMs: 0, maxMs: 0, lastMs: 0, lastRoots: 0 },
     },
     warnings: 0,
     math: { candidates: 0, rendered: 0, literal: 0, repaired: 0, domRendered: 0, failed: 0 },
-    codeBlocks: { highlighted: 0, plain: 0, deferred: 0 },
+    codeBlocks: {
+      highlighted: 0,
+      plain: 0,
+      deferred: 0,
+      skippedLarge: 0,
+      examinedCharacters: 0,
+      inputCharacters: 0,
+      maxCharacters: 0,
+    },
     copyWork: { scopedTurnScans: 0, cachedMessageUpdates: 0, fullContainerScans: 0 },
     history: {
       fullTranscriptRequested: RUNTIME_CONFIG.fullTranscriptRequested,
@@ -67,6 +80,7 @@
   // Guard flag: while an enhancement cycle runs, the Observer ignores its own DOM changes.
   let _enhancing = false;
   let _scrollContainerCache = null;
+  const selfMutationRoots = new WeakSet();
 
   // ===== Utilities =====
 
@@ -83,6 +97,23 @@
     } catch (error) {
       warnOnce(key, error);
       return fallback;
+    }
+  }
+
+  function nowMs() {
+    return typeof performance !== 'undefined' && typeof performance.now === 'function'
+      ? performance.now()
+      : Date.now();
+  }
+
+  function withSelfMutation(root, callback) {
+    if (!root || typeof callback !== 'function') return callback?.();
+    selfMutationRoots.add(root);
+    try {
+      return callback();
+    } finally {
+      const clear = () => selfMutationRoots.delete(root);
+      setTimeout(clear, 0);
     }
   }
 
@@ -145,6 +176,7 @@
         --ce-api-error-border: rgba(248, 81, 73, 0.38);
         --ce-api-error-title: #ffb4ab;
         --ce-api-error-pill-bg: rgba(248, 81, 73, 0.08);
+        --ce-content-font-size: ${CONTENT_BASE_FONT_SCALE}em;
         /* One Dark inspired syntax palette. */
         --ce-syntax-fg: #abb2bf;
         --ce-syntax-keyword: #c678dd;
@@ -162,6 +194,13 @@
         --ce-syntax-deletion: #e06c75;
         --ce-markdown-text: #c8d3f5;
         --ce-inline-code-fg: var(--ce-syntax-string);
+      }
+
+      .claude-enhance-root {
+        font-size: var(--ce-content-font-size);
+      }
+      .claude-enhance-root .claude-enhance-root {
+        font-size: inherit;
       }
 
       :is(body.vscode-light, html.vscode-light) {
@@ -985,6 +1024,17 @@
     return topLevelRoots(roots);
   }
 
+  function getRichEnhanceRoots(scope = document) {
+    const messageRoots = candidateRoots(scope, MESSAGE_PROCESSING_SELECTOR)
+      .filter((el) => !closestSafe(el, NON_PREVIEW_SELECTOR) && !isInsideDialog(el));
+    const top = topLevelRoots(messageRoots);
+    if (top.length) {
+      top.forEach((el) => el.classList.add('claude-enhance-root'));
+      return top;
+    }
+    return getEnhanceRoots(scope);
+  }
+
   function rootsForScopes(scopes, resolver) {
     if (!scopes) return resolver(document);
     const list = Array.isArray(scopes) ? scopes : [scopes];
@@ -1014,9 +1064,7 @@
         safeRun('highlightCodeBlock', () => {
           const result = RUNTIME_CONFIG.syntaxHighlighting ? highlightCodeBlock(block) : 'unchanged';
           if (RUNTIME_CONFIG.copyButtons) addCodeBlockCopyButton(block);
-          if (result === 'highlighted') runtimeDiagnostics.codeBlocks.highlighted++;
-          if (result === 'plain') runtimeDiagnostics.codeBlocks.plain++;
-          if (result === 'deferred') runtimeDiagnostics.codeBlocks.deferred++;
+          recordCodeBlockResult(result);
         });
       });
     });
@@ -1056,23 +1104,96 @@
   }
 
   const CODE_HIGHLIGHT_MIN_INTERVAL_MS = 120;
+  const CODE_HIGHLIGHT_MEDIUM_INTERVAL_MS = 400;
+  const CODE_HIGHLIGHT_MEDIUM_LENGTH = 50 * 1024;
+  const CODE_HIGHLIGHT_LARGE_LENGTH = 200 * 1024;
+  const CODE_HIGHLIGHT_MAX_LENGTH = 500 * 1024;
   const codeHighlightStates = new WeakMap();
 
-  function scheduleDeferredCodeHighlight(block) {
+  function codeHighlightPolicy(length) {
+    const size = Math.max(0, Number(length) || 0);
+    if (size > CODE_HIGHLIGHT_MAX_LENGTH) {
+      return { interval: Infinity, skip: true, waitForQuiet: true, tier: 'oversized' };
+    }
+    if (size > CODE_HIGHLIGHT_LARGE_LENGTH) {
+      return { interval: 800, skip: false, waitForQuiet: true, tier: 'large' };
+    }
+    if (size > CODE_HIGHLIGHT_MEDIUM_LENGTH) {
+      return {
+        interval: CODE_HIGHLIGHT_MEDIUM_INTERVAL_MS,
+        skip: false,
+        waitForQuiet: true,
+        tier: 'medium',
+      };
+    }
+    return {
+      interval: CODE_HIGHLIGHT_MIN_INTERVAL_MS,
+      skip: false,
+      waitForQuiet: false,
+      tier: 'small',
+    };
+  }
+
+  function scheduleDeferredCodeHighlight(block, delayOverride) {
     const state = codeHighlightStates.get(block);
-    if (!state || state.timer) return;
+    if (!state) return;
+    if (state.timer) clearTimeout(state.timer);
 
     const elapsed = Date.now() - state.lastHighlightAt;
-    const delay = Math.max(0, CODE_HIGHLIGHT_MIN_INTERVAL_MS - elapsed);
+    const policy = codeHighlightPolicy(state.lastLength);
+    const delay = Number.isFinite(delayOverride)
+      ? Math.max(0, delayOverride)
+      : Math.max(0, policy.interval - elapsed);
     state.timer = setTimeout(() => {
       state.timer = null;
       if (block.isConnected === false) return;
-      safeRun('deferred highlightCodeBlock', () => highlightCodeBlock(block));
+      const diagnostics = runtimeDiagnostics.features.code;
+      const startedAt = nowMs();
+      diagnostics.attempts++;
+      diagnostics.lastRoots = 1;
+      try {
+        const result = highlightCodeBlock(block, { quiet: true });
+        recordCodeBlockResult(result);
+        diagnostics.succeeded++;
+      } catch (error) {
+        diagnostics.failed++;
+        warnOnce('deferred highlightCodeBlock', error);
+      } finally {
+        const elapsed = Math.max(0, nowMs() - startedAt);
+        diagnostics.lastMs = Math.round(elapsed * 100) / 100;
+        diagnostics.totalMs = Math.round((diagnostics.totalMs + elapsed) * 100) / 100;
+        diagnostics.maxMs = Math.max(diagnostics.maxMs, diagnostics.lastMs);
+      }
     }, delay);
   }
 
+  function recordCodeBlockResult(result) {
+    if (result === 'highlighted') runtimeDiagnostics.codeBlocks.highlighted++;
+    if (result === 'plain') runtimeDiagnostics.codeBlocks.plain++;
+    if (result === 'deferred') runtimeDiagnostics.codeBlocks.deferred++;
+    if (result === 'skipped') runtimeDiagnostics.codeBlocks.skippedLarge++;
+  }
+
+  function markCodeBlockDirty(node) {
+    const element = node?.nodeType === Node.TEXT_NODE ? node.parentElement : node;
+    const block = element?.tagName === 'CODE' ? element : closestSafe(element, 'code');
+    if (!block || block.parentElement?.tagName !== 'PRE') return;
+    const state = codeHighlightStates.get(block) || {
+      lastHighlightAt: 0,
+      lastLength: 0,
+      timer: null,
+      dirtyAt: 0,
+    };
+    if (state.timer) {
+      clearTimeout(state.timer);
+      state.timer = null;
+    }
+    state.dirtyAt = Date.now();
+    codeHighlightStates.set(block, state);
+  }
+
   function markCodeBlockPlain(block, text, language) {
-    block.textContent = text;
+    withSelfMutation(block, () => { block.textContent = text; });
     block.classList.add('hljs');
     block.dataset.ceHighlighted = getCodeFingerprint(text);
 
@@ -1086,24 +1207,64 @@
     return 'plain';
   }
 
-  function highlightCodeBlock(block) {
+  function highlightCodeBlock(block, options = {}) {
     const text = block.textContent || '';
     if (!text.trim()) return 'unchanged';
-
-    const fingerprint = getCodeFingerprint(text);
-    if (block.dataset.ceHighlighted === fingerprint) return 'unchanged';
 
     const state = codeHighlightStates.get(block) || {
       lastHighlightAt: 0,
       lastLength: 0,
       timer: null,
+      dirtyAt: 0,
     };
+    const fingerprint = getCodeFingerprint(text);
+    if (block.dataset.ceHighlighted === fingerprint && !state.dirtyAt) return 'unchanged';
+
+    const previousLength = state.lastLength;
+    const policy = codeHighlightPolicy(text.length);
     const now = Date.now();
+    state.lastLength = text.length;
+    codeHighlightStates.set(block, state);
+    runtimeDiagnostics.codeBlocks.examinedCharacters += text.length;
+    runtimeDiagnostics.codeBlocks.maxCharacters = Math.max(
+      runtimeDiagnostics.codeBlocks.maxCharacters,
+      text.length
+    );
+
+    if (policy.skip) {
+      if (state.timer) {
+        clearTimeout(state.timer);
+        state.timer = null;
+      }
+      if (block.children?.length || block.classList.contains('hljs')) {
+        withSelfMutation(block, () => { block.textContent = text; });
+      }
+      block.classList.remove('hljs');
+      block.dataset.ceHighlighted = fingerprint;
+      block.dataset.ceHighlightSkipped = 'oversized';
+      state.dirtyAt = 0;
+      return 'skipped';
+    }
+
+    if (policy.waitForQuiet && !options.quiet) {
+      const quietFor = state.dirtyAt ? now - state.dirtyAt : 0;
+      if (!state.dirtyAt || quietFor < policy.interval) {
+        scheduleDeferredCodeHighlight(block, Math.max(0, policy.interval - quietFor));
+        return 'deferred';
+      }
+    }
+    if (policy.waitForQuiet && options.quiet && state.dirtyAt) {
+      const quietFor = now - state.dirtyAt;
+      if (quietFor < policy.interval) {
+        scheduleDeferredCodeHighlight(block, policy.interval - quietFor);
+        return 'deferred';
+      }
+    }
+
     if (state.lastHighlightAt &&
-        text.length >= state.lastLength &&
-        now - state.lastHighlightAt < CODE_HIGHLIGHT_MIN_INTERVAL_MS) {
-      codeHighlightStates.set(block, state);
-      scheduleDeferredCodeHighlight(block);
+        text.length >= previousLength &&
+        now - state.lastHighlightAt < policy.interval) {
+      scheduleDeferredCodeHighlight(block, policy.interval - (now - state.lastHighlightAt));
       return 'deferred';
     }
     if (state.timer) {
@@ -1112,7 +1273,10 @@
     }
     state.lastHighlightAt = now;
     state.lastLength = text.length;
-    codeHighlightStates.set(block, state);
+    state.dirtyAt = 0;
+    delete block.dataset.ceHighlightSkipped;
+
+    runtimeDiagnostics.codeBlocks.inputCharacters += text.length;
 
     const language = getCodeLanguage(block) || 'markdown';
     if (!language || !hljs.getLanguage(language)) {
@@ -1122,7 +1286,7 @@
     try {
       const result = hljs.highlight(text, { language, ignoreIllegals: true });
 
-      block.innerHTML = result.value;
+      withSelfMutation(block, () => { block.innerHTML = result.value; });
       block.classList.add('hljs');
       block.dataset.ceHighlighted = fingerprint;
 
@@ -3504,8 +3668,9 @@
     if (!document.body) return;
     document.body.style.zoom = '';
     const effectiveZoom = Number.isFinite(zoom) ? zoom * CONTENT_BASE_FONT_SCALE : CONTENT_BASE_FONT_SCALE;
+    document.documentElement?.style?.setProperty?.('--ce-content-font-size', `${effectiveZoom}em`);
     rootsForScopes(scopes, getEnhanceRoots).forEach((root) => {
-      root.style.fontSize = `${effectiveZoom}em`;
+      root.style.fontSize = '';
     });
   }
 
@@ -3538,11 +3703,213 @@
 
   // ===== DOM observer =====
 
+  const RICH_ENHANCEMENT_FEATURES = Object.freeze(['apiErrors', 'code', 'math']);
+  const RICH_ENHANCEMENT_QUIET_MS = 280;
+  const RICH_ENHANCEMENT_RECHECK_MS = 1200;
+  const richEnhancementEntries = new Map();
+  const richReadyEntries = new Set();
+  const richVisibility = new WeakMap();
+  let richVisibilityObserver = null;
+  let richCleanupTimer = null;
+  let richFlushScheduled = false;
   let enhancementScheduler = null;
 
+  function isRichEnhancementFeature(feature) {
+    return RICH_ENHANCEMENT_FEATURES.includes(feature);
+  }
+
+  function rootNearViewport(root) {
+    if (!root || root.isConnected === false) return false;
+    const observed = richVisibility.get(root);
+    if (observed !== undefined) return observed;
+    if (typeof root.getBoundingClientRect !== 'function' || typeof window === 'undefined') return true;
+    try {
+      const rect = root.getBoundingClientRect();
+      const viewportHeight = window.innerHeight || document.documentElement?.clientHeight || 0;
+      return rect.bottom >= -800 && rect.top <= viewportHeight + 800;
+    } catch {
+      return true;
+    }
+  }
+
+  function ensureRichVisibilityObserver() {
+    if (richVisibilityObserver || typeof IntersectionObserver !== 'function') {
+      return richVisibilityObserver;
+    }
+    richVisibilityObserver = new IntersectionObserver((entries) => {
+      for (const observed of entries) {
+        const root = observed.target;
+        const visible = observed.isIntersecting || observed.intersectionRatio > 0;
+        richVisibility.set(root, visible);
+        const entry = richEnhancementEntries.get(root);
+        if (visible && entry) scheduleRichEnhancementEntry(entry, 0);
+      }
+    }, { root: null, rootMargin: '800px 0px', threshold: 0 });
+    return richVisibilityObserver;
+  }
+
+  function finishRichEnhancementEntry(root) {
+    const entry = richEnhancementEntries.get(root);
+    if (entry?.timer) clearTimeout(entry.timer);
+    if (entry) richReadyEntries.delete(entry);
+    richEnhancementEntries.delete(root);
+    richVisibilityObserver?.unobserve?.(root);
+    richVisibility.delete(root);
+    runtimeDiagnostics.scheduler.richPending = richEnhancementEntries.size;
+  }
+
+  function flushRichEnhancements() {
+    richFlushScheduled = false;
+    const roots = [];
+    const features = new Set();
+    for (const entry of Array.from(richReadyEntries)) {
+      richReadyEntries.delete(entry);
+      const root = entry.root;
+      if (!root || richEnhancementEntries.get(root) !== entry) continue;
+      if (root.isConnected === false) {
+        runtimeDiagnostics.scheduler.richDropped++;
+        finishRichEnhancementEntry(root);
+        continue;
+      }
+      const quietFor = Date.now() - entry.updatedAt;
+      if (quietFor < RICH_ENHANCEMENT_QUIET_MS) {
+        scheduleRichEnhancementEntry(entry, RICH_ENHANCEMENT_QUIET_MS - quietFor);
+        continue;
+      }
+      if (!rootNearViewport(root)) {
+        if (!richVisibilityObserver) {
+          scheduleRichEnhancementEntry(entry, RICH_ENHANCEMENT_RECHECK_MS);
+        }
+        continue;
+      }
+      entry.features.forEach((feature) => features.add(feature));
+      roots.push(root);
+      finishRichEnhancementEntry(root);
+    }
+    if (!roots.length) return;
+    runtimeDiagnostics.scheduler.richRuns++;
+    runEnhancementCycle({
+      fullPass: false,
+      roots,
+      features: Array.from(features),
+    });
+  }
+
+  function queueReadyRichEnhancement(entry) {
+    if (!entry) return;
+    richReadyEntries.add(entry);
+    if (richFlushScheduled) return;
+    richFlushScheduled = true;
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(flushRichEnhancements);
+    else setTimeout(flushRichEnhancements, 16);
+  }
+
+  function scheduleRichCleanup() {
+    if (richCleanupTimer || !richEnhancementEntries.size) return;
+    richCleanupTimer = setTimeout(() => {
+      richCleanupTimer = null;
+      for (const root of Array.from(richEnhancementEntries.keys())) {
+        if (root?.isConnected !== false) continue;
+        runtimeDiagnostics.scheduler.richDropped++;
+        finishRichEnhancementEntry(root);
+      }
+      scheduleRichCleanup();
+    }, 5000);
+  }
+
+  function scheduleRichEnhancementEntry(entry, delay = RICH_ENHANCEMENT_QUIET_MS) {
+    if (!entry) return;
+    richReadyEntries.delete(entry);
+    if (entry.timer) clearTimeout(entry.timer);
+    entry.timer = setTimeout(() => {
+      entry.timer = null;
+      const root = entry.root;
+      if (!root || root.isConnected === false) {
+        runtimeDiagnostics.scheduler.richDropped++;
+        finishRichEnhancementEntry(root);
+        return;
+      }
+
+      const quietFor = Date.now() - entry.updatedAt;
+      if (quietFor < RICH_ENHANCEMENT_QUIET_MS) {
+        scheduleRichEnhancementEntry(entry, RICH_ENHANCEMENT_QUIET_MS - quietFor);
+        return;
+      }
+      if (!rootNearViewport(root)) {
+        if (!entry.offscreenDeferred) {
+          entry.offscreenDeferred = true;
+          runtimeDiagnostics.scheduler.richOffscreenDeferrals++;
+        }
+        if (!richVisibilityObserver) {
+          scheduleRichEnhancementEntry(entry, RICH_ENHANCEMENT_RECHECK_MS);
+        }
+        return;
+      }
+
+      queueReadyRichEnhancement(entry);
+    }, Math.max(0, delay));
+  }
+
+  function enqueueRichEnhancements(roots, features, reason) {
+    const requested = Array.from(features || []).filter(isRichEnhancementFeature);
+    if (!requested.length) return false;
+    const candidates = roots == null
+      ? getRichEnhanceRoots()
+      : narrowDirtyRoots((Array.isArray(roots) ? roots : [roots])
+        .filter((root) => root?.isConnected !== false));
+    if (!candidates.length) return false;
+
+    const observer = ensureRichVisibilityObserver();
+    const updatedAt = Date.now();
+    for (const root of candidates) {
+      root.classList?.add?.('claude-enhance-root');
+      let entry = richEnhancementEntries.get(root);
+      if (!entry) {
+        for (const candidateEntry of richEnhancementEntries.values()) {
+          if (candidateEntry.root?.contains?.(root)) {
+            entry = candidateEntry;
+            break;
+          }
+        }
+      }
+      if (!entry) {
+        const descendants = Array.from(richEnhancementEntries.values())
+          .filter((candidateEntry) => root.contains?.(candidateEntry.root));
+        entry = {
+          root,
+          features: new Set(),
+          reasons: new Set(),
+          updatedAt,
+          timer: null,
+          offscreenDeferred: false,
+        };
+        richEnhancementEntries.set(root, entry);
+        observer?.observe?.(root);
+        for (const descendant of descendants) {
+          descendant.features.forEach((feature) => entry.features.add(feature));
+          descendant.reasons.forEach((entryReason) => entry.reasons.add(entryReason));
+          finishRichEnhancementEntry(descendant.root);
+        }
+      }
+      requested.forEach((feature) => entry.features.add(feature));
+      if (reason) entry.reasons.add(String(reason));
+      entry.updatedAt = updatedAt;
+      entry.offscreenDeferred = false;
+      scheduleRichEnhancementEntry(entry);
+      runtimeDiagnostics.scheduler.richQueued++;
+    }
+    runtimeDiagnostics.scheduler.richPending = richEnhancementEntries.size;
+    scheduleRichCleanup();
+    return true;
+  }
+
   function enqueueFullEnhancement(features, reason) {
-    if (!enhancementScheduler) return false;
-    enhancementScheduler.enqueue(null, features, { fullPass: true, reason });
+    const requested = window.__CLAUDE_ENHANCE_RUNTIME_CORE__?.normalizeFeatures(features) || [];
+    const rich = requested.filter(isRichEnhancementFeature);
+    const immediate = requested.filter((feature) => !isRichEnhancementFeature(feature));
+    const richQueued = enqueueRichEnhancements(null, rich, reason);
+    if (!enhancementScheduler || !immediate.length) return richQueued;
+    enhancementScheduler.enqueue(null, immediate, { fullPass: true, reason });
     runtimeDiagnostics.scheduler.pending = enhancementScheduler.getState();
     return true;
   }
@@ -3565,6 +3932,11 @@
     function isSelfMutation(m) {
       const target = m.target;
       if (isInsideKatex(target)) return true;
+      const targetElement = target?.nodeType === Node.TEXT_NODE ? target.parentElement : target;
+      const targetCode = targetElement?.tagName === 'CODE'
+        ? targetElement
+        : closestSafe(targetElement, 'code');
+      if (targetCode && selfMutationRoots.has(targetCode)) return true;
       for (const node of m.addedNodes) {
         if (node.nodeType === Node.ELEMENT_NODE) {
           const cls = toClassName(node.className);
@@ -3581,6 +3953,7 @@
 
     function enqueueMutation(mutation, currentContainer) {
       if (isSelfMutation(mutation)) return false;
+      markCodeBlockDirty(mutation.target);
       if (mutation.type === 'childList' && !(mutation.addedNodes?.length > 0)) {
         const deletionRoot = findProcessingRoot(mutation.target, currentContainer);
         if (!deletionRoot || matchesSafe(deletionRoot, MESSAGE_CONTAINER_SELECTOR)) return false;
@@ -3605,10 +3978,13 @@
       }
       if (!roots.size) return false;
 
-      const features = mutation.type === 'characterData'
-        ? ['apiErrors', 'code', 'math', 'zoom']
-        : ['apiErrors', 'code', 'math', 'copy', 'zoom'];
-      roots.forEach((root) => enhancementScheduler.enqueue(root, features, {
+      const richQueued = enqueueRichEnhancements(
+        Array.from(roots),
+        RICH_ENHANCEMENT_FEATURES,
+        mutation.type
+      );
+      if (mutation.type === 'characterData') return richQueued;
+      roots.forEach((root) => enhancementScheduler.enqueue(root, ['copy'], {
         reason: mutation.type,
       }));
       return true;
@@ -3665,10 +4041,11 @@
       _scrollContainerCache = null;
       observer.observe(container, { childList: true, subtree: true, characterData: true });
       console.log('[Claude Enhance] Observer attached to messagesContainer');
-      enhancementScheduler.enqueue(null, undefined, {
+      enhancementScheduler.enqueue(null, ['copy', 'zoom'], {
         fullPass: true,
         reason: 'container-attached',
       });
+      enqueueRichEnhancements(null, RICH_ENHANCEMENT_FEATURES, 'container-attached');
       runtimeDiagnostics.scheduler.pending = enhancementScheduler.getState();
     }
 
@@ -3918,12 +4295,19 @@
     if (!feature.enabled()) return;
     const diagnostics = runtimeDiagnostics.features[feature.id];
     diagnostics.attempts++;
+    diagnostics.lastRoots = Array.isArray(roots) ? roots.length : 0;
+    const startedAt = nowMs();
     try {
       feature.run(roots);
       diagnostics.succeeded++;
     } catch (error) {
       diagnostics.failed++;
       warnOnce(`feature ${feature.id}`, error);
+    } finally {
+      const elapsed = Math.max(0, nowMs() - startedAt);
+      diagnostics.lastMs = Math.round(elapsed * 100) / 100;
+      diagnostics.totalMs = Math.round((diagnostics.totalMs + elapsed) * 100) / 100;
+      diagnostics.maxMs = Math.max(diagnostics.maxMs, diagnostics.lastMs);
     }
   }
 
@@ -3945,11 +4329,13 @@
 
     _enhancing = true;
     try {
-      const bottomFollow = captureBottomFollow();
+      const changesDocumentFlow = ['apiErrors', 'code', 'math', 'zoom']
+        .some((feature) => requested.has(feature));
+      const bottomFollow = changesDocumentFlow ? captureBottomFollow() : null;
       ENHANCEMENT_FEATURE_REGISTRY.forEach((feature) => {
         if (requested.has(feature.id)) runEnhancementFeature(feature, roots);
       });
-      restoreBottomFollow(bottomFollow);
+      if (bottomFollow) restoreBottomFollow(bottomFollow);
     } finally {
       _enhancing = false;
     }
@@ -3984,6 +4370,9 @@
       normalizeMarkdownMathSource,
       installRemarkSourceNormalizer,
       getCodeLanguage,
+      codeHighlightPolicy,
+      highlightCodeBlock,
+      markCodeBlockDirty,
       hasMarkdownUnderscoreEmphasis,
       parseApiErrorText,
       isProseHeavyLatex,
@@ -4009,6 +4398,9 @@
       isInsideMathExcludedRegion,
       scanAndAddCopyButtons,
       narrowDirtyRoots,
+      enqueueRichEnhancements,
+      getRichEnhanceRoots,
+      rootNearViewport,
       CODE_SURFACE_SELECTOR,
       diagnosticsSnapshot,
       enhancementFeatureIds: ENHANCEMENT_FEATURE_REGISTRY.map((feature) => feature.id),

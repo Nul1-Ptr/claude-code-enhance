@@ -17,7 +17,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  build-and-release:
+  build:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -26,13 +26,19 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
 
       - name: Install package metadata
-        run: npm install --no-audit --no-fund
+        run: npm ci --ignore-scripts --no-audit --no-fund
 
       - name: Run smoke test
         run: npm test
+
+      - name: Install Chromium
+        run: npx playwright install --with-deps --no-shell chromium
+
+      - name: Run browser regression
+        run: npm run test:browser
 
       - name: Package VSIX
         run: npm run package
@@ -40,31 +46,20 @@ jobs:
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: claude-code-enhance-vsix
+          name: claude-code-enhance-vsix-${{ github.sha }}
           path: "*.vsix"
           if-no-files-found: error
 
-      - name: Upload tagged release
-        if: startsWith(github.ref, 'refs/tags/')
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes
-          gh release upload "$GITHUB_REF_NAME" ./*.vsix --clobber
-
-      - name: Publish versioned release
-        if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+      - name: Publish tagged release
+        if: startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           VERSION=$(node -p "require('./package.json').version")
-          RELEASE_TAG="v$VERSION"
-          RELEASE_TITLE="v$VERSION"
-          # Create a real (non-prerelease) release for this version if it doesn't exist yet.
-          # Existing releases are reused so re-pushes just refresh the attached VSIX.
-          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            gh release edit "$RELEASE_TAG" --title "$RELEASE_TITLE" --prerelease=false --latest
+          test "$GITHUB_REF_NAME" = "v$VERSION"
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release edit "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --prerelease=false --latest
           else
-            gh release create "$RELEASE_TAG" --title "$RELEASE_TITLE" --generate-notes --latest --target "$GITHUB_SHA"
+            gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes --latest --target "$GITHUB_SHA"
           fi
-          gh release upload "$RELEASE_TAG" ./*.vsix --clobber
+          gh release upload "$GITHUB_REF_NAME" ./*.vsix --clobber

@@ -156,7 +156,7 @@ Press **Ctrl+Shift+D** inside the Claude Code webview to dump the DOM structure 
 
 ## Version
 
-Current local version: `1.0.8`
+Current local version: `1.0.9`
 
 The package version, internal patch build, and normalized configuration hash are stamped separately. A rebuild can therefore refresh stale injected code or settings without depending on a specific Claude Code version.
 
@@ -172,7 +172,7 @@ From this directory:
 
 ```bash
 npm run package
-code --install-extension claude-code-enhance-1.0.8.vsix --force
+code --install-extension claude-code-enhance-1.0.9.vsix --force
 ```
 
 Reload VS Code after installing. The extension patches Claude Code automatically on startup and reloads the Claude Code webview when it applies or refreshes the patch.
@@ -220,6 +220,8 @@ Before patching, it creates backups:
 - `webview/index.css.katex-bak`
 - `webview/.claude-enhance-backup.json`
 
+Patch, refresh, restore, and uninstall operations share an atomic cross-process lock. Backup rotation compares Claude version and pristine JS/CSS hashes, so a same-version repack cannot leave a stale restore point. Legacy backups without metadata are restored only after they are verified against a pristine webview and migrated to hash metadata.
+
 The extension discovers the Markdown renderer and transcript-retention function through an Acorn syntax tree rather than a version-specific minified-code string. Both the legacy slice-based retention function and the newer structured message-list retention function are recognized. When `fullTranscript` is enabled, a missing or ambiguous retention target fails closed instead of silently claiming that complete history is active. JS/CSS updates use verified temporary files, `fsync`, atomic renames, and rollback; backup metadata records Claude's version and SHA-256 hashes.
 
 The retention patch disables only Claude Code's capacity-based history trimming. Claude's semantic cleanup of explicitly superseded or retracted messages remains active so the main chat does not reintroduce duplicate or withdrawn rows.
@@ -232,7 +234,7 @@ The status command and diagnostics distinguish requested settings from effective
 
 `fullTranscript` controls the Webview's retained message data. It does not force Claude's model backend to resend every historical token; server-side context compaction and summarization remain Claude Code behavior.
 
-The sub-agent sidebar does not patch Claude Code. It runs in this extension's host process and reads the public JSONL history layout, so its project/session/agent view is independent of Claude Code's minified webview bundle.
+The sub-agent sidebar does not patch Claude Code. It runs in this extension's host process and reads the public JSONL history layout, so its project/session/agent view is independent of Claude Code's minified webview bundle. Discovery starts only when the view becomes visible, uses up to 128 filesystem watchers with a 45-second fallback, and streams JSONL in fixed byte ranges and 300-message Webview batches. Cursor-tail validation detects same-inode rewrites before append mode is used. The extension host retains only the file cursor and metadata; the Webview retains complete message data behind a 100-node DOM cap.
 
 ## How Rendering Works
 
@@ -246,7 +248,9 @@ $$\tilde{F}_{ij} = \sum_k S^{\xi_i}_k \cdot F_{kj}$$
 
 The bundled `enhance.js` also runs inside the webview to improve output styling, copy behavior, zoom, tables, code blocks, API errors, and fallback math rendering. A shared feature registry processes dirty message roots once per animation frame; conversation-container replacement is the deliberate full-pass fallback.
 
-For long sessions, copy-button maintenance is scoped to changed turns, off-screen historical turns use `content-visibility`, streaming code highlighting is rate-limited, and the scroll container lookup is cached. With `virtualTurns` enabled, Claude's message arrays stay complete while only the active turn window is mounted. If `fullTranscript=true` is combined with `virtualTurns=false`, the extension keeps Claude's native retention cap instead of creating an unbounded full-DOM transcript.
+For long sessions, copy-button maintenance is scoped to changed turns, off-screen historical turns use `content-visibility`, and expensive math, API-error, and code enhancement waits until the affected message is near the viewport and quiet for a short period. Code highlighting uses size-aware limits: medium and large streaming blocks wait longer for a quiet period, while blocks above 500 KB stay plain text with copy support. Per-feature diagnostics include total, maximum, and latest processing time plus processed-root counts.
+
+With `virtualTurns` enabled, Claude's message arrays stay complete while only the active turn window is mounted. The sub-agent transcript viewer uses the same data-versus-DOM separation: filtering and search run in cancellable idle slices against complete message records, while only 60-100 nearby messages are mounted with measured spacer heights. Same-file full reloads preserve a message-key scroll anchor instead of relying only on an estimated absolute offset. If `fullTranscript=true` is combined with `virtualTurns=false`, the extension keeps Claude's native retention cap instead of creating an unbounded full-DOM transcript.
 
 Browser `Ctrl+F` searches only mounted turns. Claude's own message focus/highlight path can reveal an unmounted historical turn, but a separate full-history search index is not included. Claude still performs linear message-key, grouping, and turn-building work before the virtual DOM boundary; those data-layer paths remain unpatched because they are less expensive and materially more version-sensitive than the React/DOM work removed here.
 
@@ -278,7 +282,7 @@ To re-enable, run:
 Claude Code Enhance: Enable
 ```
 
-Uninstalling the VS Code extension should run `uninstall-hook.js`, which restores the backups and removes copied KaTeX fonts.
+Uninstalling the VS Code extension should run `uninstall-hook.js`, which restores every discovered Claude Code installation with verified backups and removes only `webview/claude-enhance-fonts`. Claude Code's own `webview/fonts` directory is never removed.
 
 ## If You Disabled The Extension From The Extensions Panel
 

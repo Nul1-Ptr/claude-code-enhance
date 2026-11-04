@@ -19,7 +19,10 @@ function createEnhanceTestApi() {
       error() {},
     },
     katex,
+    hljs,
     Node: { ELEMENT_NODE: 1, TEXT_NODE: 3 },
+    setTimeout,
+    clearTimeout,
     document: {
       createElement(tagName) {
         return {
@@ -988,6 +991,48 @@ for (const testCase of richTextCases) {
 assert(api.getCodeLanguage(fakeCodeBlock('language-py')) === 'python', 'py alias should resolve to python');
 assert(api.getCodeLanguage(fakeCodeBlock('lang-ts')) === 'typescript', 'ts alias should resolve to typescript');
 assert(api.getCodeLanguage(fakeCodeBlock('', '', 'sh')) === 'bash', 'raw sh data-language should resolve to bash');
+assert(api.codeHighlightPolicy(50 * 1024).tier === 'small', '50KB code should retain responsive highlighting');
+assert(api.codeHighlightPolicy(50 * 1024 + 1).tier === 'medium', 'code above 50KB should wait for a quiet period');
+assert(api.codeHighlightPolicy(200 * 1024 + 1).tier === 'large', 'code above 200KB should use the long quiet period');
+assert(api.codeHighlightPolicy(500 * 1024 + 1).skip, 'code above 500KB should skip syntax highlighting');
+const codeClasses = new Set(['language-javascript']);
+let codeHtmlWrites = 0;
+const originalCodeText = `const prefix = "${'a'.repeat(90)}";${'b'.repeat(90)};`;
+const codeBlock = {
+  nodeType: 1,
+  tagName: 'CODE',
+  className: 'language-javascript',
+  textContent: originalCodeText,
+  dataset: {},
+  children: [],
+  isConnected: true,
+  parentElement: { tagName: 'PRE', dataset: {}, className: '', getAttribute() { return ''; } },
+  classList: {
+    add(value) { codeClasses.add(value); },
+    remove(value) { codeClasses.delete(value); },
+    contains(value) { return codeClasses.has(value); },
+  },
+  getAttribute() { return ''; },
+  set innerHTML(value) { this._innerHTML = value; codeHtmlWrites++; },
+  get innerHTML() { return this._innerHTML || ''; },
+};
+assert(api.highlightCodeBlock(codeBlock) === 'highlighted', 'initial code content should be highlighted');
+codeBlock.textContent = originalCodeText.slice(0, 100) + 'c' + originalCodeText.slice(101);
+api.markCodeBlockDirty(codeBlock);
+assert(api.highlightCodeBlock(codeBlock) !== 'unchanged' && codeHtmlWrites === 1,
+  'dirty equal-length code updates should not be skipped by the bounded fingerprint');
+assert(api.rootNearViewport({
+  isConnected: true,
+  getBoundingClientRect: () => ({ top: 0, bottom: 100 }),
+}), 'visible rich-content roots should be eligible for enhancement');
+assert(!api.rootNearViewport({
+  isConnected: true,
+  getBoundingClientRect: () => ({ top: 5000, bottom: 5200 }),
+}), 'far-offscreen rich-content roots should wait for visibility');
+const timingDiagnostics = api.diagnosticsSnapshot().features;
+assert(Object.values(timingDiagnostics).every((item) => (
+  'totalMs' in item && 'maxMs' in item && 'lastMs' in item && 'lastRoots' in item
+)), 'feature diagnostics should expose timing and root counts');
 assert(api.isDimensionLatexFormula('256{\\times}256{\\times}128'), 'TeX dimension formula should be recognized');
 assert(api.isDimensionLatexFormula('64×64×32'), 'Unicode dimension formula should be recognized');
 assert(api.isDimensionLatexFormula('\\64{\\times}64{\\times}32'), 'stray-backslash dimension formula should be recognized');

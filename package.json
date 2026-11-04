@@ -2,7 +2,7 @@
   "name": "claude-code-enhance",
   "displayName": "Claude Code Enhance",
   "description": "Improves Claude Code rich rendering and exposes complete sub-agent transcripts in VS Code.",
-  "version": "1.0.8",
+  "version": "1.0.9",
   "publisher": "AlexisHe",
   "license": "MIT",
   "repository": {
@@ -148,7 +148,7 @@
         },
         "claudeCodeEnhance.mathScale": {
           "type": "number",
-          "default": 1.0,
+          "default": 1,
           "minimum": 0.8,
           "maximum": 1.6,
           "description": "Additional scale applied to inline and display mathematics."
@@ -182,18 +182,29 @@
     }
   },
   "scripts": {
-    "test": "node scripts/smoke-test.js && node scripts/rich-content-regression.js && node scripts/architecture-regression.js && node scripts/subagent-regression.js",
+    "test": "node scripts/smoke-test.js && node scripts/rich-content-regression.js && node scripts/architecture-regression.js && node scripts/claude-fixture-regression.js && node scripts/subagent-regression.js",
     "test:smoke": "node scripts/smoke-test.js",
     "test:rich": "node scripts/rich-content-regression.js",
     "test:architecture": "node scripts/architecture-regression.js",
+    "test:fixtures": "node scripts/claude-fixture-regression.js",
     "test:subagents": "node scripts/subagent-regression.js",
+    "test:browser": "node scripts/subagent-browser-regression.js",
     "test:history": "node scripts/history-regression.js",
-    "package": "npx --yes @vscode/vsce package --no-dependencies --allow-missing-repository",
+    "package": "vsce package --no-dependencies --allow-missing-repository",
     "restore": "node ./uninstall-hook.js",
     "vscode:uninstall": "node ./uninstall-hook.js"
   },
   "extensionDependencies": [
     "anthropic.claude-code"
   ],
-  "author": ""
+  "author": "",
+  "devDependencies": {
+    "@playwright/test": "1.64.1",
+    "@vscode/vsce": "4.1.0"
+  },
+  "overrides": {
+    "@vscode/vsce": {
+      "minimatch": "11.0.1"
+    }
+  }
 }

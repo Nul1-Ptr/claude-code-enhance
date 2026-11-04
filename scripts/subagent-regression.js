@@ -7,7 +7,9 @@ const {
   contentBlocks,
   defaultProjectsRoot,
   findSubagentFiles,
+  findSubagentFilesAsync,
   readSubagentTranscript,
+  streamSubagentTranscript,
   transcriptStatus,
   updateSubagentTranscript,
 } = require('../lib/subagent-transcripts');
@@ -164,6 +166,156 @@ function testFixtureParsing() {
   assert(findSubagentFiles(root).length === 2, 'unscoped discovery should continue to scan every project');
 }
 
+async function testStreamingAndAsyncDiscovery() {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-subagent-streaming-'));
+  const projectId = '-tmp-streaming-project';
+  const sessionId = '99999999-8888-7777-6666-555555555555';
+  const project = path.join(root, projectId);
+  const subagents = path.join(project, sessionId, 'subagents');
+  fs.mkdirSync(subagents, { recursive: true });
+  fs.writeFileSync(path.join(project, sessionId + '.jsonl'), jsonLine({
+    type: 'user',
+    cwd: '/tmp/streaming-project',
+    message: { role: 'user', content: 'Exercise streamed transcript reads.' },
+  }));
+
+  const filePath = path.join(subagents, 'agent-streaming.jsonl');
+  const completeRecords = Array.from({ length: 80 }, (_, index) => ({
+    type: index % 2 ? 'assistant' : 'user',
+    uuid: `stream-${index}`,
+    cwd: '/tmp/streaming-project',
+    attributionAgent: 'general-purpose',
+    message: {
+      role: index % 2 ? 'assistant' : 'user',
+      content: `streamed message ${index}: ${'payload '.repeat(120)}`,
+    },
+  }));
+  const partialRecord = {
+    type: 'assistant',
+    uuid: 'stream-partial',
+    attributionAgent: 'general-purpose',
+    message: { role: 'assistant', content: 'completed across cursor reads' },
+  };
+  const partialSource = JSON.stringify(partialRecord);
+  const partialOffset = Math.floor(partialSource.length * 0.6);
+  fs.writeFileSync(
+    filePath,
+    completeRecords.map(jsonLine).join('') + partialSource.slice(0, partialOffset)
+  );
+
+  const synchronous = findSubagentFiles(root);
+  const asynchronous = await findSubagentFilesAsync(root);
+  const comparable = (descriptor) => ({
+    filePath: descriptor.filePath,
+    projectId: descriptor.projectId,
+    sessionId: descriptor.sessionId,
+    agentId: descriptor.agentId,
+    agentType: descriptor.agentType,
+    label: descriptor.label,
+    status: descriptor.status,
+    size: descriptor.size,
+  });
+  assert(
+    JSON.stringify(asynchronous.map(comparable)) === JSON.stringify(synchronous.map(comparable)),
+    'async transcript discovery should match synchronous discovery'
+  );
+  assert(asynchronous.length === 1, 'async discovery should find the streaming fixture');
+
+  const firstChunks = [];
+  const firstEvents = [];
+  const first = await streamSubagentTranscript(asynchronous[0], {
+    chunkBytes: 16 * 1024,
+    batchSize: 7,
+    onStart(event) { firstEvents.push(['start', event.append]); },
+    onChunk(event) {
+      firstEvents.push(['chunk', event.append]);
+      firstChunks.push(event.messages);
+    },
+    onComplete(event) { firstEvents.push(['complete', event.append]); },
+  });
+  const firstMessages = firstChunks.flat();
+  assert(!first.append, 'the first streamed read should replace transcript data');
+  assert(firstChunks.length > 1, 'large transcripts should be emitted in multiple message batches');
+  assert(firstMessages.length === completeRecords.length, 'streaming should emit every complete JSONL message');
+  assert(
+    firstMessages[0].line === 1 && firstMessages.at(-1).line === completeRecords.length,
+    'streamed replacement messages should retain absolute JSONL line numbers'
+  );
+  assert(
+    first.transcript.partialLine && first.transcript.lines === completeRecords.length + 1,
+    'a final incomplete JSONL record should remain pending without becoming malformed'
+  );
+  assert(
+    first.cursor.completeLines === completeRecords.length && first.cursor.completeBytes < first.cursor.bytes,
+    'the stream cursor should stop before a partial final JSONL record'
+  );
+  assert(
+    firstEvents[0][0] === 'start' && firstEvents.at(-1)[0] === 'complete' &&
+      firstEvents.every(([, append]) => append === false),
+    'replacement stream callbacks should use a consistent protocol mode'
+  );
+
+  fs.appendFileSync(filePath, partialSource.slice(partialOffset) + '\n' + jsonLine({
+    type: 'assistant',
+    uuid: 'stream-appended',
+    attributionAgent: 'general-purpose',
+    message: { role: 'assistant', stop_reason: 'end_turn', content: 'appended after cursor' },
+  }));
+  const appendedChunks = [];
+  const second = await streamSubagentTranscript(asynchronous[0], {
+    cursor: first.cursor,
+    chunkBytes: 16 * 1024,
+    batchSize: 1,
+    onChunk(event) { appendedChunks.push(event.messages); },
+  });
+  const appendedMessages = appendedChunks.flat();
+  assert(second.append, 'a growing file with the same identity should use cursor-based append');
+  assert(
+    appendedChunks.length === 2 && appendedMessages.length === 2,
+    'cursor append should batch only newly completed messages'
+  );
+  assert(
+    appendedMessages[0].line === completeRecords.length + 1 &&
+      appendedMessages[1].line === completeRecords.length + 2,
+    'cursor append should preserve absolute line numbers across a completed partial record'
+  );
+  assert(
+    !second.transcript.partialLine && second.transcript.lines === completeRecords.length + 2,
+    'completing the final record should clear partial-line state'
+  );
+  assert(
+    second.transcript.messageCount === completeRecords.length + 2 &&
+      second.cursor.completeBytes === second.cursor.bytes,
+    'cursor metadata should include the complete replacement and append history'
+  );
+
+  const replacementRecord = {
+    type: 'assistant',
+    uuid: 'stream-rewritten',
+    attributionAgent: 'general-purpose',
+    message: {
+      role: 'assistant',
+      stop_reason: 'end_turn',
+      content: `rewritten in place ${'large payload '.repeat(30_000)}`,
+    },
+  };
+  fs.writeFileSync(filePath, jsonLine(replacementRecord));
+  const replacementChunks = [];
+  const rewritten = await streamSubagentTranscript(asynchronous[0], {
+    cursor: second.cursor,
+    chunkBytes: 16 * 1024,
+    batchSize: 1,
+    onChunk(event) { replacementChunks.push(event.messages); },
+  });
+  const replacementMessages = replacementChunks.flat();
+  assert(!rewritten.append,
+    'same-inode rewrites that invalidate the cursor tail should force a full replacement');
+  assert(replacementMessages.length === 1 && replacementMessages[0].id === 'stream-rewritten',
+    'a long JSONL record spanning many byte chunks should be emitted exactly once');
+  assert(rewritten.cursor.completeBytes === rewritten.cursor.bytes && !rewritten.transcript.partialLine,
+    'the rewritten long record should produce a complete validated cursor');
+}
+
 function testBlockExtractionAndStatus() {
   const blocks = contentBlocks([
     { type: 'text', text: 'answer' },
@@ -208,6 +360,52 @@ function testMarkdownArchitecture() {
   assert(!view.parseMarkdown(engine, 'Literal \\$x\\$ text.').includes('ce-math-source'), 'escaped delimiters should stay literal');
   assert(!view.parseMarkdown(engine, 'Literal \\$x$ text.').includes('ce-math-source'), 'escaped opening delimiters should stay literal');
   assert(view.wholeMathCandidate('$x_1$')?.formula === 'x_1', 'math-only inline code should be recoverable');
+}
+
+function testTranscriptVirtualization() {
+  const records = Array.from({ length: 10000 }, (_, index) => view.createMessageRecord({
+    id: `message-${index}`,
+    line: index + 1,
+    role: index % 2 ? 'assistant' : 'user',
+    agentType: index % 2 ? 'general-purpose' : null,
+    blocks: [{
+      kind: index % 5 === 0 ? 'tool-result' : 'text',
+      text: index === 7777 ? 'needle in the transcript' : `message body ${index}`,
+      isError: index === 9999,
+    }],
+  }, index));
+  assert(records[0].searchText === null, 'transcript search text should be built lazily');
+  assert(view.recordMatches(records[0], 'all', ''), 'empty searches should not need a text index');
+  assert(records[0].searchText === null, 'empty searches should not duplicate transcript text');
+  assert(view.recordMatches(records[7777], 'all', 'needle'), 'search should match source message data');
+  assert(records[7777].searchText?.includes('needle'), 'queried records should cache their search text');
+  assert(view.recordMatches(records[9999], 'errors', ''), 'error facets should be indexed without DOM inspection');
+
+  const heights = new Map([
+    [records[0].key, 100],
+    [records[1].key, 200],
+  ]);
+  const index = view.createHeightIndex(records, heights, 240);
+  assert(index.length === 10000, 'virtual height index should retain every transcript message');
+  assert(index.sum(0, 3) === 540, 'height sums should combine measured and estimated rows');
+  assert(index.indexAt(99) === 0 && index.indexAt(100) === 1,
+    'height lookup should locate the row containing the requested offset');
+  assert(index.update(5000, 480), 'measured rows should update their height block');
+  assert(index.sum(5000, 5001) === 480, 'updated row heights should affect spacer totals');
+  const appended = view.createMessageRecord({
+    id: 'message-10000',
+    line: 10001,
+    role: 'assistant',
+    blocks: [{ kind: 'text', text: 'appended' }],
+  }, 10000);
+  index.append(appended);
+  assert(index.length === 10001 && index.sum(10000, 10001) === 240,
+    'append-only transcripts should extend the height index without rebuilding prior blocks');
+  assert(view.VIRTUAL_WINDOW_MESSAGES === 60 && view.VIRTUAL_WINDOW_OVERSCAN === 12 &&
+      view.VIRTUAL_MAX_MESSAGES === 100,
+    'transcript DOM windows should remain bounded');
+  assert(view.MAX_HIGHLIGHT_LENGTH === 500 * 1024,
+    'sub-agent code highlighting should stop at the oversized-code limit');
 }
 
 function testSidebarHelpers() {
@@ -274,7 +472,10 @@ function testSidebarHelpers() {
   assert(html.includes('default-src &#39;none&#39;'), 'transcript webview should deny resources by default');
   assert(html.includes('nonce-'), 'transcript scripts should use a nonce');
   assert(html.includes('subagent-view.js'), 'transcript runtime should be loaded locally');
+  assert(html.includes('katex-woff2.min.css'), 'transcript webview should use WOFF2-only KaTeX CSS');
   assert(!html.includes('unsafe-eval'), 'transcript CSP should forbid eval');
+  assert(sidebar.MAX_HISTORY_WATCHERS === 128,
+    'history directory watchers should remain bounded for large project roots');
 }
 
 function testSidebarRegistration() {
@@ -370,10 +571,19 @@ function testRealHistory() {
   return { files: descriptors.length, messages, bytes };
 }
 
-testFixtureParsing();
-testBlockExtractionAndStatus();
-testMarkdownArchitecture();
-testSidebarHelpers();
-testSidebarRegistration();
-const history = testRealHistory();
-console.log(`sub-agent regression passed (${history.files} real files, ${history.messages} messages, ${Math.round(history.bytes / 1024 / 1024)} MB)`);
+async function main() {
+  testFixtureParsing();
+  await testStreamingAndAsyncDiscovery();
+  testBlockExtractionAndStatus();
+  testMarkdownArchitecture();
+  testTranscriptVirtualization();
+  testSidebarHelpers();
+  testSidebarRegistration();
+  const history = testRealHistory();
+  console.log(`sub-agent regression passed (${history.files} real files, ${history.messages} messages, ${Math.round(history.bytes / 1024 / 1024)} MB)`);
+}
+
+main().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});

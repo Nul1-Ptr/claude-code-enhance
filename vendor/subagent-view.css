@@ -172,6 +172,13 @@ a:focus-visible {
 
 .transcript {
   padding-bottom: 72px;
+  overflow-anchor: none;
+}
+
+.virtual-spacer {
+  width: 100%;
+  min-height: 0;
+  pointer-events: none;
 }
 
 .message {
@@ -179,8 +186,6 @@ a:focus-visible {
   padding: 18px 4px 20px;
   border-bottom: 1px solid var(--sav-border);
   overflow-wrap: anywhere;
-  content-visibility: auto;
-  contain-intrinsic-size: auto 240px;
 }
 
 .message-user {

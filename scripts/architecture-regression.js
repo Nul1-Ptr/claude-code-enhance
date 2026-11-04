@@ -3,6 +3,7 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const childProcess = require('child_process');
 const Module = require('module');
 const vm = require('vm');
 
@@ -39,7 +40,11 @@ const {
   parseBundle,
 } = require('../lib/bundle-transform');
 const virtualTurns = require('../vendor/virtual-turns');
-const { transactionalWriteFilesSync } = require('../lib/file-transaction');
+const {
+  acquireFileLockSync,
+  transactionalWriteFilesSync,
+  withFileLockSync,
+} = require('../lib/file-transaction');
 const { ALL_FEATURES, createIncrementalScheduler } = require('../vendor/runtime-core');
 const uninstall = require('../uninstall-hook');
 
@@ -114,7 +119,51 @@ function testStructuralTransforms() {
   const spreadWithRehype = 'function getOpts(p){return{remarkPlugins:[gfm]}}h(M,{...getOpts(p),rehypePlugins:k,components:{c}},v);';
   const spreadRehypeResult = transformClaudeBundle(spreadWithRehype, { fullTranscript: false });
   assert(spreadRehypeResult.ok, 'spread Markdown renderer with explicit rehypePlugins should transform');
-  assert(/\(k\)\.concat\([^)]*__rehypeKatex/.test(spreadRehypeResult.body), 'explicit rehypePlugins should be extended');
+  assert(spreadRehypeResult.body.includes('rehypePlugins:(_s?.rehypePlugins||[]).concat'),
+    'spread props should extend the final rehypePlugins value');
+
+  const uniqueMultiSpread = `
+    const base={remarkPlugins:[gfm]};
+    h(M,{...base,...dynamic(),components:{code:C,pre:P}},v);
+  `;
+  const uniqueMultiSpreadResult = transformClaudeBundle(uniqueMultiSpread, { fullTranscript: false });
+  assert(uniqueMultiSpreadResult.ok,
+    'multiple spreads should transform when exactly one source is statically linked to remarkPlugins');
+  assert(uniqueMultiSpreadResult.body.includes('((_s)=>({..._s,remarkPlugins:'),
+    'multiple spreads should enhance the final merged props object');
+
+  const unknownMultiSpread = 'h(M,{...base,...dynamic(),components:{code:C,pre:P}},v);';
+  const unknownMultiSpreadResult = transformClaudeBundle(unknownMultiSpread, { fullTranscript: false });
+  assert(!unknownMultiSpreadResult.ok && unknownMultiSpreadResult.reason === 'markdown-renderer-not-found',
+    'multiple spreads without a unique remarkPlugins source should fail closed');
+
+  const ambiguousMultiSpread = `
+    const base={remarkPlugins:[gfm]};
+    const extra={remarkPlugins:[other]};
+    h(M,{...base,...extra,components:{code:C,pre:P}},v);
+  `;
+  const ambiguousMultiSpreadResult = transformClaudeBundle(ambiguousMultiSpread, { fullTranscript: false });
+  assert(!ambiguousMultiSpreadResult.ok && ambiguousMultiSpreadResult.reason === 'markdown-renderer-not-found',
+    'multiple statically linked remarkPlugin spreads should fail closed');
+
+  const textualRemarkSpread = `
+    const base={description:"remarkPlugins are configured elsewhere"};
+    h(M,{...base,...dynamic(),components:{code:C,pre:P}},v);
+  `;
+  const textualRemarkSpreadResult = transformClaudeBundle(textualRemarkSpread, { fullTranscript: false });
+  assert(!textualRemarkSpreadResult.ok && textualRemarkSpreadResult.reason === 'markdown-renderer-not-found',
+    'remarkPlugins text should not be mistaken for a structured spread property');
+
+  const explicitRemarkAfterSpread = `
+    const base={rehypePlugins:[existing]};
+    h(M,{...base,remarkPlugins:[gfm],components:{code:C,pre:P}},v);
+  `;
+  const explicitRemarkAfterSpreadResult = transformClaudeBundle(explicitRemarkAfterSpread, {
+    fullTranscript: false,
+  });
+  assert(explicitRemarkAfterSpreadResult.ok &&
+      explicitRemarkAfterSpreadResult.body.includes('((_s)=>({..._s,remarkPlugins:'),
+    'explicit plugins combined with spreads should enhance the final merged props object');
 
   const ambiguousSpread = `${spreadSource}\nh(M,{...getOpts(p),components:{c}},v);`;
   const ambiguousSpreadRes = transformClaudeBundle(ambiguousSpread);
@@ -433,6 +482,7 @@ function testVirtualTurnRuntime() {
     sumHeights,
     syncHeightIndex,
     canExtendHeightIndex,
+    auditHeightIndex,
     sessionKey,
     annotateTurn,
     measuredTurnHeight,
@@ -499,6 +549,14 @@ function testVirtualTurnRuntime() {
   activeReplacementTurns[activeReplacementIndex] = { key: 'active-turn-replacement' };
   assert(syncHeightIndex(store, activeReplacementTurns),
     'bounded key validation should detect replacements inside the active window');
+  const historicalReplacementTurns = activeReplacementTurns.slice();
+  historicalReplacementTurns[40] = { key: 'historical-turn-replacement' };
+  assert(!syncHeightIndex(store, historicalReplacementTurns),
+    'same-length source-array changes should stay bounded on the synchronous render path');
+  assert(auditHeightIndex(store, historicalReplacementTurns),
+    'the idle consistency audit should detect replacements outside the active window');
+  assert(store.heightKeys[40] === 'historical-turn-replacement',
+    'historical replacements should rebuild the corresponding height-index entry');
 
   const largeAppendStore = createStore('large-append');
   reconcile(largeAppendStore, 10000, false);
@@ -524,6 +582,22 @@ function testVirtualTurnRuntime() {
     'appending one turn must not rescan every historical turn key');
   assert(!Object.prototype.hasOwnProperty.call(largeAppendStore, 'heightSource'),
     'virtual stores should not retain the complete turn array');
+
+  let sameLengthKeyReads = 0;
+  const sameLengthTurns = appendedTurns.map((turn, index) => ({
+    get key() {
+      sameLengthKeyReads++;
+      return index === 4000 ? 'large-historical-replacement' : turn.key;
+    },
+  }));
+  assert(!syncHeightIndex(largeAppendStore, sameLengthTurns),
+    'same-length long arrays should defer historical consistency checks');
+  assert(sameLengthKeyReads < 200,
+    'same-length streaming updates must not synchronously rescan every historical turn key');
+  assert(auditHeightIndex(largeAppendStore, sameLengthTurns),
+    'the deferred audit should still repair a historical same-length replacement');
+  assert(largeAppendStore.heightKeys[4000] === 'large-historical-replacement',
+    'the deferred audit should update the historical key and spacer height entry');
 
   clearMeasurements(store);
   assert(store.heights.size === 0 && store.heightKeys.length === 0 && store.heightWindow.total === -1,
@@ -1243,6 +1317,53 @@ function testTransactions() {
   assert(fs.readFileSync(first, 'utf8') === 'first-original', 'partial commit should roll back first file');
   assert(fs.readFileSync(second, 'utf8') === 'second-original', 'partial commit should preserve second file');
   assert(!fs.readdirSync(temp).some((name) => name.endsWith('.tmp')), 'transaction should remove temporary files');
+
+  const lockPath = path.join(temp, 'patch.lock');
+  let reentrant = false;
+  withFileLockSync(lockPath, () => {
+    withFileLockSync(lockPath, () => { reentrant = true; });
+    const contention = childProcess.spawnSync(process.execPath, ['-e', `
+      const { withFileLockSync } = require(${JSON.stringify(path.join(projectRoot, 'lib', 'file-transaction.js'))});
+      try {
+        withFileLockSync(${JSON.stringify(lockPath)}, () => {}, { timeoutMs: 50 });
+        process.exit(0);
+      } catch (error) {
+        process.exit(error.code === 'CLAUDE_ENHANCE_LOCK_TIMEOUT' ? 23 : 24);
+      }
+    `]);
+    assert(contention.status === 23, 'a second process should not enter a live patch lock');
+  });
+  assert(reentrant && !fs.existsSync(lockPath), 'same-process patch locks should be reentrant and cleanly released');
+
+  fs.writeFileSync(lockPath, JSON.stringify({
+    pid: 99999999,
+    hostname: os.hostname(),
+    createdAt: new Date(Date.now() - 60_000).toISOString(),
+  }));
+  const releaseRecovered = acquireFileLockSync(lockPath, { timeoutMs: 100, staleMs: 1000 });
+  releaseRecovered();
+  assert(!fs.existsSync(lockPath), 'stale patch locks should be recovered atomically');
+
+  const failedLockPath = path.join(temp, 'failed.lock');
+  const originalFsync = fs.fsyncSync;
+  let failLockSync = true;
+  fs.fsyncSync = function failInitialLockSync(descriptor) {
+    if (failLockSync) {
+      failLockSync = false;
+      throw new Error('injected lock initialization failure');
+    }
+    return originalFsync.call(fs, descriptor);
+  };
+  try {
+    acquireFileLockSync(failedLockPath);
+    throw new Error('lock initialization failure did not propagate');
+  } catch (error) {
+    assert(error.message.includes('injected lock initialization failure'),
+      'expected injected lock initialization failure');
+  } finally {
+    fs.fsyncSync = originalFsync;
+  }
+  assert(!fs.existsSync(failedLockPath), 'failed lock initialization should remove the orphan lock file');
 }
 
 function createClaudeFixture(version = '9.9.9') {
@@ -1260,8 +1381,20 @@ function createClaudeFixture(version = '9.9.9') {
 
 function testConfigurationAndBackups() {
   const fixture = createClaudeFixture();
+  const nativeFonts = path.join(fixture, 'webview', 'fonts');
+  fs.mkdirSync(nativeFonts);
+  fs.writeFileSync(path.join(nativeFonts, 'native.woff2'), 'native-font');
   const firstOptions = { runtimeConfig: { fullTranscript: false, contentScale: 1 } };
   assert(extension.applyPatch(fixture, path.join(projectRoot, 'vendor'), firstOptions), 'fixture should patch');
+  assert(fs.existsSync(path.join(fixture, 'webview', 'claude-enhance-fonts', 'KaTeX_Main-Regular.woff2')),
+    'patch fonts should be copied into the extension-owned directory');
+  const patchedCss = fs.readFileSync(path.join(fixture, 'webview', 'index.css'), 'utf8');
+  assert(patchedCss.includes('claude-enhance-fonts/KaTeX_Main-Regular.woff2'),
+    'patched CSS should reference the extension-owned WOFF2 font directory');
+  assert(!patchedCss.includes('format("woff")') && !patchedCss.includes('format("truetype")'),
+    'patched CSS should not reference legacy font formats');
+  assert(fs.readFileSync(path.join(nativeFonts, 'native.woff2'), 'utf8') === 'native-font',
+    'patching should leave Claude Code native fonts untouched');
   let patched = fs.readFileSync(path.join(fixture, 'webview', 'index.js'), 'utf8');
   assert(!patched.includes(extension.FULL_TRANSCRIPT_MARKER), 'fullTranscript=false should preserve retention in patched fixture');
   assert(patched.includes(extension.VIRTUAL_TURNS_RUNTIME_MARKER),
@@ -1365,6 +1498,19 @@ function testConfigurationAndBackups() {
   assert(!extension.canRestoreOriginals(mismatchFixture), 'backup hash mismatch should block restore');
   assert(extension.removePatch(mismatchFixture) === false, 'invalid backup should not be restored');
 
+  const legacyFixture = createClaudeFixture('8.8.9');
+  const legacyPaths = extension.patchPaths(legacyFixture);
+  fs.copyFileSync(legacyPaths.jsPath, legacyPaths.jsBackup);
+  fs.copyFileSync(legacyPaths.cssPath, legacyPaths.cssBackup);
+  assert(!extension.canRestoreOriginals(legacyFixture), 'legacy backups without metadata should fail closed');
+  extension.ensureBackupFiles(
+    legacyFixture,
+    fs.readFileSync(legacyPaths.jsPath),
+    fs.readFileSync(legacyPaths.cssPath)
+  );
+  assert(extension.canRestoreOriginals(legacyFixture),
+    'matching legacy backups should be migrated only from a verified pristine webview');
+
   const partialFixture = createClaudeFixture('7.7.7');
   assert(extension.applyPatch(partialFixture, path.join(projectRoot, 'vendor')), 'partial fixture should patch');
   fs.copyFileSync(
@@ -1374,6 +1520,27 @@ function testConfigurationAndBackups() {
   assert(extension.getPatchState(partialFixture) === 'partial', 'one-sided patch should be detected');
   assert(extension.ensurePatched(partialFixture, path.join(projectRoot, 'vendor')) === 'refreshed', 'verified partial patch should recover');
   assert(extension.getPatchState(partialFixture) === 'patched', 'partial recovery should restore both patch files');
+
+  const partialUpdateFixture = createClaudeFixture('7.7.8');
+  assert(extension.applyPatch(partialUpdateFixture, path.join(projectRoot, 'vendor')),
+    'partial update fixture should patch');
+  fs.writeFileSync(
+    path.join(partialUpdateFixture, 'webview', 'index.css'),
+    '/* same-version replacement css */'
+  );
+  assert(extension.getPatchState(partialUpdateFixture) === 'partial',
+    'one-sided Claude replacement should appear as a partial patch');
+  assert(!extension.partialPatchMatchesBackups(partialUpdateFixture),
+    'partial recovery should reject an unpatched side that no longer matches the verified backup');
+  assert(extension.ensurePatched(partialUpdateFixture, path.join(projectRoot, 'vendor')) === 'skipped',
+    'one-sided Claude updates should fail closed instead of restoring an older bundle');
+  assert(extension.removePatch(partialUpdateFixture) === false,
+    'direct disable should also reject a one-sided Claude update');
+  assert(
+    fs.readFileSync(path.join(partialUpdateFixture, 'webview', 'index.css'), 'utf8') ===
+      '/* same-version replacement css */',
+    'failed partial recovery should preserve the newly installed file'
+  );
 
   const updateFixture = createClaudeFixture('6.6.6');
   assert(extension.applyPatch(updateFixture, path.join(projectRoot, 'vendor')), 'update fixture should patch');
@@ -1388,6 +1555,53 @@ function testConfigurationAndBackups() {
     fs.readFileSync(path.join(updateFixture, 'webview', 'index.js.katex-bak'), 'utf8').includes('updated Claude bundle'),
     'rotated JavaScript backup should match updated Claude bundle'
   );
+
+  const sameVersionFixture = createClaudeFixture('6.6.8');
+  assert(extension.applyPatch(sameVersionFixture, path.join(projectRoot, 'vendor')),
+    'same-version update fixture should patch');
+  assert(extension.removePatch(sameVersionFixture), 'same-version update fixture should restore');
+  fs.appendFileSync(path.join(sameVersionFixture, 'webview', 'index.js'), '\n/* same-version repack */');
+  fs.writeFileSync(path.join(sameVersionFixture, 'webview', 'index.css'), '/* same-version pristine css */');
+  assert(extension.applyPatch(sameVersionFixture, path.join(projectRoot, 'vendor')),
+    'same Claude version with changed bundle content should patch');
+  assert(
+    fs.readFileSync(path.join(sameVersionFixture, 'webview', 'index.js.katex-bak'), 'utf8').includes('same-version repack'),
+    'same-version bundle changes should rotate the pristine backup by content hash'
+  );
+
+  assert(extension.removePatch(fixture), 'fixture should restore after configuration checks');
+  assert(fs.existsSync(path.join(nativeFonts, 'native.woff2')),
+    'removing the patch should preserve Claude Code native fonts');
+  assert(!fs.existsSync(path.join(fixture, 'webview', 'claude-enhance-fonts')),
+    'removing the patch should delete only extension-owned fonts');
+  const disabledUninstall = uninstall.restoreClaudeCode(fixture);
+  assert(disabledUninstall.restored,
+    'uninstall should consume verified backups after the patch was already disabled');
+  assert(!fs.existsSync(path.join(fixture, 'webview', 'index.js.katex-bak')),
+    'disabled uninstall should remove the verified backup after confirming current files');
+
+  const fontFailureFixture = createClaudeFixture('6.6.9');
+  const originalCopyFile = fs.copyFileSync;
+  let injectedFontFailure = false;
+  fs.copyFileSync = function failFontCopy(source, target) {
+    if (!injectedFontFailure && String(target).includes('claude-enhance-fonts')) {
+      injectedFontFailure = true;
+      throw new Error('injected font copy failure');
+    }
+    return originalCopyFile.call(fs, source, target);
+  };
+  try {
+    extension.applyPatch(fontFailureFixture, path.join(projectRoot, 'vendor'));
+    throw new Error('font copy failure did not propagate');
+  } catch (error) {
+    assert(error.message.includes('injected font copy failure'), 'expected injected font copy failure');
+  } finally {
+    fs.copyFileSync = originalCopyFile;
+  }
+  assert(extension.getPatchState(fontFailureFixture) === 'unpatched',
+    'font copy failure should leave Claude Code webview files pristine');
+  assert(!fs.existsSync(path.join(fontFailureFixture, 'webview', 'claude-enhance-fonts')),
+    'font copy failure should remove partial extension-owned assets');
 }
 
 function testUninstallRestore() {
@@ -1401,12 +1615,44 @@ function testUninstallRestore() {
   assert(fs.readFileSync(path.join(fixture, 'webview', 'index.css'), 'utf8') === pristineCss, 'uninstall should restore CSS');
   assert(!fs.existsSync(path.join(fixture, 'webview', 'index.js.katex-bak')), 'uninstall should remove consumed backups');
 
+  const legacy = createClaudeFixture('5.5.7');
+  const legacyWebview = path.join(legacy, 'webview');
+  fs.copyFileSync(path.join(legacyWebview, 'index.js'), path.join(legacyWebview, 'index.js.katex-bak'));
+  fs.copyFileSync(path.join(legacyWebview, 'index.css'), path.join(legacyWebview, 'index.css.katex-bak'));
+  const legacySkipped = uninstall.restoreClaudeCode(legacy);
+  assert(!legacySkipped.restored && legacySkipped.reason === 'backup-verification-failed',
+    'uninstall should fail closed for legacy backups without metadata');
+
   const tampered = createClaudeFixture('5.5.6');
   assert(extension.applyPatch(tampered, path.join(projectRoot, 'vendor')), 'tampered uninstall fixture should patch');
   fs.appendFileSync(path.join(tampered, 'webview', 'index.css.katex-bak'), '\n/* tampered */');
   const skipped = uninstall.restoreClaudeCode(tampered);
   assert(!skipped.restored && skipped.reason === 'backup-verification-failed', 'uninstall should reject tampered backups');
   assert(extension.getPatchState(tampered) === 'patched', 'rejected uninstall should leave the working patch intact');
+
+  const partialUpdate = createClaudeFixture('5.5.9');
+  assert(extension.applyPatch(partialUpdate, path.join(projectRoot, 'vendor')),
+    'uninstall partial-update fixture should patch');
+  fs.writeFileSync(path.join(partialUpdate, 'webview', 'index.css'), '/* newer Claude CSS */');
+  const partialSkipped = uninstall.restoreClaudeCode(partialUpdate);
+  assert(!partialSkipped.restored && partialSkipped.reason === 'current-files-changed',
+    'uninstall should reject a partial state whose unpatched side changed');
+  assert(fs.readFileSync(path.join(partialUpdate, 'webview', 'index.css'), 'utf8') ===
+      '/* newer Claude CSS */',
+    'rejected uninstall should preserve the newer Claude file');
+
+  const unpatched = createClaudeFixture('5.5.8');
+  fs.mkdirSync(path.join(unpatched, 'webview', 'claude-enhance-fonts'));
+  fs.writeFileSync(path.join(unpatched, 'webview', 'claude-enhance-fonts', 'stale.woff2'), 'stale');
+  const allResults = uninstall.restoreAllClaudeCode([
+    path.join(unpatched, 'missing-install'),
+    unpatched,
+  ]);
+  assert(allResults.length === 2 && allResults[0].reason === 'backup-verification-failed' &&
+      allResults[1].reason === 'not-patched',
+    'multi-install uninstall should isolate failures and continue through unpatched installations');
+  assert(!fs.existsSync(path.join(unpatched, 'webview', 'claude-enhance-fonts')),
+    'uninstall should clean stale extension-owned fonts from an unpatched installation');
 
   const versions = [
     { parts: uninstall.versionParts('2.1.99'), mtimeMs: 3 },

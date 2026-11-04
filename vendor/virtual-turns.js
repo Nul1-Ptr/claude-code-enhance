@@ -38,6 +38,22 @@
     }
   }
 
+  function scheduleIdle(callback) {
+    if (typeof requestIdleCallback === 'function') {
+      return { kind: 'idle', handle: requestIdleCallback(callback, { timeout: 250 }) };
+    }
+    return { kind: 'timeout', handle: setTimeout(callback, 250) };
+  }
+
+  function cancelIdle(scheduled) {
+    if (!scheduled) return;
+    if (scheduled.kind === 'idle' && typeof cancelIdleCallback === 'function') {
+      cancelIdleCallback(scheduled.handle);
+    } else {
+      clearTimeout(scheduled.handle);
+    }
+  }
+
   function clamp(value, minimum, maximum) {
     return Math.max(minimum, Math.min(maximum, value));
   }
@@ -94,6 +110,8 @@
       heightDirtyFrom: 0,
       heightSourceFirstKey: null,
       heightSourceLastKey: null,
+      heightAudit: null,
+      heightAuditGeneration: 0,
       topHeight: 0,
       bottomHeight: 0,
       heightWindow: {
@@ -133,6 +151,9 @@
       store.afterScheduled = false;
       store.scrollScheduled = false;
       store.measurementScheduled = false;
+      cancelIdle(store.heightAudit);
+      store.heightAudit = null;
+      store.heightAuditGeneration++;
     }
   }
 
@@ -178,6 +199,9 @@
     store.heightDirtyFrom = 0;
     store.heightSourceFirstKey = null;
     store.heightSourceLastKey = null;
+    cancelIdle(store.heightAudit);
+    store.heightAudit = null;
+    store.heightAuditGeneration++;
     store.topHeight = 0;
     store.bottomHeight = 0;
     store.heightWindow = { start: -1, end: -1, tailStart: -1, total: -1 };
@@ -281,6 +305,14 @@
     return true;
   }
 
+  function allHeightKeysMatch(store, turns, limit = store.heightKeys.length) {
+    if (turns.length < limit) return false;
+    for (let index = 0; index < limit; index++) {
+      if (store.heightKeys[index] !== turnKey(turns[index], index)) return false;
+    }
+    return true;
+  }
+
   function canExtendHeightIndex(store, turns) {
     const previousLength = store.heightKeys.length;
     if (turns.length <= previousLength) return false;
@@ -303,14 +335,40 @@
     return heightKeysMatchAtIndices(store, turns, indices, previousLength);
   }
 
-  function syncHeightIndex(store, turns, beforeChange) {
+  function auditHeightIndex(store, turns, beforeChange) {
+    if (store.disposed || store.heightKeys.length !== turns.length) return false;
+    if (allHeightKeysMatch(store, turns)) return false;
+    return syncHeightIndex(store, turns, beforeChange, { forceFull: true, skipAudit: true });
+  }
+
+  function scheduleHeightAudit(store, turns) {
+    if (store.disposed || !turns.length) return;
+    cancelIdle(store.heightAudit);
+    const generation = ++store.heightAuditGeneration;
+    const weakTurns = typeof WeakRef === 'function' ? new WeakRef(turns) : null;
+    store.heightAudit = scheduleIdle(() => {
+      store.heightAudit = null;
+      if (store.disposed || generation !== store.heightAuditGeneration) return;
+      const currentTurns = weakTurns ? weakTurns.deref() : turns;
+      if (!currentTurns) return;
+      const changed = auditHeightIndex(store, currentTurns, () => {
+        if (!store.atBottom && !store.pendingScroll && store.container) setAnchorPending(store);
+      });
+      if (changed) requestForce(store);
+    });
+  }
+
+  function syncHeightIndex(store, turns, beforeChange, options = {}) {
     const length = turns.length;
     const previousKeys = store.heightKeys;
     const firstKey = length > 0 ? turnKey(turns[0], 0) : null;
     const lastKey = length > 0 ? turnKey(turns[length - 1], length - 1) : null;
-
-    if (activeHeightKeysMatch(store, turns, firstKey, lastKey)) {
+    const activeKeysMatch = activeHeightKeysMatch(store, turns, firstKey, lastKey);
+    const verifiedKeysMatch = activeKeysMatch &&
+      (!options.forceFull || allHeightKeysMatch(store, turns));
+    if (verifiedKeysMatch) {
       rebuildHeightPrefix(store);
+      if (!options.skipAudit) scheduleHeightAudit(store, turns);
       return false;
     }
 
@@ -328,6 +386,7 @@
       rebuildHeightPrefix(store);
       store.heightSourceFirstKey = firstKey;
       store.heightSourceLastKey = lastKey;
+      if (!options.skipAudit) scheduleHeightAudit(store, turns);
       return true;
     }
 
@@ -367,6 +426,7 @@
     rebuildHeightPrefix(store);
     store.heightSourceFirstKey = firstKey;
     store.heightSourceLastKey = lastKey;
+    if (!options.skipAudit) scheduleHeightAudit(store, turns);
     return keysChanged;
   }
 
@@ -1111,6 +1171,9 @@
     store.afterScheduled = false;
     store.scrollScheduled = false;
     store.measurementScheduled = false;
+    cancelIdle(store.heightAudit);
+    store.heightAudit = null;
+    store.heightAuditGeneration++;
   }
 
   function Component(options = {}) {
@@ -1201,7 +1264,9 @@
       createNode,
       activeHeightKeysMatch,
       heightKeysMatchAtIndices,
+      allHeightKeysMatch,
       canExtendHeightIndex,
+      auditHeightIndex,
       syncHeightIndex,
       rebuildHeightPrefix,
       measuredTurnHeight,

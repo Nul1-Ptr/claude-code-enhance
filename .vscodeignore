@@ -6,4 +6,8 @@ node_modules/**
 .claude/**
 .codex/**
 scripts/**
+package-lock.json
+vendor/katex.min.css
+vendor/fonts/*.ttf
+vendor/fonts/*.woff
 *.vsix
