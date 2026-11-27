@@ -99,6 +99,114 @@ a:focus-visible {
   min-height: 34px;
 }
 
+#filter-group[hidden],
+#latest[hidden],
+#conversation-pagination[hidden],
+#conversation-search-results[hidden] {
+  display: none !important;
+}
+
+.conversation-pagination {
+  position: sticky;
+  z-index: 15;
+  top: 52px;
+  display: flex;
+  align-items: center;
+  justify-content: safe center;
+  gap: 8px;
+  overflow-x: auto;
+  white-space: nowrap;
+  min-height: 42px;
+  padding: 5px 14px;
+  border-bottom: 1px solid var(--sav-border);
+  background: var(--sav-bg);
+}
+
+.conversation-pagination > * {
+  flex-shrink: 0;
+}
+
+#conversation-jump {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+}
+
+#conversation-page-input {
+  width: 5em;
+  min-height: 30px;
+  padding: 3px 6px;
+  color: var(--vscode-input-foreground, var(--sav-fg));
+  background: var(--vscode-input-background, var(--sav-subtle));
+  border: 1px solid var(--sav-border);
+  border-radius: 4px;
+}
+
+.conversation-pagination button,
+.conversation-search-heading button {
+  min-height: 30px;
+  padding: 3px 10px;
+}
+
+.conversation-pagination span {
+  min-width: 180px;
+  color: var(--sav-muted);
+  text-align: center;
+  font-size: 12px;
+}
+
+.conversation-search-results {
+  position: sticky;
+  z-index: 14;
+  top: 94px;
+  max-height: 35vh;
+  overflow: auto;
+  border-bottom: 1px solid var(--sav-border);
+  background: var(--sav-panel);
+}
+
+.conversation-search-heading {
+  position: sticky;
+  top: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 38px;
+  padding: 4px 14px;
+  color: var(--sav-muted);
+  background: var(--sav-panel);
+}
+
+.conversation-search-list {
+  display: grid;
+  gap: 4px;
+  padding: 0 14px 10px;
+}
+
+.conversation-search-hit {
+  display: grid;
+  gap: 2px;
+  width: 100%;
+  padding: 6px 9px;
+  color: var(--sav-fg);
+  text-align: left;
+}
+
+.conversation-search-hit span {
+  overflow: hidden;
+  color: var(--sav-muted);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.message-raw-link {
+  margin-left: auto;
+  padding: 2px 7px;
+  font-size: 12px;
+}
+
 .filters button {
   min-height: 34px;
   padding: 4px 9px;
@@ -221,6 +329,18 @@ a:focus-visible {
 .markdown-content > :first-child,
 .detail-content > :first-child {
   margin-top: 0;
+}
+
+.large-message-source pre,
+.large-message-source pre code {
+  white-space: pre !important;
+  overflow-wrap: normal !important;
+  word-break: normal !important;
+}
+
+.large-message-source pre {
+  max-height: 60vh;
+  overflow: auto;
 }
 
 .markdown-content > :last-child,

@@ -3,6 +3,7 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const { workerPolicyRestoreEntries, cleanupWorkerPolicy } = require('./lib/worker-policy');
 const { validateBundleSyntax } = require('./lib/bundle-transform');
 const {
   readJsonFile,
@@ -95,6 +96,7 @@ function restorePaths(extDir) {
     cssBackup: path.join(webview, 'index.css.katex-bak'),
     metadata: path.join(webview, BACKUP_METADATA_FILE),
     fonts: path.join(webview, PATCH_FONTS_DIRECTORY),
+    worker: path.join(webview, 'claude-enhance-worker.js'),
     lock: path.join(webview, PATCH_LOCK_FILE),
   };
 }
@@ -140,22 +142,24 @@ function restoreClaudeCode(extDir) {
   if (!fs.existsSync(paths.webview)) {
     return { restored: false, reason: 'backup-verification-failed' };
   }
-  const hasJsBackup = fs.existsSync(paths.jsBackup);
-  const hasCssBackup = fs.existsSync(paths.cssBackup);
-  if (!hasJsBackup && !hasCssBackup) {
-    let patched = false;
-    try {
-      patched = fs.readFileSync(paths.js).includes(Buffer.from(PATCH_MARKER)) ||
-        fs.readFileSync(paths.css).includes(Buffer.from(PATCH_CSS_MARKER));
-    } catch {}
-    if (patched) return { restored: false, reason: 'backup-verification-failed' };
-    return withFileLockSync(paths.lock, () => {
+  return withFileLockSync(paths.lock, () => {
+    const policyRestore = workerPolicyRestoreEntries(extDir);
+    const hasJsBackup = fs.existsSync(paths.jsBackup);
+    const hasCssBackup = fs.existsSync(paths.cssBackup);
+    if (!hasJsBackup && !hasCssBackup) {
+      let patched = false;
+      try {
+        patched = fs.readFileSync(paths.js).includes(Buffer.from(PATCH_MARKER)) ||
+          fs.readFileSync(paths.css).includes(Buffer.from(PATCH_CSS_MARKER));
+      } catch {}
+      if (patched) return { restored: false, reason: 'backup-verification-failed' };
+      if (policyRestore.length) transactionalWriteFilesSync(policyRestore);
+      cleanupWorkerPolicy(extDir);
       fs.rmSync(paths.metadata, { force: true });
       fs.rmSync(paths.fonts, { recursive: true, force: true });
+      fs.rmSync(paths.worker, { force: true });
       return { restored: false, reason: 'not-patched' };
-    });
-  }
-  return withFileLockSync(paths.lock, () => {
+    }
     const backups = verifiedBackups(extDir, paths);
     if (!backups) return { restored: false, reason: 'backup-verification-failed' };
     if (!currentFilesAllowRestore(paths, backups)) {
@@ -165,6 +169,7 @@ function restoreClaudeCode(extDir) {
     transactionalWriteFilesSync([
       { path: paths.js, content: backups.js },
       { path: paths.css, content: backups.css },
+      ...policyRestore,
     ], (temporaryFiles) => {
       const js = fs.readFileSync(temporaryFiles.get(paths.js), 'utf8');
       const css = fs.readFileSync(temporaryFiles.get(paths.css), 'utf8');
@@ -178,6 +183,8 @@ function restoreClaudeCode(extDir) {
     fs.rmSync(paths.cssBackup, { force: true });
     fs.rmSync(paths.metadata, { force: true });
     if (fs.existsSync(paths.fonts)) fs.rmSync(paths.fonts, { recursive: true });
+    fs.rmSync(paths.worker, { force: true });
+    cleanupWorkerPolicy(extDir);
     return { restored: true, reason: 'restored' };
   });
 }

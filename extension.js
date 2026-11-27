@@ -1,4 +1,5 @@
-const vscode = require('vscode');
+const { isMainThread } = require('worker_threads');
+const vscode = isMainThread ? require('vscode') : null;
 const fs = require('fs');
 const path = require('path');
 const {
@@ -18,6 +19,7 @@ const {
   withFileLockSync,
 } = require('./lib/file-transaction');
 const { registerSubagentSidebar } = require('./lib/subagent-sidebar');
+const { readSharedSettings, migrateSharedSettings } = require('./lib/shared-config');
 
 const PATCH_MARKER = '/* === KaTeX LaTeX Rendering Patch === */';
 const PATCH_CSS_MARKER = '/* === KaTeX LaTeX Rendering CSS Patch === */';
@@ -31,7 +33,7 @@ const EXTENSION_VERSION = require('./package.json').version;
 const PATCH_VERSION_PREFIX = '/* katex-ext-version: ';
 // Internal patch revision. Changing this forces a refresh even when the
 // package version is unchanged.
-const PATCH_BUILD_ID = 'structural-transactional-incremental-runtime-2026-11-04.15';
+const PATCH_BUILD_ID = 'structural-transactional-incremental-runtime-2026-11-26.22';
 const PATCH_BUILD_PREFIX = '/* enhance-patch-build: ';
 const PATCH_CONFIG_PREFIX = '/* enhance-patch-config: ';
 const PATCH_RUNTIME_STATE_PREFIX = '/* enhance-runtime-state: ';
@@ -43,7 +45,7 @@ const PATCH_FONTS_DIRECTORY = 'claude-enhance-fonts';
 const PATCH_SCHEMA_VERSION = 2;
 
 const DEFAULT_RUNTIME_CONFIG = Object.freeze({
-  fullTranscript: true,
+  fullTranscript: false,
   virtualTurns: true,
   contentScale: 1.1,
   mathScale: 1.0,
@@ -82,19 +84,7 @@ function normalizePatchOptions(options = {}) {
 
 function readPatchOptions() {
   const config = vscode.workspace?.getConfiguration?.('claudeCodeEnhance');
-  const get = (key) => config?.get?.(key, DEFAULT_RUNTIME_CONFIG[key]) ?? DEFAULT_RUNTIME_CONFIG[key];
-  return normalizePatchOptions({
-    runtimeConfig: {
-      fullTranscript: get('fullTranscript'),
-      virtualTurns: get('virtualTurns'),
-      contentScale: get('contentScale'),
-      mathScale: get('mathScale'),
-      toolOutputMath: get('toolOutputMath'),
-      syntaxHighlighting: get('syntaxHighlighting'),
-      copyButtons: get('copyButtons'),
-      apiErrorCards: get('apiErrorCards'),
-    },
-  });
+  return normalizePatchOptions({ runtimeConfig: readSharedSettings(config, DEFAULT_RUNTIME_CONFIG) });
 }
 
 function patchConfigHash(options = {}) {
@@ -152,7 +142,7 @@ function fallbackReasonLabel(reason) {
 
 function historyStatusLabel(runtimeState) {
   if (!runtimeState) return 'History Unknown';
-  if (runtimeState.fullTranscript) return 'History Full';
+  if (runtimeState.fullTranscript) return 'History Full (performance may degrade on long sessions)';
   if (runtimeState.fullTranscriptRequested) {
     return `History Native (${fallbackReasonLabel(runtimeState.fullTranscriptFallbackReason)})`;
   }
@@ -456,6 +446,9 @@ function applyPatchUnlocked(extDir, vendorDir, options = {}) {
   };
   if (!transformed.ok) return false;
 
+  const workerPolicy = require('./lib/worker-policy').prepareWorkerPolicy(extDir);
+  lastPatchDiagnostics.workerPolicy = { supported: workerPolicy.supported, requiresReload: workerPolicy.changed };
+
   ensureBackupFiles(extDir, body, originalCss);
 
   // Copy KaTeX fonts into an extension-owned directory. Claude Code ships its
@@ -477,6 +470,16 @@ function applyPatchUnlocked(extDir, vendorDir, options = {}) {
   const highlightCore = fs.readFileSync(path.join(vendorDir, 'highlight.min.js'), 'utf8');
   const v2Bundle = fs.readFileSync(path.join(vendorDir, 'remark-math-bundle.js'), 'utf8');
   const runtimeCore = fs.readFileSync(path.join(vendorDir, 'runtime-core.js'), 'utf8');
+  const mathCore = fs.readFileSync(path.join(vendorDir, 'math-core.js'), 'utf8');
+  const richDocument = fs.readFileSync(path.join(vendorDir, 'rich-document.js'), 'utf8');
+  const richFragments = fs.readFileSync(path.join(vendorDir, 'rich-fragments.js'), 'utf8');
+  const richRows = fs.readFileSync(path.join(vendorDir, 'rich-rows.js'), 'utf8');
+  const markedCore = fs.readFileSync(path.join(vendorDir, 'marked.min.js'), 'utf8');
+  const transcriptCore = fs.readFileSync(path.join(vendorDir, 'subagent-view.js'), 'utf8');
+  const richContent = fs.readFileSync(path.join(vendorDir, 'rich-content.js'), 'utf8');
+  const richWorker = require('./lib/rich-content-assets').richWorkerSource(vendorDir);
+  const workerPath = path.join(paths.webviewDir, 'claude-enhance-worker.js');
+  const workerBase = transformed.diagnostics.sourceType === 'module' ? 'import.meta.url' : 'document.currentScript?.src';
   const virtualTurnsRuntime = transformed.diagnostics.virtualTurnsApplied
     ? fs.readFileSync(path.join(vendorDir, 'virtual-turns.js'), 'utf8')
     : '';
@@ -487,14 +490,20 @@ function applyPatchUnlocked(extDir, vendorDir, options = {}) {
     `${PATCH_CONFIG_PREFIX}${patchConfigHash(normalizedOptions)} */\n` +
     `${PATCH_RUNTIME_STATE_PREFIX}${JSON.stringify(runtimeState)} */\n` +
     `window.__CLAUDE_ENHANCE_CONFIG__=Object.freeze(${JSON.stringify(runtimeConfig)});\n` +
+    require('./lib/rich-content-assets').richWorkerConfiguration(vendorDir) + '\n' +
+    `window.__CLAUDE_ENHANCE_WORKER_URL__=(${workerBase})?new URL("claude-enhance-worker.js",${workerBase}).href:null;\n` +
+    `;(function(){\n` +
     `/* KaTeX Core - MIT License - https://katex.org */\n${katexCore}\n` +
+    `const katex=window.katex;\n` +
     `/* Highlight.js Core - BSD-3-Clause License - https://highlightjs.org */\n${highlightCore}\n` +
     `/* remark-math + rehype-katex pipeline */\n${v2Bundle}\n` +
     `/* Claude Code Enhance incremental runtime */\n${runtimeCore}\n` +
+    `;window.hljs=hljs;\n${mathCore}\n${markedCore}\n${transcriptCore}\n${richFragments}\n${richDocument}\n${richRows}\n${richContent}\n` +
     (virtualTurnsRuntime
       ? `/* Claude Code Enhance turn virtualization */\n${virtualTurnsRuntime}\n`
       : '') +
     `/* Claude Code output preview enhancer */\n${enhanceCode}\n` +
+    `}).call(window);\n` +
     `/* === End KaTeX/Enhance Patch — Claude Code bundle follows === */\n` +
     transformed.body;
 
@@ -516,6 +525,8 @@ function applyPatchUnlocked(extDir, vendorDir, options = {}) {
     transactionalWriteFilesSync([
       { path: paths.jsPath, content: patchedJs },
       { path: paths.cssPath, content: patchedCss },
+      { path: workerPath, content: richWorker },
+      ...workerPolicy.entries,
     ], (temporaryFiles) => {
       const temporaryJs = fs.readFileSync(temporaryFiles.get(paths.jsPath), 'utf8');
       const temporaryCss = fs.readFileSync(temporaryFiles.get(paths.cssPath), 'utf8');
@@ -532,6 +543,7 @@ function applyPatchUnlocked(extDir, vendorDir, options = {}) {
         throw new Error('Patched Claude Code CSS failed WOFF2-only verification.');
       }
       validateBundleSyntax(temporaryJs, temporaryFiles.get(paths.jsPath));
+      validateBundleSyntax(fs.readFileSync(temporaryFiles.get(workerPath), 'utf8'), temporaryFiles.get(workerPath));
     });
   } catch (error) {
     fs.rmSync(fontsTarget, { recursive: true, force: true });
@@ -552,9 +564,13 @@ function removePatchUnlocked(extDir) {
   if (patchState !== 'patched' && patchState !== 'partial') return false;
   if (!canRestoreOriginals(extDir)) return false;
 
+  const workerPolicy = require('./lib/worker-policy');
+  const policyRestore = workerPolicy.workerPolicyRestoreEntries(extDir);
+
   transactionalWriteFilesSync([
     { path: paths.jsPath, content: fs.readFileSync(paths.jsBackup) },
     { path: paths.cssPath, content: fs.readFileSync(paths.cssBackup) },
+    ...policyRestore,
   ], (temporaryFiles) => {
     const restoredJs = fs.readFileSync(temporaryFiles.get(paths.jsPath), 'utf8');
     const restoredCss = fs.readFileSync(temporaryFiles.get(paths.cssPath), 'utf8');
@@ -567,6 +583,9 @@ function removePatchUnlocked(extDir) {
   if (fs.existsSync(paths.fontsDir)) {
     fs.rmSync(paths.fontsDir, { recursive: true });
   }
+  fs.rmSync(path.join(paths.webviewDir, 'claude-enhance-worker.js'), { force: true });
+  workerPolicy.cleanupWorkerPolicy(extDir);
+  lastPatchDiagnostics = { workerPolicy: { requiresReload: policyRestore.length > 0 } };
   return true;
 }
 
@@ -641,6 +660,7 @@ function ensurePatched(extDir, vendorDir, options = {}) {
     if (patchState === 'unavailable') return 'unsupported';
     if (getPatchedVersion(extDir) === EXTENSION_VERSION &&
         getPatchedBuildId(extDir) === PATCH_BUILD_ID &&
+        fs.existsSync(path.join(extDir, 'webview', 'claude-enhance-worker.js')) &&
         getPatchedConfigHash(extDir) === patchConfigHash(normalizedOptions)) {
       return 'current';
     }
@@ -679,12 +699,19 @@ function reloadWebviewAndNotify(message, severity = 'information') {
 function fullTranscriptFallbackMessage(diagnostics = lastPatchDiagnostics) {
   const runtimeState = diagnostics?.runtimeState;
   if (!runtimeState?.fullTranscriptRequested || runtimeState.fullTranscript) return '';
-  return 'Full history was not enabled safely (' +
+  return 'Full history is not enabled (' +
     `${fallbackReasonLabel(runtimeState.fullTranscriptFallbackReason)}); ` +
-    "Claude Code's native history retention remains active.";
+    "Claude Code's native history retention remains active. Use Open Conversation History to browse the complete local transcript.";
 }
 
 function reloadPatchedWebviewAndNotify(message) {
+  if (lastPatchDiagnostics?.workerPolicy?.requiresReload) {
+    vscode.window.showInformationMessage(message + ' Reload the window to apply the local Worker policy change.', 'Reload Window')
+      .then((choice) => {
+        if (choice === 'Reload Window') vscode.commands.executeCommand('workbench.action.reloadWindow');
+      });
+    return;
+  }
   const fallbackMessage = fullTranscriptFallbackMessage();
   reloadWebviewAndNotify(
     fallbackMessage ? `${message} ${fallbackMessage}` : message,
@@ -743,8 +770,28 @@ function collectDiagnostics(extDir, options = readPatchOptions()) {
   };
 }
 
-function activate(context) {
+async function activate(context) {
   const vendorDir = path.join(context.extensionPath, 'vendor');
+  const { runPatchTask } = require('./lib/patch-tasks');
+  let patchStatus = null;
+  const executePatch = async (operation, extDir, options = readPatchOptions()) => {
+    const result = await runPatchTask({ operation, extDir, vendorDir, options });
+    if (result.diagnostics) lastPatchDiagnostics = result.diagnostics;
+    patchStatus = { extDir, ...result.status };
+    return result.value;
+  };
+  try {
+    const migration = await migrateSharedSettings(vscode, DEFAULT_RUNTIME_CONFIG);
+    if (migration.migrated.length) {
+      vscode.window.showInformationMessage('Claude Code Enhance moved existing rendering settings to User settings because the installed patch is shared by all workspaces.');
+    }
+    if (migration.conflicts.length) {
+      vscode.window.showWarningMessage(`Claude Code Enhance uses shared User settings. Conflicting workspace settings remain in your file but are inactive: ${migration.conflicts.join(', ')}.`);
+    }
+  } catch (error) {
+    vscode.window.showErrorMessage('Claude Code Enhance could not migrate rendering settings: ' + error.message);
+    return;
+  }
 
   try {
     registerSubagentSidebar(vscode, context);
@@ -757,7 +804,7 @@ function activate(context) {
   const extDir = findClaudeCodeExtDir();
   if (extDir) {
     try {
-      const result = ensurePatched(extDir, vendorDir, readPatchOptions());
+      const result = await executePatch('ensure', extDir);
       if (result === 'fresh') {
         reloadPatchedWebviewAndNotify('Claude Code Enhance enabled. The webview was reloaded; reload again if any math still looks unrendered.');
       } else if (result === 'refreshed') {
@@ -774,14 +821,14 @@ function activate(context) {
 
   // Enable command
   context.subscriptions.push(
-    vscode.commands.registerCommand('claude-code-enhance.enable', function() {
+    vscode.commands.registerCommand('claude-code-enhance.enable', async function() {
       const dir = findClaudeCodeExtDir();
       if (!dir) {
         vscode.window.showErrorMessage('Claude Code extension not found.');
         return;
       }
       try {
-        const result = ensurePatched(dir, vendorDir, readPatchOptions());
+        const result = await executePatch('ensure', dir);
         if (result === 'fresh' || result === 'refreshed') {
           reloadPatchedWebviewAndNotify('Claude Code Enhance enabled. The webview was reloaded; reload again if any math still looks unrendered.');
         } else if (result === 'current') {
@@ -801,19 +848,19 @@ function activate(context) {
 
   // Disable command
   context.subscriptions.push(
-    vscode.commands.registerCommand('claude-code-enhance.disable', function() {
+    vscode.commands.registerCommand('claude-code-enhance.disable', async function() {
       const dir = findClaudeCodeExtDir();
       if (!dir) {
         vscode.window.showErrorMessage('Claude Code extension not found.');
         return;
       }
-      if (getPatchState(dir) === 'unpatched') {
+      if (patchStatus?.extDir === dir && patchStatus.patchState === 'unpatched') {
         vscode.window.showInformationMessage('Claude Code Enhance is not active.');
         return;
       }
       try {
-        if (removePatch(dir)) {
-          reloadWebviewAndNotify('Claude Code Enhance disabled. The webview was reloaded.');
+        if (await executePatch('remove', dir)) {
+          reloadPatchedWebviewAndNotify('Claude Code Enhance disabled. Reload to apply the restored rendering files.');
         } else {
           vscode.window.showErrorMessage('Claude Code Enhance could not verify the original backups. No files were changed.');
         }
@@ -827,13 +874,13 @@ function activate(context) {
 
   // Status command
   context.subscriptions.push(
-    vscode.commands.registerCommand('claude-code-enhance.status', function() {
+    vscode.commands.registerCommand('claude-code-enhance.status', async function() {
       const dir = findClaudeCodeExtDir();
       if (!dir) {
         vscode.window.showInformationMessage('Claude Code extension not found.');
         return;
       }
-      const diagnostics = collectDiagnostics(dir);
+      const diagnostics = await executePatch('diagnostics', dir);
       const compatibility = diagnostics.compatibility?.supported ? 'Compatible' : 'Unsupported';
       const configuration = diagnostics.patchedConfigHash === diagnostics.expectedConfigHash ? 'Current' : 'Stale';
       const runtimeState = diagnostics.patched
@@ -849,8 +896,8 @@ function activate(context) {
   const diagnosticsChannel = vscode.window.createOutputChannel?.('Claude Code Enhance');
   if (diagnosticsChannel) context.subscriptions.push(diagnosticsChannel);
   context.subscriptions.push(
-    vscode.commands.registerCommand('claude-code-enhance.diagnostics', function() {
-      const diagnostics = collectDiagnostics(findClaudeCodeExtDir());
+    vscode.commands.registerCommand('claude-code-enhance.diagnostics', async function() {
+      const diagnostics = await executePatch('diagnostics', findClaudeCodeExtDir());
       const report = JSON.stringify(diagnostics, null, 2);
       if (diagnosticsChannel) {
         diagnosticsChannel.clear();
@@ -871,9 +918,9 @@ function activate(context) {
   statusBarItem.command = 'claude-code-enhance.status';
   function refreshStatusBar() {
     const dir = findClaudeCodeExtDir();
-    const patchState = dir ? getPatchState(dir) : 'unavailable';
+    const patchState = dir && patchStatus?.extDir === dir ? patchStatus.patchState : 'unavailable';
     if (patchState === 'patched') {
-      const runtimeState = getPatchedRuntimeState(dir);
+      const runtimeState = patchStatus.runtimeState;
       const historyStatus = historyStatusLabel(runtimeState);
       const fallback = runtimeState?.fullTranscriptRequested && !runtimeState.fullTranscript;
       statusBarItem.text = fallback ? '$(warning) LaTeX' : '$(symbol-operator) LaTeX';
@@ -896,11 +943,11 @@ function activate(context) {
   // Watch for Claude Code extension changes (updates). A Claude Code update
   // installs a fresh (unpatched) webview; this re-patches it.
   context.subscriptions.push(
-    vscode.extensions.onDidChange(function() {
+    vscode.extensions.onDidChange(async function() {
       const dir = findClaudeCodeExtDir();
       if (dir) {
         try {
-          const result = ensurePatched(dir, vendorDir, readPatchOptions());
+          const result = await executePatch('ensure', dir);
           if (result === 'fresh' || result === 'refreshed') {
             reloadPatchedWebviewAndNotify('Claude Code Enhance re-applied after a Claude Code update. The webview was reloaded; reload again if any math still looks unrendered.');
           } else if (result === 'unsupported') {
@@ -916,12 +963,12 @@ function activate(context) {
 
   if (vscode.workspace?.onDidChangeConfiguration) {
     context.subscriptions.push(
-      vscode.workspace.onDidChangeConfiguration(function(event) {
+      vscode.workspace.onDidChangeConfiguration(async function(event) {
         if (!event.affectsConfiguration('claudeCodeEnhance')) return;
         const dir = findClaudeCodeExtDir();
         if (!dir) return;
         try {
-          const result = ensurePatched(dir, vendorDir, readPatchOptions());
+          const result = await executePatch('ensure', dir);
           if (result === 'fresh' || result === 'refreshed') {
             reloadPatchedWebviewAndNotify('Claude Code Enhance settings updated. The webview was reloaded.');
           } else if (result === 'unsupported') {
@@ -943,6 +990,9 @@ function deactivate() {
 }
 
 module.exports = { activate, deactivate };
+module.exports.patchOperations = { ensurePatched, removePatch, collectDiagnostics,
+  status: (extDir) => ({ patchState: extDir ? getPatchState(extDir) : 'unavailable', runtimeState: extDir ? getPatchedRuntimeState(extDir) : null }),
+  diagnostics: () => lastPatchDiagnostics };
 
 // Exposed for testing only
 module.exports._test = {

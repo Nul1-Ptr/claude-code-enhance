@@ -558,6 +558,16 @@ function testVirtualTurnRuntime() {
   assert(store.heightKeys[40] === 'historical-turn-replacement',
     'historical replacements should rebuild the corresponding height-index entry');
 
+  const retentionStore = createStore('retention-cycle');
+  for (let revision = 0; revision < 100; revision++) {
+    const retained = Array.from({ length: 24 }, (_, index) => ({ key: `retained-${revision + index}` }));
+    syncHeightIndex(retentionStore, retained, null, { skipAudit: true });
+    assert(retentionStore.heightIndex.size === retained.length,
+      'native retention must remove evicted keys from the height index');
+    assert(JSON.stringify(Array.from(retentionStore.heightIndex.keys())) === JSON.stringify(retained.map((turn) => turn.key)),
+      'height indices must describe only currently retained turns');
+  }
+
   const largeAppendStore = createStore('large-append');
   reconcile(largeAppendStore, 10000, false);
   let appendKeyReads = 0;
@@ -1344,6 +1354,37 @@ function testTransactions() {
   releaseRecovered();
   assert(!fs.existsSync(lockPath), 'stale patch locks should be recovered atomically');
 
+  for (const legacy of [false, true]) {
+    const racingPath = path.join(temp, `racing-${legacy}.lock`);
+    const deadOwner = { pid: 99999999, hostname: os.hostname(), createdAt: new Date(0).toISOString() };
+    const deadPath = legacy ? racingPath : path.join(racingPath, 'owner-dead.json');
+    if (!legacy) fs.mkdirSync(racingPath);
+    fs.writeFileSync(deadPath, JSON.stringify(deadOwner));
+    let releaseWinner;
+    const racingFs = Object.create(fs);
+    racingFs.unlinkSync = (filename) => {
+      if (filename === deadPath && !releaseWinner) {
+        fs.unlinkSync(deadPath);
+        if (!legacy) fs.rmdirSync(racingPath);
+        releaseWinner = acquireFileLockSync(racingPath);
+      }
+      return fs.unlinkSync(filename);
+    };
+    const isolated = { module: { exports: {} }, process, Buffer, SharedArrayBuffer, Atomics, Int32Array,
+      require: (name) => name === 'fs' ? racingFs : require(name) };
+    vm.runInNewContext(fs.readFileSync(path.join(projectRoot, 'lib/file-transaction.js'), 'utf8'), isolated);
+    try {
+      isolated.module.exports.acquireFileLockSync(racingPath, { timeoutMs: 0 });
+      throw new Error('stale recovery replaced a live owner');
+    } catch (error) {
+      assert(error.code === 'CLAUDE_ENHANCE_LOCK_TIMEOUT',
+        'a stale recovery snapshot must never remove a newly acquired owner');
+      assert(fs.readdirSync(racingPath).length === 1, 'the winning lock must keep its ownership record');
+    } finally {
+      releaseWinner?.();
+    }
+  }
+
   const failedLockPath = path.join(temp, 'failed.lock');
   const originalFsync = fs.fsyncSync;
   let failLockSync = true;
@@ -1388,6 +1429,8 @@ function testConfigurationAndBackups() {
   assert(extension.applyPatch(fixture, path.join(projectRoot, 'vendor'), firstOptions), 'fixture should patch');
   assert(fs.existsSync(path.join(fixture, 'webview', 'claude-enhance-fonts', 'KaTeX_Main-Regular.woff2')),
     'patch fonts should be copied into the extension-owned directory');
+  assert(fs.existsSync(path.join(fixture, 'webview', 'claude-enhance-worker.js')),
+    'the self-contained rendering worker should be installed with the patch');
   const patchedCss = fs.readFileSync(path.join(fixture, 'webview', 'index.css'), 'utf8');
   assert(patchedCss.includes('claude-enhance-fonts/KaTeX_Main-Regular.woff2'),
     'patched CSS should reference the extension-owned WOFF2 font directory');
@@ -1403,6 +1446,10 @@ function testConfigurationAndBackups() {
 
   assert(extension.normalizePatchOptions({ virtualTurns: false }).runtimeConfig.virtualTurns === false,
     'top-level virtualTurns should be normalized consistently with fullTranscript');
+  assert(extension.normalizePatchOptions().fullTranscript === false,
+    'the extension should default to Claude Code native history retention');
+  assert(extension.normalizePatchOptions({ fullTranscript: true }).fullTranscript === true,
+    'users should still be able to explicitly request full main-chat history');
 
   const noTurnFixture = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-enhance-no-turn-'));
   const noTurnWebview = path.join(noTurnFixture, 'webview');
@@ -1455,8 +1502,8 @@ function testConfigurationAndBackups() {
   const fullState = extension.getPatchedRuntimeState(fixture);
   assert(fullState?.fullTranscript && fullState.virtualTurns,
     'verified full history should persist both effective capabilities');
-  assert(extension.historyStatusLabel(fullState) === 'History Full',
-    'status text should report verified full history');
+  assert(extension.historyStatusLabel(fullState).startsWith('History Full'),
+    'status text should report verified full history and its long-session cost');
 
   const disabledVirtualOptions = {
     runtimeConfig: { fullTranscript: false, contentScale: 1.25, virtualTurns: false },
@@ -1574,6 +1621,8 @@ function testConfigurationAndBackups() {
     'removing the patch should preserve Claude Code native fonts');
   assert(!fs.existsSync(path.join(fixture, 'webview', 'claude-enhance-fonts')),
     'removing the patch should delete only extension-owned fonts');
+  assert(!fs.existsSync(path.join(fixture, 'webview', 'claude-enhance-worker.js')),
+    'removing the patch should delete the rendering worker');
   const disabledUninstall = uninstall.restoreClaudeCode(fixture);
   assert(disabledUninstall.restored,
     'uninstall should consume verified backups after the patch was already disabled');
@@ -1602,6 +1651,8 @@ function testConfigurationAndBackups() {
     'font copy failure should leave Claude Code webview files pristine');
   assert(!fs.existsSync(path.join(fontFailureFixture, 'webview', 'claude-enhance-fonts')),
     'font copy failure should remove partial extension-owned assets');
+  assert(!fs.existsSync(path.join(fontFailureFixture, 'webview', 'claude-enhance-worker.js')),
+    'a failed patch should not leave its worker behind');
 }
 
 function testUninstallRestore() {
@@ -1614,6 +1665,7 @@ function testUninstallRestore() {
   assert(fs.readFileSync(path.join(fixture, 'webview', 'index.js'), 'utf8') === pristineJs, 'uninstall should restore JavaScript');
   assert(fs.readFileSync(path.join(fixture, 'webview', 'index.css'), 'utf8') === pristineCss, 'uninstall should restore CSS');
   assert(!fs.existsSync(path.join(fixture, 'webview', 'index.js.katex-bak')), 'uninstall should remove consumed backups');
+  assert(!fs.existsSync(path.join(fixture, 'webview', 'claude-enhance-worker.js')), 'uninstall should remove its worker');
 
   const legacy = createClaudeFixture('5.5.7');
   const legacyWebview = path.join(legacy, 'webview');
@@ -1711,6 +1763,34 @@ function testInstalledCompatibility() {
   }
 }
 
+function testWorkerPolicyTransactions() {
+  const { transformWorkerPolicy, MARKER, policyPaths } = require('../lib/worker-policy');
+  const original = 'function policy(webview){return `worker-src ${webview.cspSource}`;}';
+  const patched = transformWorkerPolicy(original);
+  assert(patched.includes(MARKER) && patched.includes(' blob:'), 'worker policy should only add local blob workers');
+  assert(!transformWorkerPolicy(original + original.replace('policy', 'other')), 'ambiguous worker policies must fail closed');
+  const fixture = createClaudeFixture();
+  try {
+    const host = path.join(fixture, 'extension.js');
+    fs.writeFileSync(path.join(fixture, 'package.json'), JSON.stringify({ version: '9.9.9', main: './extension.js' }));
+    fs.writeFileSync(host, original);
+    assert(extension.applyPatch(fixture, path.join(projectRoot, 'vendor')));
+    assert(fs.readFileSync(host, 'utf8') === patched, 'host worker policy must be committed with the webview patch');
+    assert(extension.removePatch(fixture));
+    assert(fs.readFileSync(host, 'utf8') === original, 'disable must restore the exact host policy entry');
+    assert(!fs.existsSync(policyPaths(fixture).metadata));
+    assert(extension.applyPatch(fixture, path.join(projectRoot, 'vendor')));
+    assert(uninstall.restoreClaudeCode(fixture).restored);
+    assert(fs.readFileSync(host, 'utf8') === original, 'uninstall must restore the exact host policy entry');
+  } finally { fs.rmSync(fixture, { recursive: true, force: true }); }
+  const installed = uninstall.findClaudeCodeDir();
+  if (installed) {
+    const manifest = JSON.parse(fs.readFileSync(path.join(installed, 'package.json'), 'utf8'));
+    const source = fs.readFileSync(path.join(installed, manifest.main), 'utf8');
+    assert(transformWorkerPolicy(source), 'installed Claude host should expose one worker CSP template');
+  }
+}
+
 testStructuralTransforms();
 testVirtualTurnTransform();
 testVirtualTurnRuntime();
@@ -1719,5 +1799,6 @@ testScheduler();
 testTransactions();
 testConfigurationAndBackups();
 testUninstallRestore();
+testWorkerPolicyTransactions();
 testInstalledCompatibility();
 console.log(`architecture regression passed (${installedClaudeBundles().length} installed Claude versions)`);

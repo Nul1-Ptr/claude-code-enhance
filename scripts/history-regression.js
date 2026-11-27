@@ -32,6 +32,8 @@ const context = {
 };
 context.globalThis = context;
 vm.createContext(context);
+vm.runInContext(fs.readFileSync(path.join(projectRoot, 'vendor', 'runtime-core.js'), 'utf8'), context);
+vm.runInContext(fs.readFileSync(path.join(projectRoot, 'vendor', 'math-core.js'), 'utf8'), context);
 vm.runInContext(fs.readFileSync(path.join(projectRoot, 'vendor', 'remark-math-bundle.js'), 'utf8'), context);
 vm.runInContext(fs.readFileSync(path.join(projectRoot, 'vendor', 'enhance.js'), 'utf8'), context);
 const api = context.window.__CLAUDE_ENHANCE_TEST_API__;

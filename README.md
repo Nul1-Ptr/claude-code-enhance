@@ -16,7 +16,7 @@ It adds:
 - Structured, theme-aware API error cards
 - Table and code-block readability improvements
 - Ctrl/Cmd + mouse-wheel zoom for the chat output
-- Configurable content/math scale and optional full-transcript retention
+- Configurable content/math scale, native chat retention, and searchable local conversation history
 - A native sub-agent sidebar with complete, live child transcripts
 
 ## Preview
@@ -122,12 +122,14 @@ The Claude Code activity-bar view exposes child-agent histories that the main Cl
 Selecting a child agent opens its complete transcript in a separate live webview. The view includes:
 
 - Full user, assistant, thinking, tool-call, and tool-result records
-- Search plus answer, thinking, tool, and error filters
+- Global file search plus answer, thinking, tool, and error filters, with paged result navigation
 - GFM tables and fenced code through the bundled Marked parser
 - KaTeX formulas protected before Markdown tokenization, including formulas inside tables
 - Syntax highlighting and copy controls for code and tool output
 - Structured tool/API errors and an option to open the original JSONL
-- Append-only refresh while Claude is writing new records
+- Incremental file indexing while Claude is writing new records; follow new messages at the tail, or retain your older page while reading
+
+`Claude Code Enhance: Open Conversation History` provides a paged viewer for local main-session JSONL history. Main and sub-agent histories share the sparse index and global file search service. Each loaded page contains at most 60 messages; previous page bodies are released. Large pages are transmitted in batches targeting 512 KiB, with a Webview acknowledgement before the next batch. An individual record may exceed that target; no content is truncated to fit a transport batch.
 
 Raw HTML in transcript text is displayed literally. Rendered Markdown is DOM-sanitized, links are protocol-restricted, and the webview uses a nonce-based Content Security Policy. If KaTeX rejects malformed or unsupported input, the original formula remains visible with an error tooltip.
 
@@ -137,7 +139,7 @@ A status bar item (right-aligned) shows the current state:
 
 | Indicator | Meaning |
 |---|---|
-| `LaTeX` (with operator symbol) | Enhancement patch is active and requested full history is verified |
+| `LaTeX` (with operator symbol) | Enhancement patch is active; explicitly requested full history is verified but may cost more on long sessions |
 | `LaTeX (off)` | Patch is not applied |
 | `LaTeX` (with warning symbol) | Patch is incomplete, or full history safely fell back to Claude's native retention |
 | `LaTeX (no CC)` | Claude Code extension is not installed |
@@ -156,7 +158,7 @@ Press **Ctrl+Shift+D** inside the Claude Code webview to dump the DOM structure 
 
 ## Version
 
-Current local version: `1.0.9`
+Current local version: `1.0.10`
 
 The package version, internal patch build, and normalized configuration hash are stamped separately. A rebuild can therefore refresh stale injected code or settings without depending on a specific Claude Code version.
 
@@ -172,7 +174,7 @@ From this directory:
 
 ```bash
 npm run package
-code --install-extension claude-code-enhance-1.0.9.vsix --force
+code --install-extension claude-code-enhance-1.0.10.vsix --force
 ```
 
 Reload VS Code after installing. The extension patches Claude Code automatically on startup and reloads the Claude Code webview when it applies or refreshes the patch.
@@ -188,6 +190,7 @@ Open the command palette with `Ctrl+Shift+P`:
 - `Claude Code Enhance: Open Sub-agent Sidebar`
 - `Claude Code Enhance: Show All Projects`
 - `Claude Code Enhance: Show Active Workspace`
+- `Claude Code Enhance: Open Conversation History`
 - `Claude Code Enhance: Open Raw Sub-agent Transcript`
 - `Claude Code Enhance: Refresh Sub-agents`
 
@@ -195,46 +198,59 @@ Open the command palette with `Ctrl+Shift+P`:
 
 | Setting | Default | Purpose |
 |---|---:|---|
-| `claudeCodeEnhance.fullTranscript` | `true` | Keep the full conversation data instead of applying Claude Code's retention cap. The main chat renders only a virtualized turn window. |
-| `claudeCodeEnhance.virtualTurns` | `true` | Render a tail-first virtual window while keeping the latest turn mounted. Disable `fullTranscript` before disabling this setting. |
+| `claudeCodeEnhance.fullTranscript` | `false` | Keep complete conversation data in Claude's main chat. This may reduce performance on long sessions; use Open Conversation History to browse complete local JSONL history. |
+| `claudeCodeEnhance.virtualTurns` | `true` | Render a tail-first virtual window while keeping the latest turn mounted. If disabled while `fullTranscript=true`, the extension keeps Claude's native retention cap. |
 | `claudeCodeEnhance.contentScale` | `1.1` | Scale rendered conversation content (`0.8`-`1.5`). |
 | `claudeCodeEnhance.mathScale` | `1.0` | Additional inline/display math scale (`0.8`-`1.6`). |
 | `claudeCodeEnhance.toolOutputMath` | `true` | Render validated math in prose-oriented tool output while preserving code regions. |
 | `claudeCodeEnhance.syntaxHighlighting` | `true` | Apply bundled syntax highlighting. |
 | `claudeCodeEnhance.copyButtons` | `true` | Add code-block and assistant-turn copy controls. |
 | `claudeCodeEnhance.apiErrorCards` | `true` | Render API errors as structured diagnostic cards. |
-| `claudeCodeEnhance.subagentProjectsRoot` | empty | Override the Claude history root used by the sub-agent sidebar; empty uses `~/.claude/projects`. The sidebar initially filters that root to the active workspace. |
+| `claudeCodeEnhance.subagentProjectsRoot` | empty | Override the Claude history root used by the sub-agent sidebar and conversation-history viewer; empty uses `~/.claude/projects`. The sidebar initially filters that root to the active workspace. |
 
-Setting changes are normalized, hashed into the patch stamp, and applied by a guarded webview refresh.
+Rendering settings use the User/application scope because every window shares the same installed Claude patch. Existing explicit workspace values are migrated to User settings when no User value exists, including `fullTranscript=true`. Conflicts retain the User value and show a notice; workspace files are not rewritten. The history-root setting remains workspace configurable. Changes are normalized, hashed into the patch stamp, and applied by a guarded refresh.
 
 ## What Gets Patched
 
-Claude Code Enhance does not modify Claude Code's extension host code. It patches only Claude Code's webview files:
+Claude Code Enhance patches these webview files:
 
 - `webview/index.js`
 - `webview/index.css`
+
+When structurally identified, it also adds `blob:` to the extension host's Webview `worker-src` CSP template. This permits a bundled local Worker across VS Code's separate Webview/resource origins. The host change only changes this directive and requires **Reload Window** to activate or restore it. Missing or ambiguous templates are left untouched and reported in diagnostics.
 
 Before patching, it creates backups:
 
 - `webview/index.js.katex-bak`
 - `webview/index.css.katex-bak`
 - `webview/.claude-enhance-backup.json`
+- `webview/claude-enhance-worker-policy.backup` and `webview/claude-enhance-worker-policy.json` when the host CSP is patched
 
-Patch, refresh, restore, and uninstall operations share an atomic cross-process lock. Backup rotation compares Claude version and pristine JS/CSS hashes, so a same-version repack cannot leave a stale restore point. Legacy backups without metadata are restored only after they are verified against a pristine webview and migrated to hash metadata.
+Patch, refresh, restore, and uninstall operations share an atomic directory lock with unique owner records. Dead-owner recovery cannot remove a newer owner's lock. Patch construction, compatibility checks, and lock waits execute in a Node worker thread, keeping the extension-host event loop available. Backup rotation compares Claude version and pristine hashes, so a same-version repack cannot leave a stale restore point. Legacy backups without metadata are restored only after verification. Host CSP restoration verifies both original and patched hashes and refuses to overwrite an unexpectedly modified host entry.
 
 The extension discovers the Markdown renderer and transcript-retention function through an Acorn syntax tree rather than a version-specific minified-code string. Both the legacy slice-based retention function and the newer structured message-list retention function are recognized. When `fullTranscript` is enabled, a missing or ambiguous retention target fails closed instead of silently claiming that complete history is active. JS/CSS updates use verified temporary files, `fsync`, atomic renames, and rollback; backup metadata records Claude's version and SHA-256 hashes.
 
-The retention patch disables only Claude Code's capacity-based history trimming. Claude's semantic cleanup of explicitly superseded or retracted messages remains active so the main chat does not reintroduce duplicate or withdrawn rows.
+By default the extension keeps Claude Code's native capacity-based history trimming, which avoids building and grouping an unbounded message model in the main chat. Setting `fullTranscript=true` disables only that capacity trimming; Claude's semantic cleanup of explicitly superseded or retracted messages remains active.
 
-For the installed Claude Code 2.1.314, 2.1.317, and 2.1.318 bundles, the capacity entry points are `BKe`, `tGe`, and `oGe`. Their replay/append wrappers (`zfe`/`Hfe`, `$fe`/`jfe`, and `qfe`/`Kfe`) call those entry points and inherit the patch automatically. Semantic cleanup (`Xhe`/`IKe`, `ope`/`$Ke`, and `spe`/`KKe`) is intentionally left unchanged. Minified names are diagnostic examples only; matching is structural and fails closed when the shape is missing or ambiguous.
+For the inspected Claude Code 2.1.314, 2.1.317, 2.1.318, 2.1.319, and 2.1.332 bundles, the capacity entry points are `BKe`, `tGe`, `oGe`, `wGe`, and `kj`. Their replay/append wrappers call those entry points and inherit the patch automatically. Semantic cleanup is intentionally left unchanged. Minified names are diagnostic examples only; matching is structural and fails closed when the shape is missing or ambiguous.
 
-Long conversations use a tail-first virtual turn window. Complete message data remains available, but only the active window plus the newest turn are mounted in the main chat. Moving the window preserves a keyed scroll anchor, so reading older history does not jump or pull back to streaming output. When both `fullTranscript` and `virtualTurns` are enabled, a future Claude bundle must match both the retention and turn-list signatures; otherwise only full-transcript retention is skipped and Claude's native retention remains active. Markdown, math, highlighting, and any independently verified virtualization patch still apply.
+Claude Code 2.1.332 uses ES module syntax and `import.meta.url` to load math and Monaco assets. The patch supports both classic scripts and modules, preserves relative asset URLs, and isolates injected library bindings from Claude's bundle. Its native math provider and code renderer are recognized through their Markdown properties and parameter bindings. While enhancement is available, the verified provider hooks select the enhancer's math and highlighting paths, avoiding duplicate parsing and competing code-block DOM updates. Disabling enhanced syntax highlighting retains native code coloring; if the enhancement pipeline is unavailable, the original native settings remain effective. Diagnostics expose `sourceType`, `nativeMathGuarded`, and `nativeCodeGuarded`.
+
+Long conversations use a tail-first virtual turn window. Only the active window plus the newest turn are mounted. When `fullTranscript` is left at its default `false`, Claude also keeps its native message-retention cap, avoiding the linear message-key, grouping, and turn-building work that occurs before the virtual DOM boundary. Turning `fullTranscript` on keeps complete message data in Claude's model and may bring back that cost.
 
 The status command and diagnostics distinguish requested settings from effective settings. If runtime virtualization unexpectedly fails after a verified patch, the message list falls back to a bounded recent-turn window instead of mounting the complete retained history.
 
 `fullTranscript` controls the Webview's retained message data. It does not force Claude's model backend to resend every historical token; server-side context compaction and summarization remain Claude Code behavior.
 
+`Claude Code Enhance: Open Conversation History` opens a workspace-filtered selector for local Claude session JSONL files (or all local projects when no workspace is open). The viewer builds a sparse index in the extension host, loads only 60 messages per page, and scans the file on demand for case-insensitive literal search. The Webview holds only the current page and search-result snippets. Files are read-only; remote/cloud-only sessions are not available. Malformed and partial JSONL lines are reported, and records larger than 1 MiB use a lightweight placeholder with an option to open the raw file at that line.
+
+Indexing, page reads, and search use a fixed file boundary, so appending new messages does not invalidate an in-progress read. File identity, size, timestamps, and a saved tail fingerprint detect replacement, truncation, and tail rewrites. New bytes are indexed incrementally, including a previously incomplete final line. Searches keep their original snapshot across batches; new messages are included when the query runs again. Results arrive in batches of 50, with at most 300 recent snippets mounted and a continuation button to reach later matches. JSONL scanning avoids copying each complete line and yields after 256 records or approximately 8 ms, whichever comes first, so cancellation can run between expensive records. The time budget is cooperative; one record can exceed it. Indexing only checks whether a record is displayable, and page reads format message bodies only inside the requested page, avoiding tool-input serialization for skipped records.
+
+The history viewer keeps the current page, scroll position, and expanded content when new messages arrive. The Latest button shows the number of new messages and loads them on request, including updates to a partially filled last page. First, Older, Newer, and direct page-number navigation make distant history reachable without repeated paging. Collapsed thinking, tool calls, and long tool results build their rich content only when expanded; search navigation opens matching disclosures. Sub-agent live append behavior stays unchanged.
+
 The sub-agent sidebar does not patch Claude Code. It runs in this extension's host process and reads the public JSONL history layout, so its project/session/agent view is independent of Claude Code's minified webview bundle. Discovery starts only when the view becomes visible, uses up to 128 filesystem watchers with a 45-second fallback, and streams JSONL in fixed byte ranges and 300-message Webview batches. Cursor-tail validation detects same-inode rewrites before append mode is used. The extension host retains only the file cursor and metadata; the Webview retains complete message data behind a 100-node DOM cap.
+
+Transcript window updates leave overlapping message nodes connected and only insert or remove messages entering or leaving the window. Height-only refreshes preserve focus, text selection, and expanded disclosures without remounting messages or restarting their resize observation. Sub-agent search and filtering yield after 400 records or approximately 6 ms, including browsers without `requestIdleCallback`; a timed-out idle callback still makes bounded progress.
 
 ## How Rendering Works
 
@@ -248,11 +264,23 @@ $$\tilde{F}_{ij} = \sum_k S^{\xi_i}_k \cdot F_{kj}$$
 
 The bundled `enhance.js` also runs inside the webview to improve output styling, copy behavior, zoom, tables, code blocks, API errors, and fallback math rendering. A shared feature registry processes dirty message roots once per animation frame; conversation-container replacement is the deliberate full-pass fallback.
 
-For long sessions, copy-button maintenance is scoped to changed turns, off-screen historical turns use `content-visibility`, and expensive math, API-error, and code enhancement waits until the affected message is near the viewport and quiet for a short period. Code highlighting uses size-aware limits: medium and large streaming blocks wait longer for a quiet period, while blocks above 500 KB stay plain text with copy support. Per-feature diagnostics include total, maximum, and latest processing time plus processed-root counts.
+For long sessions, copy-button maintenance is scoped to changed turns, off-screen historical turns use `content-visibility`, and expensive math, API-error, and code enhancement waits until the affected message is near the viewport and quiet for a short period. Streaming code above 51,200 JavaScript string units uses deferred highlighting after a 400–800 ms quiet period; smaller blocks retain the 120 ms rate limit. Size affects scheduling, not whether formatting is available.
 
-With `virtualTurns` enabled, Claude's message arrays stay complete while only the active turn window is mounted. The sub-agent transcript viewer uses the same data-versus-DOM separation: filtering and search run in cancellable idle slices against complete message records, while only 60-100 nearby messages are mounted with measured spacer heights. Same-file full reloads preserve a message-key scroll anchor instead of relying only on an estimated absolute offset. If `fullTranscript=true` is combined with `virtualTurns=false`, the extension keeps Claude's native retention cap instead of creating an unbounded full-DOM transcript.
+Large or dense Markdown uses a progressive renderer in both main chat and transcript views. Source-size, line-count, and delimiter-density thresholds select this path; math-bearing sources above 4,096 string units also qualify. Complete source and copying remain available. A local Worker retains the document tokens and reference definitions; appends re-lex the active final block, while reference-definition changes trigger a full re-lex. Completed blocks keep their DOM and newly streamed text appears immediately in a plain-text tail while formatting catches up. Continuous appends use a maximum scheduling delay of 750 ms, in addition to a 250 ms quiet period.
 
-Browser `Ctrl+F` searches only mounted turns. Claude's own message focus/highlight path can reveal an unmounted historical turn, but a separate full-history search index is not included. Claude still performs linear message-key, grouping, and turn-building work before the virtual DOM boundary; those data-layer paths remain unpatched because they are less expensive and materially more version-sensitive than the React/DOM work removed here.
+Messages above 96 semantic blocks mount a moving window of 32–64 blocks. Code and tables above 120 lines/rows mount at most 80 rows in an independently scrollable area; full code/table copying fetches the complete block. Tool code and standalone large code use the same renderer. Height estimates and measurements maintain spacers and reading anchors. Worker documents use a 16-document, approximately 32 MiB cache budget, evicting older documents that can be reconstructed from retained source. A single active document can exceed that budget to remain fully renderable. This is a cache estimate, not a JavaScript heap limit.
+
+Giant paragraphs, individual code lines, and table cells use navigable fragments, typically around 8,192 text units. Fragmentation happens after semantic parsing and highlighting, preserving nested formatting and links. The viewer retains one fragment, or two adjacent fragments for a search spanning their boundary. **Previous fragment**, **Next fragment**, and **Show entire block** provide access to all content; complete expansion also supports continuous selection and reading. Source and copy controls remain complete. A larger individual token or grapheme can exceed the fragment target. Large formulas are split only where KaTeX provides complete top-level layout groups; full expansion preserves the original expression and MathML. Fractions, matrices, and other indivisible layouts remain intact.
+
+Streaming JavaScript/TypeScript and JSON code reuse completed highlighted prefixes at verified root lexical boundaries. The active tail is reprocessed with its full context, retaining at least 1,024 characters of overlap. Multiline comments, strings, nested templates, and embedded languages are never split independently. The bundled Highlight.js 11.9.0 has a local opt-in checkpoint hook; this hook and its full-output equivalence tests must be retained or revalidated when updating that library. Other grammars, edits, and tails without a safe boundary retain full highlighting. Nested row and fragment positions survive append updates.
+
+The main-chat renderer lives in a custom element's shadow tree; React continues owning its original source text. Main chat and history prefer a bundled Blob Worker when CSP permits it, with a sibling module Worker as an alternate asset. The CSP patch and Worker assets are restored or removed with the patch. Worker creation failure falls back to deferred main-thread processing; an individual parser/highlighter call can still block in this mode. Invalid content retains its source and interrupted formatting offers retry. Ordinary, transcript, and Worker mathematics share normalization, macro repairs, validation, and bounded prepared-output caching. KaTeX retains `trust:false`, bounded expansion, and bounded sizing. The history service's separate 1 MiB raw-record policy is unchanged.
+
+DOM construction yields cooperatively after about 6 ms or 200 nodes. Diagnostics report Worker/fallback backend, cancellation, cache estimates, block reuse, DOM slices, and observed long tasks without recording message contents. Fragmentation bounds the common mounted text/layout path; initial Markdown, KaTeX, and highlighting calls still process the complete semantic unit in the Worker. Indivisible formulas and explicitly expanded blocks can still require large layouts, and source/token memory scales with an active message. There is no hard frame-time or constant-memory guarantee. Giant messages use the viewer's safe Markdown dialect, so Claude-specific Markdown components and application links are not reproduced there.
+
+With `virtualTurns` enabled, only the active turn window is mounted; Claude's message data follows native retention by default and stays complete only when `fullTranscript=true` is explicitly enabled. Both history viewers retain one 60-message page and use cancellable host file scans for global searches and filters. The Webview does not accumulate complete sub-agent histories or lowercase search copies. Appends update sparse checkpoints and metadata; the sub-agent viewer follows the tail only while the reader remains there and no search is active. If `fullTranscript=true` is combined with `virtualTurns=false`, the extension keeps Claude's native retention cap.
+
+Browser `Ctrl+F` searches mounted content, including only mounted blocks/rows/fragments inside a giant message. Complete-source disclosures and copying remain available. Claude's own message focus/highlight path can reveal an unmounted turn. Local history search returns the displayed content-block index and UTF-16 source offsets, then opens the matching disclosure, block window, row, and fragment. The matching text is highlighted; Markdown syntax or formula-source matches use the complete-source disclosure when they cannot be represented as rendered text. Oversized JSONL records open at their raw line. Search is literal with locale-independent Unicode lowercase and Greek final-sigma normalization. Remote/cloud-only sessions remain outside this local viewer. Claude still performs linear message-key, grouping, and turn-building work before the virtual DOM boundary when `fullTranscript=true`; those data-layer paths remain unpatched.
 
 ## Theme Behavior
 
@@ -312,6 +340,14 @@ Run the focused sub-agent parser/renderer regression, including every local chil
 ```bash
 npm run test:subagents
 ```
+
+Run the Chromium browser regressions:
+
+```bash
+npm run test:browser
+```
+
+These exercise the production transcript HTML and CSP with 10,000+ synthetic messages, page limits and jumps, scrolling, search continuation, lazy disclosures, reading-position preservation during appends, and Markdown sanitization. They also load patched classic-script and ES-module fixtures with the real vendor runtime, checking math fallback, highlighting, relative lazy imports, and exact restoration. An enhancement scheduler test verifies that simulated expensive blocks yield across animation frames and detached roots are discarded. Installed-bundle structural and patch/restore checks run in `npm test` using temporary copies. These automated checks do not replace a manual test inside the VS Code Webview.
 
 Validate all local Claude and Codex JSONL histories (this scans several gigabytes on a typical development machine):
 

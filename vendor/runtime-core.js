@@ -8,6 +8,87 @@
   'use strict';
 
   const ALL_FEATURES = Object.freeze(['apiErrors', 'code', 'math', 'copy', 'zoom']);
+  const CONTENT_LIMITS = Object.freeze({
+    sourceCharacters: 64 * 1024,
+    sourceLines: 1500,
+    mathMarkers: 128,
+    codeFences: 48,
+    formulaCharacters: 4096,
+    codeCharacters: 50 * 1024,
+  });
+
+  function foldSearch(value) {
+    return String(value).toLowerCase().replace(/ς/g, 'σ');
+  }
+
+  function findLiteral(source, query, from = 0) {
+    const text = String(source);
+    const needle = foldSearch(query);
+    if (!needle) return null;
+    const suffix = text.slice(from);
+    const folded = foldSearch(suffix);
+    const index = folded.indexOf(needle);
+    if (index < 0) return null;
+    if (folded.length === suffix.length) return { start: from + index, end: from + index + needle.length };
+    let originalOffset = from;
+    let foldedOffset = 0;
+    let start = from;
+    for (const character of suffix) {
+      const next = foldedOffset + foldSearch(character).length;
+      if (foldedOffset <= index && index < next) start = originalOffset;
+      originalOffset += character.length;
+      if (next >= index + needle.length) return { start, end: originalOffset };
+      foldedOffset = next;
+    }
+    return null;
+  }
+
+  function richSourceReason(source) {
+    if (source.length > CONTENT_LIMITS.sourceCharacters) return 'length';
+    if (source.length > CONTENT_LIMITS.formulaCharacters && /\$|\\[([]/.test(source)) return 'math-complexity';
+    let lines = 1;
+    let mathMarkers = 0;
+    let codeFences = 0;
+    const markers = /\$|\\[()[\]]|`{3,}|~{3,}|\n/g;
+    let match;
+    while ((match = markers.exec(source))) {
+      if (match[0] === '\n') {
+        if (++lines > CONTENT_LIMITS.sourceLines) return 'lines';
+      } else if (match[0][0] === '`' || match[0][0] === '~') {
+        if (++codeFences > CONTENT_LIMITS.codeFences) return 'code-blocks';
+      } else if (++mathMarkers > CONTENT_LIMITS.mathMarkers) {
+        return 'math-density';
+      }
+    }
+    return null;
+  }
+
+  function createRenderQueue(options) {
+    const tasks = new Map();
+    let scheduled = false;
+    const schedule = () => {
+      if (scheduled || !tasks.size) return;
+      scheduled = true;
+      options.schedule(flush);
+    };
+    const flush = () => {
+      scheduled = false;
+      const startedAt = options.now();
+      let processed = 0;
+      for (const [element, callback] of tasks) {
+        if (processed >= 4 || (processed > 0 && options.now() - startedAt >= 6)) break;
+        tasks.delete(element);
+        processed++;
+        if (element.isConnected === false || (options.isUsable && !options.isUsable(element))) continue;
+        try { callback(); } catch (error) { options.onError?.(error); }
+      }
+      schedule();
+    };
+    return Object.freeze({
+      enqueue(element, callback) { tasks.set(element, callback); schedule(); },
+      clear() { tasks.clear(); },
+    });
+  }
 
   function normalizeFeatures(features, fallback = ALL_FEATURES) {
     const requested = features == null
@@ -94,5 +175,5 @@
     return Object.freeze({ enqueue, flushNow: drain, cancel, getState: state });
   }
 
-  return Object.freeze({ ALL_FEATURES, normalizeFeatures, createIncrementalScheduler });
+  return Object.freeze({ ALL_FEATURES, CONTENT_LIMITS, foldSearch, findLiteral, richSourceReason, createRenderQueue, normalizeFeatures, createIncrementalScheduler });
 });

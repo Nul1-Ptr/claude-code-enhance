@@ -1,5 +1,40 @@
 # Changelog
 
+## [1.0.10] - 2026-11-27
+
+- Added navigable fragments inside giant paragraphs, code lines, and table cells after complete semantic parsing, with preserved inline styles/links, exact copying, and optional complete expansion.
+- Split large additive formulas at complete KaTeX layout groups; retained full-formula MathML through complete expansion and kept indivisible expressions intact.
+- Reused Highlight.js prefixes at verified JavaScript/TypeScript statement and JSON separator boundaries; retained the full active lexical tail for multiline comments, strings, nested templates, and embedded languages. Other grammars retain complete highlighting.
+- Carried Unicode-aware search offsets from local history into message blocks, code rows, and fragments, with source fallback for Markdown syntax matches and raw-record navigation for oversized JSONL records.
+- Preserved nested reading positions during append updates and tested fragment recovery, malicious Markdown, precise search navigation, and incremental/full highlighter equivalence.
+- Closed stale-lock recovery races with immutable directory ownership, and pruned virtual height-index keys after native message eviction.
+- Unified normal and oversized JSONL search over decoded content, including Unicode/escape handling and global message-type filters.
+- Shared math normalization, repairs, validation, and bounded prepared HTML caching between ordinary, transcript, and Worker rendering.
+- Kept streamed tails immediately visible and re-lexed only the active Markdown tail, with stable completed blocks and reference-aware invalidation.
+- Added semantic-block windows and code/table row windows inside giant messages, full copying, reading anchors, and recoverable Worker document-cache eviction.
+- Enabled local Blob Workers through a verified, reversible host CSP directive change; activation/restoration requires Reload Window.
+- Moved patch operations and lock waits off the extension-host main thread; made rendering settings application-scoped with explicit workspace-setting migration notices.
+- Unified sub-agent viewing with sparse history paging, incremental indexing, global host search/filtering, and byte-batched page delivery with acknowledgement backpressure.
+- Added real host/Webview paging regressions for 10,001 records, background patch responsiveness, row scrolling/copying, and a synthetic rendering heartbeat check.
+- Adapted patching and restoration to Claude Code 2.1.332 ES modules, preserving `import.meta.url` and isolating injected library bindings.
+- Added structural guards for native math and code rendering so enabled enhancements use one processing pipeline, with native fallback when enhancements are unavailable or code highlighting is disabled.
+- Changed default main-chat retention to Claude's native behavior while retaining virtual turns and explicit full-transcript opt-in.
+- Added a read-only local conversation-history selector with sparse indexing, 60-message pages, cancellable global search, and raw-record navigation.
+- Made history reads tolerate concurrent appends without restarting full indexing or clearing searches, and reduced JSONL buffer copies with bounded cancellation intervals.
+- Kept search-result DOM bounded while allowing continuation beyond 300 matches, and preserved sub-agent filters across transcript refreshes.
+- Split queued main-chat enhancements across animation frames with a cooperative 6 ms/four-task budget and per-slice diagnostics.
+- Deferred collapsed thinking and tool bodies until expanded, revealing matching disclosures on search navigation.
+- Preserved the history reader's page, scroll position, and expanded content during appends; added new-message counts, explicit Latest refresh, and direct page jumps.
+- Removed tool-body serialization from sparse indexing and skipped page prefixes, and made JSONL cancellation yield on elapsed time as well as record count.
+- Kept overlapping transcript messages connected during virtual window and height updates, preserving focus and selection without restarting resize observers.
+- Bounded sub-agent filtering by both elapsed time and record count, including the timer fallback when idle callbacks are unavailable.
+- Added progressive rich rendering for giant and formula-dense messages: complete source remains accessible while a local worker parses Markdown, mathematics, and code, followed by cooperative DOM construction.
+- Replaced permanent source-size downgrades with scheduling thresholds, quiet-period highlighting, revision cancellation, viewport deferral, disclosure resumption, and reuse of completed blocks during streaming appends.
+- Isolated progressive output in a shadow tree to preserve React-owned source text, retained safe Markdown and KaTeX expansion/sizing rules, and added worker cleanup to patch restoration and uninstall.
+- Added Chromium regressions for complete 2 MiB rich output, exact copying, dense/large formulas, oversized code, cross-block links, worker cancellation/CSP, stale revisions, and worker-unavailable fallback.
+- Verified progressive output and updates with the installed Claude bundle's real React/Markdown renderer using an isolated copy with application startup replaced by a test harness.
+- Added 2.1.332 structural fixtures, installed-bundle checks, concurrent file-update regressions, and Chromium coverage for module startup and the production transcript HTML.
+
 ## [1.0.9] - 2026-11-04
 
 ### Performance

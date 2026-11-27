@@ -6,6 +6,7 @@ const vm = require('vm');
 const projectRoot = path.join(__dirname, '..');
 const katex = require(path.join(projectRoot, 'vendor', 'katex.min.js'));
 const hljs = require(path.join(projectRoot, 'vendor', 'highlight.min.js'));
+const { CONTENT_LIMITS, richSourceReason } = require('../vendor/runtime-core');
 
 function assert(condition, message) {
   if (!condition) throw new Error(message);
@@ -56,6 +57,8 @@ function createEnhanceTestApi() {
   };
   context.globalThis = context;
   vm.createContext(context);
+  vm.runInContext(fs.readFileSync(path.join(projectRoot, 'vendor', 'runtime-core.js'), 'utf8'), context);
+  vm.runInContext(fs.readFileSync(path.join(projectRoot, 'vendor', 'math-core.js'), 'utf8'), context);
 
   const enhancePath = path.join(projectRoot, 'vendor', 'enhance.js');
   vm.runInContext(fs.readFileSync(enhancePath, 'utf8'), context, {
@@ -93,10 +96,12 @@ function createRemarkBundleTestApi() {
     },
     katex,
     hljs,
-    window: { katex, __CLAUDE_ENHANCE_TEST_MODE__: true },
+    window: { katex, __CLAUDE_ENHANCE_TEST_MODE__: true, __CLAUDE_ENHANCE_RICH__: {} },
   };
   context.globalThis = context;
   vm.createContext(context);
+  vm.runInContext(fs.readFileSync(path.join(projectRoot, 'vendor', 'runtime-core.js'), 'utf8'), context);
+  vm.runInContext(fs.readFileSync(path.join(projectRoot, 'vendor', 'math-core.js'), 'utf8'), context);
 
   const bundlePath = path.join(projectRoot, 'vendor', 'remark-math-bundle.js');
   vm.runInContext(fs.readFileSync(bundlePath, 'utf8'), context, {
@@ -431,6 +436,29 @@ assert(
   normalizedParserSource === numericFormulaSource,
   'the installed remark source plugin should preserve closed numeric formulas'
 );
+
+for (const source of [
+  'source '.repeat(12000),
+  '$x^2$ '.repeat(65),
+  'line\n'.repeat(1501),
+  '```js\nconst sample = 1;\n```\n'.repeat(25),
+]) {
+  normalizedParserSource = '';
+  const file = {};
+  const tree = sourceProcessor.parser(source, file);
+  assert(richSourceReason(source) && file.data.__ceDeferredSource,
+    'large or dense Markdown should select progressive rendering before parsing');
+  assert(normalizedParserSource === '', 'deferred Markdown must leave parsing to the progressive renderer');
+  assert(tree.children[0].children[0].value === source &&
+    tree.children[0].data.hName === 'ce-rich-message',
+  'deferred Markdown should retain complete source as React-owned text outside the rendered shadow tree');
+  api.__rehypeKatex.call({})(tree, file);
+  assert(!tree.__dummyRehypeKatexTransformerRan, 'deferred source must not enter a second KaTeX pipeline');
+  sourceProcessor.parser(numericFormulaSource, file);
+  assert(!file.data.__ceDeferredSource && normalizedParserSource === numericFormulaSource,
+    'a shorter replacement should restore normal rich rendering');
+}
+assert(!richSourceReason('a'.repeat(CONTENT_LIMITS.sourceCharacters)), 'source threshold should be inclusive');
 
 const structuredContextCases = [
   { text: '`code $x$` and $y$', expected: ['$y$'] },
@@ -776,9 +804,11 @@ assert(
   'an unbalanced formula should carry an explicit failed preparation result'
 );
 assert(
-  !api.prepareLatexForKatex('x'.repeat(12001), false).ok,
-  'oversized formulas should be rejected before invoking KaTeX'
+  api.prepareLatexForKatex('x'.repeat(12001), false).ok,
+  'valid large formulas should remain renderable'
 );
+assert(api.renderLatexHtml('x'.repeat(CONTENT_LIMITS.formulaCharacters + 1), false).includes('katex'),
+  'formula scheduling thresholds must not disable valid rich output');
 assert(
   api.looksLikeCodeDollarFormula('3 : $2; $need{'),
   'Perl dollar variables should be classified as code-like rather than math'
@@ -992,9 +1022,11 @@ assert(api.getCodeLanguage(fakeCodeBlock('language-py')) === 'python', 'py alias
 assert(api.getCodeLanguage(fakeCodeBlock('lang-ts')) === 'typescript', 'ts alias should resolve to typescript');
 assert(api.getCodeLanguage(fakeCodeBlock('', '', 'sh')) === 'bash', 'raw sh data-language should resolve to bash');
 assert(api.codeHighlightPolicy(50 * 1024).tier === 'small', '50KB code should retain responsive highlighting');
-assert(api.codeHighlightPolicy(50 * 1024 + 1).tier === 'medium', 'code above 50KB should wait for a quiet period');
-assert(api.codeHighlightPolicy(200 * 1024 + 1).tier === 'large', 'code above 200KB should use the long quiet period');
-assert(api.codeHighlightPolicy(500 * 1024 + 1).skip, 'code above 500KB should skip syntax highlighting');
+for (const size of [50 * 1024 + 1, 200 * 1024 + 1, 500 * 1024 + 1]) {
+  const policy = api.codeHighlightPolicy(size);
+  assert(!policy.skip && policy.waitForQuiet && policy.tier === 'deferred',
+    'large code should defer until quiet without dropping highlighting');
+}
 const codeClasses = new Set(['language-javascript']);
 let codeHtmlWrites = 0;
 const originalCodeText = `const prefix = "${'a'.repeat(90)}";${'b'.repeat(90)};`;

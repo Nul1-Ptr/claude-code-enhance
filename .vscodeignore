@@ -5,6 +5,7 @@ node_modules/**
 .env
 .claude/**
 .codex/**
+.docs/**
 scripts/**
 package-lock.json
 vendor/katex.min.css

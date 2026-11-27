@@ -70,7 +70,6 @@ for (const marker of [
   'claude-enhance-root',
   'shouldSkipPreviewEnhancement',
   'isProseHeavyLatex',
-  'escapeUnescapedUnderscores',
   'escapeUnescapedTextSpecials',
   'StructuredMathCandidate',
   'MATH_DELIMITER_DEFINITIONS',
@@ -91,8 +90,8 @@ for (const marker of [
   'recoverMathOnlyInlineCode',
   'normalizeMarkdownMathSource',
   'installRemarkSourceNormalizer',
-  'MAX_LATEX_SOURCE_LENGTH',
-  'MAX_LATEX_PREPARATION_CACHE',
+  'ce-rich-message',
+  '__CLAUDE_ENHANCE_MATH_CORE__',
   'repairLatexForKatexError',
   'prepareLatexForKatex',
   'chooseRenderableLatexForKatex',
@@ -194,9 +193,12 @@ for (const marker of [
   '--ce-syntax-keyword',
   'Common Highlight.js palette',
   'vscode-high-contrast',
-  'claude-code-enhance-full-transcript',
 ]) {
   if (!patchedJs.includes(marker)) throw new Error('missing JS marker: ' + marker);
+}
+
+if (patchedJs.includes('claude-code-enhance-full-transcript')) {
+  throw new Error('default patch should preserve Claude Code native message retention');
 }
 
 if (patchedJs.includes('let attached = false')) {
@@ -288,7 +290,9 @@ if (installedFixture) {
   fs.copyFileSync(installedFixture.jsPath, path.join(localWebview, 'index.js'));
   fs.copyFileSync(installedFixture.cssPath, path.join(localWebview, 'index.css'));
 
-  if (!extension.applyPatch(localTmp, path.join(__dirname, '..', 'vendor'))) {
+  if (!extension.applyPatch(localTmp, path.join(__dirname, '..', 'vendor'), {
+    runtimeConfig: { fullTranscript: false, virtualTurns: true },
+  })) {
     throw new Error('applyPatch returned false for installed Claude Code fixture: ' + installedFixture.name);
   }
   const installedDiagnostics = extension.getLastPatchDiagnostics();
@@ -303,8 +307,8 @@ if (installedFixture) {
       throw new Error('missing installed Claude Code marker: ' + marker);
     }
   }
-  if (!installedDiagnostics.retentionApplied || !localPatchedJs.includes(extension.FULL_TRANSCRIPT_MARKER)) {
-    throw new Error('missing installed Claude Code full-transcript retention marker');
+  if (installedDiagnostics.retentionApplied || localPatchedJs.includes(extension.FULL_TRANSCRIPT_MARKER)) {
+    throw new Error('default installed Claude Code patch must preserve native history retention');
   }
   if (!installedDiagnostics.virtualTurnsApplied ||
       !localPatchedJs.includes('__claudeEnhanceVirtualRuntime')) {

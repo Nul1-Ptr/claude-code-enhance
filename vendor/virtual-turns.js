@@ -397,11 +397,12 @@
     const keysChanged = common < previousKeys.length || previousKeys.length !== length;
     if (keysChanged) {
       if (typeof beforeChange === 'function') beforeChange();
-      const appendedOnly = common === previousKeys.length && previousKeys.length < length;
+      const previousLength = previousKeys.length;
+      const appendedOnly = common === previousLength && previousLength < length;
       store.heightKeys.length = common;
       store.heightValues.length = common;
       store.heightPrefix.length = common + 1;
-      if (common < previousKeys.length) {
+      if (common < previousLength) {
         for (const key of store.heightIndex.keys()) {
           const index = store.heightIndex.get(key);
           if (index >= common) store.heightIndex.delete(key);

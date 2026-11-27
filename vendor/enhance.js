@@ -8,15 +8,26 @@
 
   console.log('[Claude Enhance] Loading...');
 
+  const { CONTENT_LIMITS, richSourceReason, createRenderQueue } = window.__CLAUDE_ENHANCE_RUNTIME_CORE__;
+  const { normalizeToolOutputMathFormula, normalizeLatexTextCommands, repairUnsupportedKatexMacros,
+    repairLatexForKatexError, normalizeLatexForRender, looksLikeCodeDollarFormula, analyzeFormulaSignals,
+    looksLikeAmbiguousDollarProse, hasMarkdownUnderscoreEmphasis, isProseHeavyLatex } = window.__CLAUDE_ENHANCE_MATH_CORE__;
+  const { prepareLatexForKatex, classifyStructuredMathCandidate } = window.__CLAUDE_ENHANCE_MATH_CORE__.create(katex, (candidate) => {
+    runtimeDiagnostics.math.candidates++;
+    if (candidate.decision === 'render') {
+      runtimeDiagnostics.math.rendered++;
+      if (candidate.preparation.repaired) runtimeDiagnostics.math.repaired++;
+    } else runtimeDiagnostics.math.literal++;
+  });
   const suppliedConfig = window.__CLAUDE_ENHANCE_CONFIG__ || {};
   const finiteConfig = (value, fallback, minimum, maximum) => {
     const parsed = Number(value);
     return Number.isFinite(parsed) ? Math.max(minimum, Math.min(maximum, parsed)) : fallback;
   };
   const RUNTIME_CONFIG = Object.freeze({
-    fullTranscript: suppliedConfig.fullTranscript !== false,
+    fullTranscript: suppliedConfig.fullTranscript === true,
     virtualTurns: suppliedConfig.virtualTurns !== false,
-    fullTranscriptRequested: suppliedConfig.fullTranscriptRequested ?? suppliedConfig.fullTranscript !== false,
+    fullTranscriptRequested: suppliedConfig.fullTranscriptRequested ?? suppliedConfig.fullTranscript === true,
     virtualTurnsRequested: suppliedConfig.virtualTurnsRequested ?? suppliedConfig.virtualTurns !== false,
     fullTranscriptFallbackReason: suppliedConfig.fullTranscriptFallbackReason || null,
     contentScale: finiteConfig(suppliedConfig.contentScale, 1.1, 0.8, 1.5),
@@ -41,6 +52,9 @@
       coalescedBatches: 0,
       richQueued: 0,
       richRuns: 0,
+      richFrames: 0,
+      richYieldedFrames: 0,
+      richMaxSliceMs: 0,
       richOffscreenDeferrals: 0,
       richDropped: 0,
       richPending: 0,
@@ -61,12 +75,12 @@
       highlighted: 0,
       plain: 0,
       deferred: 0,
-      skippedLarge: 0,
       examinedCharacters: 0,
       inputCharacters: 0,
       maxCharacters: 0,
     },
     copyWork: { scopedTurnScans: 0, cachedMessageUpdates: 0, fullContainerScans: 0 },
+    largeContent: { deferredSources: 0 },
     history: {
       fullTranscriptRequested: RUNTIME_CONFIG.fullTranscriptRequested,
       fullTranscript: RUNTIME_CONFIG.fullTranscript,
@@ -147,6 +161,7 @@
         ? virtualRuntime.diagnostics()
         : [],
     };
+    runtimeDiagnostics.largeContent.rendering = window.__CLAUDE_ENHANCE_RICH__?.diagnostics || null;
     return JSON.parse(JSON.stringify(runtimeDiagnostics));
   }
 
@@ -202,6 +217,8 @@
       .claude-enhance-root .claude-enhance-root {
         font-size: inherit;
       }
+      ce-rich-message, ce-rich-code { display: block; min-width: 0; }
+      pre > code[hidden] { display: none !important; }
 
       :is(body.vscode-light, html.vscode-light) {
         --ce-shadow: rgba(0, 0, 0, 0.10);
@@ -948,6 +965,7 @@
   function isInsideMathExcludedRegion(el) {
     const node = el?.nodeType === Node.ELEMENT_NODE ? el : el?.parentElement;
     if (!node || node.nodeType !== Node.ELEMENT_NODE) return true;
+    if (closestSafe(node, 'ce-rich-message, ce-rich-code')) return true;
     if (isMathCodeElement(node)) return true;
     if (isInsideToolOutput(node)) {
       return !RUNTIME_CONFIG.toolOutputMath || !!closestSafe(node, NON_TOOL_PREVIEW_SELECTOR);
@@ -957,6 +975,7 @@
 
   function shouldSkipPreviewEnhancement(el) {
     if (!el || el.nodeType !== Node.ELEMENT_NODE) return true;
+    if (closestSafe(el, 'ce-rich-message, ce-rich-code')) return true;
     return isInsideNonPreviewRegion(el);
   }
 
@@ -1055,11 +1074,18 @@
 
   // ===== Code highlighting =====
 
+  function codeEnhancementTargets(root) {
+    const selector = 'pre code';
+    return matchesSafe(root, selector) ? [root] : querySelectorAllSafe(root, selector);
+  }
+
   function highlightAllCode(scopes) {
     if (RUNTIME_CONFIG.syntaxHighlighting && typeof hljs === 'undefined') return;
 
-    rootsForScopes(scopes, getEnhanceRoots).forEach((root) => {
-      querySelectorAllSafe(root, 'pre code').forEach((block) => {
+    const roots = scopes ? (Array.isArray(scopes) ? scopes : [scopes]) : getEnhanceRoots();
+    roots.forEach((root) => {
+      const blocks = codeEnhancementTargets(root);
+      blocks.forEach((block) => {
         if (shouldSkipPreviewEnhancement(block)) return;
         safeRun('highlightCodeBlock', () => {
           const result = RUNTIME_CONFIG.syntaxHighlighting ? highlightCodeBlock(block) : 'unchanged';
@@ -1104,27 +1130,19 @@
   }
 
   const CODE_HIGHLIGHT_MIN_INTERVAL_MS = 120;
-  const CODE_HIGHLIGHT_MEDIUM_INTERVAL_MS = 400;
-  const CODE_HIGHLIGHT_MEDIUM_LENGTH = 50 * 1024;
-  const CODE_HIGHLIGHT_LARGE_LENGTH = 200 * 1024;
-  const CODE_HIGHLIGHT_MAX_LENGTH = 500 * 1024;
+  const CODE_HIGHLIGHT_MAX_LENGTH = CONTENT_LIMITS.codeCharacters;
   const codeHighlightStates = new WeakMap();
+  const codeRenderQueue = createRenderQueue({
+    schedule: (callback) => typeof requestAnimationFrame === 'function'
+      ? requestAnimationFrame(callback) : setTimeout(callback, 16),
+    now: nowMs,
+    onError: (error) => warnOnce('queued code highlight', error),
+  });
 
   function codeHighlightPolicy(length) {
     const size = Math.max(0, Number(length) || 0);
     if (size > CODE_HIGHLIGHT_MAX_LENGTH) {
-      return { interval: Infinity, skip: true, waitForQuiet: true, tier: 'oversized' };
-    }
-    if (size > CODE_HIGHLIGHT_LARGE_LENGTH) {
-      return { interval: 800, skip: false, waitForQuiet: true, tier: 'large' };
-    }
-    if (size > CODE_HIGHLIGHT_MEDIUM_LENGTH) {
-      return {
-        interval: CODE_HIGHLIGHT_MEDIUM_INTERVAL_MS,
-        skip: false,
-        waitForQuiet: true,
-        tier: 'medium',
-      };
+      return { interval: size > 200 * 1024 ? 800 : 400, skip: false, waitForQuiet: true, tier: 'deferred' };
     }
     return {
       interval: CODE_HIGHLIGHT_MIN_INTERVAL_MS,
@@ -1144,7 +1162,7 @@
     const delay = Number.isFinite(delayOverride)
       ? Math.max(0, delayOverride)
       : Math.max(0, policy.interval - elapsed);
-    state.timer = setTimeout(() => {
+    state.timer = setTimeout(() => codeRenderQueue.enqueue(block, () => {
       state.timer = null;
       if (block.isConnected === false) return;
       const diagnostics = runtimeDiagnostics.features.code;
@@ -1152,7 +1170,7 @@
       diagnostics.attempts++;
       diagnostics.lastRoots = 1;
       try {
-        const result = highlightCodeBlock(block, { quiet: true });
+        const result = highlightCodeBlock(block);
         recordCodeBlockResult(result);
         diagnostics.succeeded++;
       } catch (error) {
@@ -1164,14 +1182,13 @@
         diagnostics.totalMs = Math.round((diagnostics.totalMs + elapsed) * 100) / 100;
         diagnostics.maxMs = Math.max(diagnostics.maxMs, diagnostics.lastMs);
       }
-    }, delay);
+    }), delay);
   }
 
   function recordCodeBlockResult(result) {
     if (result === 'highlighted') runtimeDiagnostics.codeBlocks.highlighted++;
     if (result === 'plain') runtimeDiagnostics.codeBlocks.plain++;
     if (result === 'deferred') runtimeDiagnostics.codeBlocks.deferred++;
-    if (result === 'skipped') runtimeDiagnostics.codeBlocks.skippedLarge++;
   }
 
   function markCodeBlockDirty(node) {
@@ -1188,6 +1205,7 @@
       clearTimeout(state.timer);
       state.timer = null;
     }
+    state.controller?.abort();
     state.dirtyAt = Date.now();
     codeHighlightStates.set(block, state);
   }
@@ -1207,7 +1225,7 @@
     return 'plain';
   }
 
-  function highlightCodeBlock(block, options = {}) {
+  function highlightCodeBlock(block) {
     const text = block.textContent || '';
     if (!text.trim()) return 'unchanged';
 
@@ -1231,34 +1249,31 @@
       text.length
     );
 
-    if (policy.skip) {
-      if (state.timer) {
-        clearTimeout(state.timer);
-        state.timer = null;
-      }
-      if (block.children?.length || block.classList.contains('hljs')) {
-        withSelfMutation(block, () => { block.textContent = text; });
-      }
-      block.classList.remove('hljs');
-      block.dataset.ceHighlighted = fingerprint;
-      block.dataset.ceHighlightSkipped = 'oversized';
-      state.dirtyAt = 0;
-      return 'skipped';
-    }
-
-    if (policy.waitForQuiet && !options.quiet) {
-      const quietFor = state.dirtyAt ? now - state.dirtyAt : 0;
-      if (!state.dirtyAt || quietFor < policy.interval) {
-        scheduleDeferredCodeHighlight(block, Math.max(0, policy.interval - quietFor));
-        return 'deferred';
-      }
-    }
-    if (policy.waitForQuiet && options.quiet && state.dirtyAt) {
+    if (policy.waitForQuiet && window.__CLAUDE_ENHANCE_RICH__) {
+      if (!state.dirtyAt) state.dirtyAt = now;
       const quietFor = now - state.dirtyAt;
       if (quietFor < policy.interval) {
         scheduleDeferredCodeHighlight(block, policy.interval - quietFor);
         return 'deferred';
       }
+      if (state.controller && !state.controller.signal.aborted && state.pendingSource === text) return 'deferred';
+      state.controller?.abort();
+      state.controller = new AbortController();
+      state.pendingSource = text;
+      const language = getCodeLanguage(block) || 'markdown';
+      window.__CLAUDE_ENHANCE_RICH__.highlight(block, language, {
+        signal: state.controller.signal,
+        mutate: (commit) => withSelfMutation(block, commit),
+        complete: () => {
+          state.dirtyAt = 0;
+          state.lastHighlightAt = Date.now();
+          state.pendingSource = null;
+          block.dataset.ceHighlighted = fingerprint;
+          if (block.parentElement?.tagName === 'PRE') block.parentElement.dataset.ceLanguage = language;
+          runtimeDiagnostics.codeBlocks.highlighted++;
+        },
+      });
+      return 'deferred';
     }
 
     if (state.lastHighlightAt &&
@@ -1538,37 +1553,6 @@
     return '';
   }
 
-  function stripToolOutputLinePrefix(line, mode) {
-    if (mode === 'numbered-quote') {
-      return line.replace(/^[ \t]*\d+[ \t]*>[ \t]*/, '');
-    }
-    if (mode === 'numbered') {
-      return line.replace(/^[ \t]*\d+[ \t]*[|:][ \t]*/, '');
-    }
-    if (mode === 'numbered-tab') {
-      return line.replace(/^[ \t]*\d+\t[ \t]*/, '');
-    }
-    if (!mode.startsWith('quote:')) return line;
-
-    const depth = Number.parseInt(mode.slice('quote:'.length), 10) || 1;
-    let output = line;
-    for (let i = 0; i < depth; i++) {
-      const stripped = output.replace(/^[ \t]*>[ \t]?/, '');
-      if (stripped === output) break;
-      output = stripped;
-    }
-    return output;
-  }
-
-  function normalizeToolOutputMathFormula(formula, mode) {
-    const source = String(formula || '');
-    if (!mode || !source.includes('\n')) return source;
-    return source.split('\n')
-      .map((line) => stripToolOutputLinePrefix(line, mode))
-      .join('\n')
-      .trim();
-  }
-
   function createStructuredMathCandidate(source, start, closeIndex, definition, context) {
     const end = closeIndex + definition.close.length;
     const bodyStart = start + definition.open.length;
@@ -1748,6 +1732,20 @@
       const originalParser = this.parser;
       if (typeof originalParser !== 'function') return;
       this.parser = (source, file) => {
+        const reason = window.__CLAUDE_ENHANCE_RICH__ && richSourceReason(String(source || ''));
+        if (file && typeof file === 'object') {
+          file.data = file.data || {};
+          file.data.__ceDeferredSource = !!reason;
+        }
+        if (reason) {
+          if (file?.data) delete file.data.__ceNormalizedMathSource;
+          runtimeDiagnostics.largeContent.deferredSources++;
+          return { type: 'root', children: [{
+            type: 'paragraph',
+            data: { hName: 'ce-rich-message', hProperties: { className: ['ce-progressive-content'] } },
+            children: [{ type: 'text', value: source }],
+          }] };
+        }
         const normalizedSource = normalizeMarkdownMathSource(source);
         const guardedSource = guardPipes(normalizedSource);
         if (file && typeof file === 'object') {
@@ -1767,199 +1765,6 @@
 
   // ===== LaTeX rendering =====
 
-  const LATEX_TEXT_COMMANDS = new Set([
-    'texttt', 'textrm', 'textsf', 'textit', 'textbf', 'textnormal',
-    'textmd', 'textup', 'emph', 'hbox', 'text', 'mbox'
-  ]);
-  const MAX_LATEX_SOURCE_LENGTH = 12000;
-  const MAX_LATEX_PREPARATION_CACHE = 512;
-  const latexPreparationCache = new Map();
-
-  function rememberLatexPreparation(key, result) {
-    if (key.length > 4096) return result;
-    if (latexPreparationCache.has(key)) latexPreparationCache.delete(key);
-    latexPreparationCache.set(key, result);
-    if (latexPreparationCache.size > MAX_LATEX_PREPARATION_CACHE) {
-      latexPreparationCache.delete(latexPreparationCache.keys().next().value);
-    }
-    return result;
-  }
-
-  function escapeUnescapedTextSpecials(text) {
-    const source = String(text || '');
-    let output = '';
-    for (let i = 0; i < source.length; i++) {
-      const char = source[i];
-      if ('_%#&$'.includes(char) && !isEscapedLatexCharacter(source, i)) output += '\\';
-      output += char;
-    }
-    return output;
-  }
-
-  function escapeUnescapedUnderscores(text) {
-    return escapeUnescapedTextSpecials(text);
-  }
-
-  function isEscapedLatexCharacter(text, index) {
-    let slashCount = 0;
-    for (let i = index - 1; i >= 0 && text[i] === '\\'; i--) slashCount++;
-    return slashCount % 2 === 1;
-  }
-
-  function findBalancedLatexGroupEnd(text, openIndex) {
-    if (text[openIndex] !== '{') return -1;
-    let depth = 1;
-    for (let i = openIndex + 1; i < text.length; i++) {
-      if (isEscapedLatexCharacter(text, i)) continue;
-      if (text[i] === '{') depth++;
-      if (text[i] === '}' && --depth === 0) return i;
-    }
-    return -1;
-  }
-
-  function normalizeLatexTextCommands(formula) {
-    const source = String(formula || '');
-    let output = '';
-
-    for (let i = 0; i < source.length;) {
-      if (source[i] !== '\\' || isEscapedLatexCharacter(source, i)) {
-        output += source[i++];
-        continue;
-      }
-
-      const commandMatch = source.slice(i + 1).match(/^([A-Za-z]+)/);
-      if (!commandMatch || !LATEX_TEXT_COMMANDS.has(commandMatch[1])) {
-        output += source[i++];
-        continue;
-      }
-
-      const command = commandMatch[1];
-      const commandEnd = i + 1 + command.length;
-      let openIndex = commandEnd;
-      while (openIndex < source.length && /\s/.test(source[openIndex])) openIndex++;
-      if (source[openIndex] !== '{') {
-        output += source[i++];
-        continue;
-      }
-
-      const closeIndex = findBalancedLatexGroupEnd(source, openIndex);
-      if (closeIndex === -1) {
-        output += source.slice(i);
-        break;
-      }
-
-      const content = source.slice(openIndex + 1, closeIndex);
-      const normalizedContent = normalizeLatexTextCommands(content);
-      const normalizedCommand = command === 'mbox' ? 'text' : command;
-      const spacing = source.slice(commandEnd, openIndex);
-      output += `\\${normalizedCommand}${spacing}{${escapeUnescapedTextSpecials(normalizedContent)}}`;
-      i = closeIndex + 1;
-    }
-
-    return output;
-  }
-
-  function repairUnsupportedKatexMacros(formula) {
-    return String(formula || '').replace(/\\mathds(?=\s*\{)/g, '\\mathbb');
-  }
-
-  function uniqueLatexCandidates(items) {
-    const seen = new Set();
-    return items
-      .filter((item) => typeof item === 'string' && item.trim())
-      .filter((item) => {
-        if (seen.has(item)) return false;
-        seen.add(item);
-        return true;
-      });
-  }
-
-  function repairLatexForKatexError(formula, error, displayMode) {
-    const message = String(error?.message || '');
-    const candidates = [];
-
-    if (/Undefined control sequence/.test(message)) {
-      candidates.push(repairUnsupportedKatexMacros(formula));
-    }
-
-    if (/got '[_#&$]'|Unexpected end of input in a macro argument|Expected '\$'/.test(message)) {
-      candidates.push(normalizeLatexTextCommands(formula));
-    }
-
-    if (displayMode && /got '&'|Expected 'EOF'/.test(message) && formula.includes('&')) {
-      candidates.push(`\\begin{aligned}\n${formula}\n\\end{aligned}`);
-    }
-
-    candidates.push(normalizeLatexTextCommands(repairUnsupportedKatexMacros(formula)));
-    return uniqueLatexCandidates(candidates);
-  }
-
-  function escapeUnderscoresInText(formula) {
-    return normalizeLatexTextCommands(formula);
-  }
-
-  function prepareLatexForKatex(formula, displayMode) {
-    const original = String(formula || '');
-    const cacheKey = `${displayMode ? 'D' : 'I'}:${original}`;
-    const cached = latexPreparationCache.get(cacheKey);
-    if (cached) {
-      latexPreparationCache.delete(cacheKey);
-      latexPreparationCache.set(cacheKey, cached);
-      return cached;
-    }
-
-    if (original.length > MAX_LATEX_SOURCE_LENGTH) {
-      return rememberLatexPreparation(cacheKey, {
-        ok: false,
-        formula: original,
-        original,
-        repaired: false,
-        attempts: 0,
-        error: new Error(`Math source exceeds ${MAX_LATEX_SOURCE_LENGTH} characters`),
-      });
-    }
-
-    const queue = uniqueLatexCandidates([normalizeLatexForRender(original, displayMode)]);
-    const seen = new Set(queue);
-    let lastError = null;
-
-    for (let i = 0; i < queue.length && i < 8; i++) {
-      const candidate = queue[i];
-      try {
-        katex.renderToString(candidate, {
-          displayMode,
-          strict: 'ignore',
-          throwOnError: true
-        });
-        return rememberLatexPreparation(cacheKey, {
-          ok: true,
-          formula: candidate,
-          original,
-          repaired: candidate !== original,
-          attempts: i + 1,
-          error: null,
-        });
-      } catch (error) {
-        lastError = error;
-        repairLatexForKatexError(candidate, error, displayMode).forEach((next) => {
-          if (!seen.has(next)) {
-            seen.add(next);
-            queue.push(next);
-          }
-        });
-      }
-    }
-
-    return rememberLatexPreparation(cacheKey, {
-      ok: false,
-      formula: queue[queue.length - 1] || original,
-      original,
-      repaired: false,
-      attempts: Math.min(queue.length, 8),
-      error: lastError,
-    });
-  }
-
   function chooseRenderableLatexForKatex(formula, displayMode) {
     return prepareLatexForKatex(formula, displayMode).formula;
   }
@@ -1967,10 +1772,13 @@
   function renderLatexHtml(formula, displayMode) {
     const preparation = prepareLatexForKatex(formula, displayMode);
     try {
-      const html = katex.renderToString(preparation.formula, {
+      const html = preparation.html || katex.renderToString(preparation.formula, {
         displayMode,
         strict: 'ignore',
-        throwOnError: false
+        throwOnError: false,
+        trust: false,
+        maxExpand: 1000,
+        maxSize: 50,
       });
       runtimeDiagnostics.math.domRendered++;
       return html;
@@ -1978,141 +1786,6 @@
       runtimeDiagnostics.math.failed++;
       throw error;
     }
-  }
-
-  function normalizeLatexFormula(formula) {
-    return escapeUnderscoresInText(formula)
-      .replace(/(\\(?:mathbf|mathrm|mathit|mathsf|mathtt|boldsymbol)\{[^{}]+\})\s*\{\\text\{([^{}]+)\}\}/g, '$1_{\\text{$2}}')
-      .replace(/((?:\\[a-zA-Z]+\{[^{}]+\})|[A-Za-z])\^(?=([)}_\s,.;]|$))/g, '$1^*')
-      .replace(/([A-Za-z0-9}\\]+)\s*\/\|([^|]+)\|/g, '\\frac{$1}{\\lvert $2\\rvert}')
-      .replace(/\\ (?=[a-zA-Z0-9_{}])/g, '\\\\ ');
-  }
-
-  function normalizeDisplayLatexFormula(formula) {
-    return normalizeLatexFormula(formula)
-      .replace(/\\\s*\n/g, '\\\\\n')
-      .replace(/\\\[(\d+(?:\.\d+)?[a-z]*)\]/gi, '\\\\[$1]')
-      .replace(/&\s*\\\[6pt\]/g, '& \\\\')
-      .replace(/\\(sum|prod|int|lim|inf|sup|max|min)\{([^}]+)\}/g, '\\$1_{$2}');
-  }
-
-  function normalizeLatexForRender(formula, displayMode) {
-    return displayMode ? normalizeDisplayLatexFormula(formula) : normalizeLatexFormula(formula);
-  }
-
-  function looksLikeCodeDollarFormula(text) {
-    const cleaned = String(text || '').replace(/\s+/g, ' ').trim();
-    if (!cleaned) return false;
-
-    // Nested dollar variables cannot be valid inside a TeX math span and are
-    // common in shell, Perl, templates, and Makefiles.
-    if (/\$(?:\{?[A-Za-z_][\w]*|\d+)/.test(cleaned)) return true;
-    if (/^\{?[A-Za-z_][\w]*(?:\{|\[)$/.test(cleaned)) return true;
-
-    const programmingSyntax = /(?:;|&&|\|\||=>|::|\+\+|--|<\w+>|["'`]\s*\w)/.test(cleaned);
-    const programmingWords = /\b(?:if|else|while|for|foreach|print|next|return|defined|keys|open|close)\b/.test(cleaned);
-    return programmingSyntax && programmingWords;
-  }
-
-  function analyzeFormulaSignals(text) {
-    const cleaned = String(text || '').replace(/\s+/g, ' ').trim();
-    const macros = cleaned.match(/\\[A-Za-z]+/g) || [];
-    const words = cleaned.match(/[A-Za-z]{2,}/g) || [];
-    const operators = cleaned.match(/[_^=+\-*/<>×]/g) || [];
-    return {
-      cleaned,
-      macroCount: macros.length,
-      wordCount: words.length,
-      operatorCount: operators.length,
-      hasStructure: /[{}\[\]]/.test(cleaned),
-      hasDigit: /\d/.test(cleaned),
-      hasMathFunction: /\b(?:sin|cos|tan|log|ln|exp|det|rank|dim|max|min|arg)\b/i.test(cleaned),
-      hasProseConnector: /\b(?:and|or|is|are|was|were|the|to|of|for|with|from|then|shell|cost)\b/i.test(cleaned),
-    };
-  }
-
-  function looksLikeAmbiguousDollarProse(text) {
-    const signals = analyzeFormulaSignals(text);
-    if (!signals.cleaned || signals.wordCount < 2 || !/\s/.test(signals.cleaned)) return false;
-    if (signals.macroCount || signals.operatorCount || signals.hasStructure || signals.hasMathFunction) return false;
-    return signals.hasProseConnector || signals.wordCount > 1;
-  }
-
-  function skippedLatexPreparation(formula, reason) {
-    return {
-      ok: false,
-      formula: String(formula || ''),
-      original: String(formula || ''),
-      repaired: false,
-      attempts: 0,
-      skipped: true,
-      error: null,
-      reason,
-    };
-  }
-
-  function classifyStructuredMathCandidate(candidate) {
-    const formula = String(candidate?.formula || '').trim();
-    const preparedSource = normalizeToolOutputMathFormula(
-      formula,
-      candidate?.toolOutputLinePrefixMode || ''
-    );
-    const signals = analyzeFormulaSignals(preparedSource);
-    const codeLike = looksLikeCodeDollarFormula(preparedSource) ||
-      (candidate?.delimiter === 'dollar-inline' && candidate?.raw?.startsWith('${'));
-    const proseLike = looksLikeAmbiguousDollarProse(preparedSource);
-    const proseHeavy = isProseHeavyLatex(preparedSource, !!candidate?.displayMode);
-
-    let decision = 'render';
-    let reason = 'validated';
-    let preparation;
-
-    if (!formula || !preparedSource) {
-      decision = 'literal';
-      reason = 'empty';
-      preparation = skippedLatexPreparation(formula, reason);
-    } else if (codeLike) {
-      decision = 'literal';
-      reason = 'code-like';
-      preparation = skippedLatexPreparation(formula, reason);
-    } else if (proseLike || proseHeavy) {
-      decision = 'literal';
-      reason = proseLike ? 'ambiguous-prose' : 'prose-heavy';
-      preparation = skippedLatexPreparation(formula, reason);
-    } else {
-      preparation = prepareLatexForKatex(preparedSource, !!candidate?.displayMode);
-      if (!preparation.ok) {
-        decision = 'literal';
-        reason = 'invalid-latex';
-      } else if (preparation.repaired) {
-        reason = 'validated-after-repair';
-      }
-    }
-
-    let confidence = 'low';
-    if (decision === 'render') {
-      confidence = candidate?.delimiterConfidence === 'high' || signals.macroCount ||
-        signals.operatorCount || signals.hasStructure ? 'high' : 'medium';
-    }
-
-    runtimeDiagnostics.math.candidates++;
-    if (decision === 'render') {
-      runtimeDiagnostics.math.rendered++;
-      if (preparation.repaired) runtimeDiagnostics.math.repaired++;
-    } else {
-      runtimeDiagnostics.math.literal++;
-    }
-
-    return {
-      ...candidate,
-      formula,
-      renderFormula: preparation.ok ? preparation.formula : formula,
-      preparation,
-      decision,
-      reason,
-      confidence,
-      signals,
-    };
   }
 
   function structuredCandidateForFormula(text, displayMode, context = 'synthetic') {
@@ -2209,6 +1882,7 @@
     const wrapped = function ceRemarkMathWithClassifiedInput() {
       const originalTransformer = original.apply(this, arguments);
       return function ceClassifiedMathTransformer(tree, file) {
+        if (file?.data?.__ceDeferredSource) return tree;
         const result = typeof originalTransformer === 'function'
           ? originalTransformer.call(this, tree, file)
           : undefined;
@@ -2281,9 +1955,10 @@
     if (typeof original !== 'function' || original.__ceNormalizedKatexInput) return false;
 
     const wrapped = function ceRehypeKatexWithNormalizedInput() {
-      const transformer = original.apply(this, arguments);
+      const transformer = original.call(this, { ...arguments[0], trust: false, maxExpand: 1000, maxSize: 50 });
       if (typeof transformer !== 'function') return transformer;
       return function ceNormalizedKatexTransformer(tree, file) {
+        if (file?.data?.__ceDeferredSource) return tree;
         normalizeHastMathNodes(tree);
         return transformer.call(this, tree, file);
       };
@@ -2305,27 +1980,6 @@
 
   function containsCjk(text) {
     return /[\u3400-\u9fff\uf900-\ufaff]/.test(text);
-  }
-
-  function hasMarkdownUnderscoreEmphasis(text) {
-    return /(^|[^\w\\])_[^_\n]{2,}_(?=[^\w]|$)/.test(text);
-  }
-
-  function isProseHeavyLatex(text, displayMode) {
-    const cleaned = text.replace(/\s+/g, ' ').trim();
-    if (!cleaned) return true;
-
-    const macroCount = (cleaned.match(/\\[a-zA-Z]+/g) || []).length;
-    const cjkCount = (cleaned.match(/[\u3400-\u9fff\uf900-\ufaff]/g) || []).length;
-    const wordCount = (cleaned.match(/[A-Za-z]{3,}/g) || []).length;
-    const prosePunctuationCount = (cleaned.match(/[，。；：、]|[.!?]\s+[A-Z]/g) || []).length;
-
-    if (!displayMode && cleaned.length > 240) return true;
-    if (cleaned.length > 120 && macroCount < 4 && hasMarkdownUnderscoreEmphasis(cleaned)) return true;
-    if (cleaned.length > 120 && cjkCount > 12 && macroCount < 4) return true;
-    if (cleaned.length > 180 && cjkCount > 12 && prosePunctuationCount > 1) return true;
-    if (cleaned.length > 220 && wordCount > 20 && macroCount < 4) return true;
-    return false;
   }
 
   function isRenderableLatexFormula(text, displayMode) {
@@ -3134,7 +2788,7 @@
             const parent = node.parentNode;
             if (!parent || parent.nodeType !== 1) return NodeFilter.FILTER_REJECT;
             if (closestSafe(parent, '.ce-api-error') ||
-                isInsideNonPreviewRegion(parent) ||
+                shouldSkipPreviewEnhancement(parent) ||
                 ['SCRIPT', 'STYLE', 'CODE', 'PRE', 'BUTTON', 'INPUT', 'TEXTAREA'].includes(parent.tagName)) {
               return NodeFilter.FILTER_REJECT;
             }
@@ -3190,7 +2844,6 @@
 
     try {
       rootsForScopes(scopes, getMathRoots).forEach((root) => safeRun('renderLaTeX root', () => {
-
         preprocessHTMLMath(root);
 
         const walker = document.createTreeWalker(
@@ -3284,6 +2937,7 @@
       if (shouldExclude(node)) return '';
 
       const tag = node.tagName;
+      if (node.tagName === 'CE-RICH-MESSAGE') return '\n' + node.textContent + '\n';
       const children = Array.from(node.childNodes);
       const newContext = {
         ...context,
@@ -3706,6 +3360,8 @@
   const RICH_ENHANCEMENT_FEATURES = Object.freeze(['apiErrors', 'code', 'math']);
   const RICH_ENHANCEMENT_QUIET_MS = 280;
   const RICH_ENHANCEMENT_RECHECK_MS = 1200;
+  const RICH_ENHANCEMENT_FRAME_BUDGET_MS = 6;
+  const RICH_ENHANCEMENT_MAX_TASKS_PER_FRAME = 4;
   const richEnhancementEntries = new Map();
   const richReadyEntries = new Set();
   const richVisibility = new WeakMap();
@@ -3760,9 +3416,12 @@
 
   function flushRichEnhancements() {
     richFlushScheduled = false;
-    const roots = [];
-    const features = new Set();
-    for (const entry of Array.from(richReadyEntries)) {
+    const startedAt = nowMs();
+    let processed = 0;
+    while (richReadyEntries.size) {
+      if (processed >= RICH_ENHANCEMENT_MAX_TASKS_PER_FRAME ||
+          (processed > 0 && nowMs() - startedAt >= RICH_ENHANCEMENT_FRAME_BUDGET_MS)) break;
+      const entry = richReadyEntries.values().next().value;
       richReadyEntries.delete(entry);
       const root = entry.root;
       if (!root || richEnhancementEntries.get(root) !== entry) continue;
@@ -3782,26 +3441,53 @@
         }
         continue;
       }
-      entry.features.forEach((feature) => features.add(feature));
-      roots.push(root);
-      finishRichEnhancementEntry(root);
+      const feature = entry.features.values().next().value;
+      if (feature) {
+        let taskRoot = root;
+        if (feature === 'code') {
+          if (!entry.codeBlocks) entry.codeBlocks = {
+            blocks: codeEnhancementTargets(root),
+            index: 0,
+          };
+          taskRoot = entry.codeBlocks.blocks[entry.codeBlocks.index++];
+          if (entry.codeBlocks.index >= entry.codeBlocks.blocks.length) {
+            entry.codeBlocks = null;
+            entry.features.delete(feature);
+          }
+        } else entry.features.delete(feature);
+        processed++;
+        runtimeDiagnostics.scheduler.richRuns++;
+        if (taskRoot?.isConnected !== false && taskRoot) {
+          runEnhancementCycle({ fullPass: false, roots: [taskRoot], features: [feature] });
+        }
+      }
+      if (entry.features.size) richReadyEntries.add(entry);
+      else finishRichEnhancementEntry(root);
     }
-    if (!roots.length) return;
-    runtimeDiagnostics.scheduler.richRuns++;
-    runEnhancementCycle({
-      fullPass: false,
-      roots,
-      features: Array.from(features),
-    });
+    if (processed) {
+      runtimeDiagnostics.scheduler.richFrames++;
+      runtimeDiagnostics.scheduler.richMaxSliceMs = Math.max(
+        runtimeDiagnostics.scheduler.richMaxSliceMs,
+        Math.round((nowMs() - startedAt) * 100) / 100
+      );
+    }
+    if (richReadyEntries.size) {
+      runtimeDiagnostics.scheduler.richYieldedFrames++;
+      scheduleRichFlush();
+    }
+  }
+
+  function scheduleRichFlush() {
+    if (richFlushScheduled) return;
+    richFlushScheduled = true;
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(flushRichEnhancements);
+    else setTimeout(flushRichEnhancements, 16);
   }
 
   function queueReadyRichEnhancement(entry) {
     if (!entry) return;
     richReadyEntries.add(entry);
-    if (richFlushScheduled) return;
-    richFlushScheduled = true;
-    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(flushRichEnhancements);
-    else setTimeout(flushRichEnhancements, 16);
+    scheduleRichFlush();
   }
 
   function scheduleRichCleanup() {
@@ -3892,6 +3578,7 @@
         }
       }
       requested.forEach((feature) => entry.features.add(feature));
+      if (requested.includes('code')) entry.codeBlocks = null;
       if (reason) entry.reasons.add(String(reason));
       entry.updatedAt = updatedAt;
       entry.offscreenDeferred = false;
@@ -4394,6 +4081,7 @@
       looksLikeAmbiguousDollarProse,
       isPreparedLatexFormula,
       renderLatexHtml,
+      renderLaTeX,
       displayDollarRole,
       isInsideMathExcludedRegion,
       scanAndAddCopyButtons,

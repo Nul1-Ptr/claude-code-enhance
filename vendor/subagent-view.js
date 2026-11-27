@@ -1,16 +1,24 @@
 (function(root, factory) {
   'use strict';
 
-  const api = factory();
+  const runtime = typeof module === 'object' && module.exports
+    ? require('./runtime-core') : root.__CLAUDE_ENHANCE_RUNTIME_CORE__;
+  const math = typeof module === 'object' && module.exports
+    ? require('./math-core') : root.__CLAUDE_ENHANCE_MATH_CORE__;
+  const katex = typeof module === 'object' && module.exports
+    ? require('./katex.min') : root.katex;
+  const api = factory(runtime, math, katex);
   if (typeof module === 'object' && module.exports) module.exports = api;
   if (root) root.__CLAUDE_ENHANCE_SUBAGENT_VIEW__ = api;
-  if (root?.document) api.start(root);
-})(typeof window !== 'undefined' ? window : globalThis, function() {
+  if (root?.document?.getElementById('transcript')) api.start(root);
+})(typeof window !== 'undefined' ? window : globalThis, function(runtime, math, katex) {
   'use strict';
 
   const PIPE_SENTINEL = '\uE000';
-  const MAX_FORMULA_LENGTH = 100000;
-  const MAX_HIGHLIGHT_LENGTH = 500 * 1024;
+  const MAX_HIGHLIGHT_LENGTH = runtime.CONTENT_LIMITS.codeCharacters;
+  const FILTER_SLICE_MS = 6;
+  const FILTER_SLICE_RECORDS = 400;
+  const mathCore = math.create(katex);
   const LANGUAGE_ALIASES = Object.freeze({
     bash: 'bash',
     c: 'c',
@@ -60,24 +68,39 @@
     return slashes % 2 === 1;
   }
 
-  function findClosingDelimiter(source, start, close, allowNewline) {
-    for (let cursor = start; cursor <= source.length - close.length; cursor++) {
-      if (!allowNewline && (source[cursor] === '\n' || source[cursor] === '\r')) return -1;
-      if (!source.startsWith(close, cursor) || isEscaped(source, cursor)) continue;
-      if (close === '$' && (source[cursor + 1] === '$' || source[cursor - 1] === '$')) continue;
-      return cursor;
+  function delimiterIndex(source) {
+    const positions = new Map();
+    const markers = /\\[()[\]]|\$\$|\$|`+|\r\n|[\r\n]/g;
+    let match;
+    while ((match = markers.exec(source))) {
+      if (isEscaped(source, match.index)) continue;
+      let marker = match[0];
+      if (marker === '$' && source[match.index - 1] === '$') continue;
+      if (/^[\r\n]/.test(marker)) marker = '\n';
+      if (!positions.has(marker)) positions.set(marker, []);
+      positions.get(marker).push(match.index);
     }
-    return -1;
+    return { length: source.length, next(marker, start) {
+      const entries = positions.get(marker) || [];
+      let low = 0;
+      let high = entries.length;
+      while (low < high) {
+        const middle = (low + high) >>> 1;
+        if (entries[middle] < start) low = middle + 1;
+        else high = middle;
+      }
+      return entries[low] ?? -1;
+    } };
   }
 
-  function delimitedCandidate(source, open, close, display, allowNewline) {
-    if (!source.startsWith(open)) return null;
-    if (open === '$' && source.startsWith('$$')) return null;
-    if (isEscaped(source, 0)) return null;
-    const end = findClosingDelimiter(source, open.length, close, allowNewline);
+  function delimitedCandidate(source, open, close, display, allowNewline, index, offset) {
+    if (!source.startsWith(open) || (open === '$' && source.startsWith('$$'))) return null;
+    const closing = index.next(close, offset + open.length);
+    const newline = allowNewline ? -1 : index.next('\n', offset);
+    const end = closing < 0 || (newline >= 0 && closing > newline) ? -1 : closing - offset;
     if (end === -1) return null;
     const formula = source.slice(open.length, end).replaceAll(PIPE_SENTINEL, '|');
-    if (!formula.trim() || formula.length > MAX_FORMULA_LENGTH) return null;
+    if (!formula.trim()) return null;
     return {
       raw: source.slice(0, end + close.length),
       formula,
@@ -96,28 +119,22 @@
   }
 
   function looksLikeMath(formula, display = false) {
-    const { source, commands, operators, words } = formulaSignals(formula);
-    if (!source || source.length > MAX_FORMULA_LENGTH || /https?:\/\//i.test(source)) return false;
-    if (display) return true;
-    if (/^[A-Za-z]$/.test(source) || /^[A-Za-z][A-Za-z0-9]{0,2}$/.test(source)) return true;
-    if (/^[\p{L}\p{N}]+$/u.test(source) && source.length > 3) return false;
-    if (/^\d+(?:[.,]\d+)?$/.test(source)) return false;
-    if (commands || operators) return true;
-    if (/\b(?:and|are|for|from|into|is|of|or|the|to|with)\b/i.test(source)) return false;
-    if (/^\d[\d.,]*\s+[A-Za-z]/.test(source)) return false;
-    if (words.length > 2) return false;
-    return /[\p{L}\p{N}]/u.test(source) && !/\s{2,}/.test(source);
+    return mathCore.classifyStructuredMathCandidate({ formula, displayMode: display,
+      delimiter: display ? 'dollar-display' : 'dollar-inline' }).decision === 'render';
   }
 
-  function candidateAt(source) {
-    return delimitedCandidate(source, '$$', '$$', true, true) ||
-      delimitedCandidate(source, '\\[', '\\]', true, true) ||
-      delimitedCandidate(source, '\\(', '\\)', false, true) ||
-      delimitedCandidate(source, '$', '$', false, false);
+  function candidateAt(source, index = null, offset = 0) {
+    if (!source.startsWith('$') && !source.startsWith('\\[') && !source.startsWith('\\(')) return null;
+    index ||= delimiterIndex(source);
+    return delimitedCandidate(source, '$$', '$$', true, true, index, offset) ||
+      delimitedCandidate(source, '\\[', '\\]', true, true, index, offset) ||
+      delimitedCandidate(source, '\\(', '\\)', false, true, index, offset) ||
+      delimitedCandidate(source, '$', '$', false, false, index, offset);
   }
 
   function guardMathPipes(markdown) {
     const source = String(markdown || '');
+    const index = delimiterIndex(source);
     let output = '';
     let cursor = 0;
     while (cursor < source.length) {
@@ -125,7 +142,7 @@
         let tickCount = 1;
         while (source[cursor + tickCount] === '`') tickCount++;
         const fence = '`'.repeat(tickCount);
-        const end = source.indexOf(fence, cursor + tickCount);
+        const end = index.next(fence, cursor + tickCount);
         if (end !== -1) {
           const raw = source.slice(cursor, end + tickCount);
           output += raw.replace(/(?<!\\)\|/g, PIPE_SENTINEL);
@@ -145,7 +162,7 @@
         output += source[cursor++];
         continue;
       }
-      const candidate = candidateAt(source.slice(cursor));
+      const candidate = candidateAt(source.slice(cursor), index, cursor);
       if (!candidate || !looksLikeMath(candidate.formula, candidate.display)) {
         output += source[cursor++];
         continue;
@@ -164,9 +181,10 @@
       `data-delimiter="${escapeHtml(delimiter)}">${escapeHtml(candidate.formula)}</${tag}>`;
   }
 
-  function blockMathToken(source) {
+  function blockMathToken(source, index) {
     const indent = /^( {0,3})/.exec(source)?.[1] || '';
-    const candidate = candidateAt(source.slice(indent.length));
+    const candidate = candidateAt(source.slice(indent.length), index,
+      index ? index.length - source.length + indent.length : 0);
     if (!candidate?.display) return null;
     const rest = source.slice(indent.length + candidate.raw.length);
     if (rest && !/^\s*(?:\n|$)/.test(rest)) return null;
@@ -188,7 +206,7 @@
           return match ? match.index + (match[0][0] === '\n' ? 1 : 0) : undefined;
         },
         tokenizer(source) {
-          return blockMathToken(source);
+          return blockMathToken(source, this.lexer.ceBlockMathIndex);
         },
         renderer(token) {
           return mathSourceHtml(token.candidate) + '\n';
@@ -203,7 +221,8 @@
           return positions.length ? Math.min(...positions) : undefined;
         },
         tokenizer(source) {
-          const candidate = candidateAt(source);
+          const index = this.lexer.ceInlineMathIndex;
+          const candidate = candidateAt(source, index, index ? index.length - source.length : 0);
           if (!candidate || !looksLikeMath(candidate.formula, candidate.display)) return undefined;
           return { type: 'ceMathInline', raw: candidate.raw, candidate };
         },
@@ -222,7 +241,27 @@
       gfm: true,
       pedantic: false,
     });
+    class MathLexer extends markedNamespace.Lexer {
+      blockTokens(source, ...argumentsRest) {
+        const previous = this.ceBlockMathIndex;
+        this.ceBlockMathIndex = delimiterIndex(source);
+        try { return super.blockTokens(source, ...argumentsRest); }
+        finally { this.ceBlockMathIndex = previous; }
+      }
+      inlineTokens(source, ...argumentsRest) {
+        const previous = this.ceInlineMathIndex;
+        this.ceInlineMathIndex = delimiterIndex(source);
+        try { return super.inlineTokens(source, ...argumentsRest); }
+        finally { this.ceInlineMathIndex = previous; }
+      }
+    }
+    const lexer = (source, options) => {
+      const instance = new MathLexer(options || engine.defaults);
+      if (options?.ceReferenceLinks) Object.assign(instance.tokens.links, options.ceReferenceLinks);
+      return instance.lex(source);
+    };
     engine.use({
+      hooks: { provideLexer() { return lexer; } },
       extensions: createMathExtensions(),
       renderer: {
         html(token) {
@@ -230,6 +269,7 @@
         },
       },
     });
+    engine.lexer = lexer;
     return engine;
   }
 
@@ -373,23 +413,45 @@
       ? windowObject.acquireVsCodeApi()
       : { postMessage() {} };
     const markdown = createMarkdownEngine(windowObject.marked);
+    const richQueue = runtime.createRenderQueue({
+      schedule: (callback) => windowObject.requestAnimationFrame(callback),
+      now: () => windowObject.performance.now(),
+      isUsable: (element) => !element.closest('details:not([open])'),
+      onError: () => {},
+    });
     const transcriptRoot = document.getElementById('transcript');
     const summaryRoot = document.getElementById('summary');
     const searchInput = document.getElementById('search');
     const statusRoot = document.getElementById('status');
     const latestButton = document.getElementById('latest');
+    const filterGroup = document.getElementById('filter-group');
+    const conversationPagination = document.getElementById('conversation-pagination');
+    const conversationPrevious = document.getElementById('conversation-previous');
+    const conversationNext = document.getElementById('conversation-next');
+    const conversationPageLabel = document.getElementById('conversation-page-label');
+    const conversationFirst = document.getElementById('conversation-first');
+    const conversationLatest = document.getElementById('conversation-latest');
+    const conversationJump = document.getElementById('conversation-jump');
+    const conversationPageInput = document.getElementById('conversation-page-input');
+    const conversationSearchResults = document.getElementById('conversation-search-results');
+    const conversationSearchSummary = document.getElementById('conversation-search-summary');
+    const conversationSearchList = document.getElementById('conversation-search-list');
+    const conversationSearchMore = document.getElementById('conversation-search-more');
     const filterButtons = Array.from(document.querySelectorAll('[data-filter]'));
     const persistedState = typeof vscode.getState === 'function' ? (vscode.getState() || {}) : {};
     const persistedFilter = filterButtons.some((button) => button.dataset.filter === persistedState.filter)
       ? persistedState.filter
       : 'all';
     const state = {
+      mode: 'subagent',
       transcript: null,
       messages: [],
       records: [],
       filteredRecords: [],
       filter: persistedFilter,
       query: typeof persistedState.query === 'string' ? persistedState.query : '',
+      subagentFilter: persistedFilter,
+      subagentQuery: typeof persistedState.query === 'string' ? persistedState.query : '',
       shownMessages: 0,
       heightCache: new Map(),
       heightIndex: null,
@@ -406,6 +468,20 @@
       filterGeneration: 0,
       loadingReplacement: false,
       pendingScrollRestore: null,
+      pageIndex: 0,
+      pageSize: 60,
+      totalMessages: 0,
+      loadedTotalMessages: 0,
+      pendingConversationLine: null,
+      pendingConversationLocation: null,
+      navigationGeneration: 0,
+      searchGeneration: 0,
+      searchRequestId: null,
+      searchContinuationToken: null,
+      searchResultCount: 0,
+      searchSnapshotStale: false,
+      pageRequestId: null,
+      pageStartRequestId: null,
     };
     state.heightIndex = createHeightIndex([], state.heightCache);
     let restoreScrollY = Number.isFinite(persistedState.scrollY) ? persistedState.scrollY : null;
@@ -415,12 +491,14 @@
     }
 
     function persistUiState() {
-      if (typeof vscode.setState !== 'function') return;
+      if ((state.mode === 'conversation' && !state.pagedSubagent) || typeof vscode.setState !== 'function') return;
       vscode.setState({
         filter: state.filter,
         query: state.query,
         scrollY: windowObject.scrollY,
         filePath: state.transcript?.filePath || null,
+        pageIndex: state.pageIndex,
+        viewId: state.transcript?.descriptor?.viewId || null,
       });
     }
 
@@ -474,19 +552,13 @@
     }
 
     function renderMathElement(element, candidate) {
+      if (element.dataset.ceMathProcessed) return false;
+      element.dataset.ceMathProcessed = 'true';
       const displayMode = candidate?.display ?? element.dataset.display === 'true';
       const formula = candidate?.formula ?? element.textContent.replaceAll(PIPE_SENTINEL, '|');
       if (!looksLikeMath(formula, displayMode) || !windowObject.katex?.renderToString) return false;
       try {
-        element.innerHTML = windowObject.katex.renderToString(formula, {
-          displayMode,
-          output: 'htmlAndMathml',
-          strict: 'ignore',
-          throwOnError: true,
-          trust: false,
-          maxExpand: 1000,
-          maxSize: 50,
-        });
+        element.innerHTML = mathCore.render(formula, displayMode);
         element.classList.add(displayMode ? 'ce-math-display' : 'ce-math-inline');
         element.classList.remove('ce-math-source');
         element.dataset.tex = formula;
@@ -501,36 +573,44 @@
 
     function recoverMathCode(root) {
       for (const code of root.querySelectorAll('code:not(pre code)')) {
-        const candidate = wholeMathCandidate(code.textContent);
-        if (!candidate) continue;
-        const replacement = document.createElement(candidate.display ? 'div' : 'span');
-        replacement.className = 'ce-math-source ce-math-code';
-        replacement.textContent = candidate.formula;
-        replacement.dataset.display = String(candidate.display);
-        code.replaceWith(replacement);
-        renderMathElement(replacement, candidate);
+        richQueue.enqueue(code, () => {
+          const candidate = wholeMathCandidate(code.textContent);
+          if (!candidate) return;
+          const replacement = document.createElement(candidate.display ? 'div' : 'span');
+          replacement.className = 'ce-math-source ce-math-code';
+          replacement.textContent = candidate.formula;
+          replacement.dataset.display = String(candidate.display);
+          code.replaceWith(replacement);
+          renderMathElement(replacement, candidate);
+        });
       }
     }
 
     function highlightCode(root) {
       for (const code of root.querySelectorAll('pre code')) {
-        const raw = code.textContent;
-        const className = Array.from(code.classList).find((name) => name.startsWith('language-'));
-        const requested = className ? className.slice('language-'.length).toLowerCase() : '';
-        const language = LANGUAGE_ALIASES[requested] || requested;
-        if (raw.length <= MAX_HIGHLIGHT_LENGTH && language && windowObject.hljs?.getLanguage?.(language)) {
-          try {
-            code.innerHTML = windowObject.hljs.highlight(raw, {
-              language,
-              ignoreIllegals: true,
-            }).value;
-            code.classList.add('hljs');
-          } catch {
-            code.textContent = raw;
+        if (!code.dataset.ceViewHighlighted) richQueue.enqueue(code, () => {
+          if (code.dataset.ceViewHighlighted) return;
+          code.dataset.ceViewHighlighted = 'true';
+          const raw = code.textContent;
+          const className = Array.from(code.classList).find((name) => name.startsWith('language-'));
+          const requested = className ? className.slice('language-'.length).toLowerCase() : '';
+          const language = LANGUAGE_ALIASES[requested] || requested;
+          if (raw.length > MAX_HIGHLIGHT_LENGTH && windowObject.__CLAUDE_ENHANCE_RICH__) {
+            windowObject.__CLAUDE_ENHANCE_RICH__.highlight(code, language).then((completed) => {
+              if (!completed) delete code.dataset.ceViewHighlighted;
+            });
+          } else if (language && windowObject.hljs?.getLanguage?.(language)) {
+            try {
+              code.innerHTML = windowObject.hljs.highlight(raw, {
+                language,
+                ignoreIllegals: true,
+              }).value;
+              code.classList.add('hljs');
+            } catch {
+              code.textContent = raw;
+            }
           }
-        } else if (raw.length > MAX_HIGHLIGHT_LENGTH) {
-          code.dataset.highlightSkipped = 'oversized';
-        }
+        });
         const pre = code.parentElement;
         if (!pre || pre.parentElement?.classList.contains('code-shell')) continue;
         const shell = document.createElement('div');
@@ -555,7 +635,9 @@
     }
 
     function finishRichContent(root) {
-      for (const source of root.querySelectorAll('.ce-math-source')) renderMathElement(source);
+      for (const source of root.querySelectorAll('.ce-math-source')) {
+        if (!source.dataset.ceMathProcessed) richQueue.enqueue(source, () => renderMathElement(source));
+      }
       recoverMathCode(root);
       highlightCode(root);
       for (const table of Array.from(root.querySelectorAll('table'))) {
@@ -567,7 +649,13 @@
       }
     }
 
-    function markdownFragment(source) {
+    function markdownFragment(source, defer = false) {
+      const text = String(source || '');
+      if ((defer || runtime.richSourceReason(text)) && windowObject.__CLAUDE_ENHANCE_RICH__) {
+        const deferred = document.createElement('ce-rich-message');
+        deferred.textContent = text;
+        return deferred;
+      }
       const fragment = sanitizeMarkdownHtml(parseMarkdown(markdown, source));
       finishRichContent(fragment);
       return fragment;
@@ -576,6 +664,15 @@
     function codeShell(text, language) {
       const shell = document.createElement('div');
       shell.className = 'tool-code';
+      if (windowObject.__CLAUDE_ENHANCE_RICH__ && (String(text || '').length > MAX_HIGHLIGHT_LENGTH ||
+          String(text || '').split('\n', 122).length > 121)) {
+        const code = document.createElement('ce-rich-code');
+        code.setAttribute('language', language || '');
+        code.textContent = text || '';
+        shell.append(code);
+        return shell;
+      }
+      if (String(text || '').length > MAX_HIGHLIGHT_LENGTH) shell.classList.add('large-message-source');
       const pre = document.createElement('pre');
       const code = document.createElement('code');
       if (language) code.className = `language-${language}`;
@@ -586,43 +683,59 @@
       return shell;
     }
 
-    function blockElement(block) {
+    function disclosureBlock(className, label, open, renderContent) {
+      const details = document.createElement('details');
+      details.className = className;
+      details.open = open;
+      const summary = document.createElement('summary');
+      summary.textContent = label;
+      details.appendChild(summary);
+      let rendered = false;
+      let scheduled = false;
+      const render = () => {
+        if (rendered || !details.open) return;
+        details.appendChild(renderContent());
+        rendered = true;
+      };
+      if (open) render();
+      details.addEventListener('toggle', () => {
+        if (!details.open || scheduled) return;
+        if (rendered) {
+          finishRichContent(details);
+          return;
+        }
+        scheduled = true;
+        windowObject.requestAnimationFrame(() => {
+          scheduled = false;
+          if (details.isConnected) render();
+        });
+      });
+      return details;
+    }
+
+    function blockElement(block, defer = false) {
       if (block.kind === 'text') {
         const content = document.createElement('div');
         content.className = 'markdown-content';
-        content.appendChild(markdownFragment(block.text));
+        content.appendChild(markdownFragment(block.text, defer));
         return content;
       }
       if (block.kind === 'thinking') {
-        const details = document.createElement('details');
-        details.className = 'thinking-block';
-        const summary = document.createElement('summary');
-        summary.textContent = 'Thinking';
-        details.appendChild(summary);
-        const content = document.createElement('div');
-        content.className = 'markdown-content detail-content';
-        content.appendChild(markdownFragment(block.text));
-        details.appendChild(content);
-        return details;
+        return disclosureBlock('thinking-block', 'Thinking', false, () => {
+          const content = document.createElement('div');
+          content.className = 'markdown-content detail-content';
+          content.appendChild(markdownFragment(block.text, defer));
+          return content;
+        });
       }
       if (block.kind === 'tool') {
-        const details = document.createElement('details');
-        details.className = 'tool-block';
-        const summary = document.createElement('summary');
-        summary.textContent = block.name || 'Tool call';
-        details.appendChild(summary);
-        details.appendChild(codeShell(block.text, 'json'));
-        return details;
+        return disclosureBlock('tool-block', block.name || 'Tool call', false, () => codeShell(block.text, 'json'));
       }
       if (block.kind === 'tool-result') {
-        const details = document.createElement('details');
-        details.className = block.isError ? 'tool-result error-block' : 'tool-result';
-        details.open = String(block.text || '').length <= 2400 || block.isError;
-        const summary = document.createElement('summary');
-        summary.textContent = block.isError ? 'Tool error' : 'Tool result';
-        details.appendChild(summary);
-        details.appendChild(codeShell(block.text, ''));
-        return details;
+        return disclosureBlock(block.isError ? 'tool-result error-block' : 'tool-result',
+          block.isError ? 'Tool error' : 'Tool result',
+          String(block.text || '').length <= 2400 || block.isError === true,
+          () => codeShell(block.text, ''));
       }
       if (block.kind === 'api-error') {
         const error = document.createElement('div');
@@ -631,6 +744,7 @@
         title.textContent = 'API error';
         const source = document.createElement('pre');
         source.textContent = block.text || '';
+        if (String(block.text || '').length > MAX_HIGHLIGHT_LENGTH) error.classList.add('large-message-source');
         error.append(title, source);
         return error;
       }
@@ -641,9 +755,11 @@
     }
 
     function roleLabel(message) {
-      if (message.role === 'assistant') return message.agentType || 'Sub-agent';
+      if (message.role === 'assistant') {
+        return state.mode === 'conversation' ? 'Assistant' : (message.agentType || 'Sub-agent');
+      }
       if (message.role === 'tool-result') return 'Tool';
-      if (message.role === 'user') return 'Prompt';
+      if (message.role === 'user') return state.mode === 'conversation' ? 'You' : 'Prompt';
       return message.role || 'Event';
     }
 
@@ -664,6 +780,7 @@
       const article = document.createElement('article');
       article.className = `message message-${message.role || 'event'}`;
       article.dataset.messageId = message.id;
+      article.dataset.messageLine = String(message.line || '');
       article.dataset.role = message.role || 'event';
       article.dataset.facets = messageFacets(message).join(' ');
       if (article.dataset.facets.includes('errors')) article.classList.add('message-error');
@@ -675,14 +792,48 @@
       metadata.textContent = [message.error, formatTime(message.timestamp), `line ${message.line}`]
         .filter(Boolean).join(' | ');
       header.append(role, metadata);
+      if (message.largeRecord) {
+        const raw = document.createElement('button');
+        raw.type = 'button';
+        raw.className = 'message-raw-link';
+        raw.textContent = 'Open raw record';
+        raw.addEventListener('click', () => vscode.postMessage({ type: 'openRaw', line: message.line }));
+        header.appendChild(raw);
+      }
       article.appendChild(header);
-      for (const block of message.blocks) article.appendChild(blockElement(block));
+      const sources = [];
+      let characters = 0;
+      for (const block of message.blocks) {
+        if (block.kind !== 'text') continue;
+        const text = String(block.text || '');
+        characters += text.length;
+        if (characters > runtime.CONTENT_LIMITS.sourceCharacters) break;
+        sources.push(text);
+      }
+      const defer = characters > runtime.CONTENT_LIMITS.sourceCharacters || !!runtime.richSourceReason(sources.join('\n'));
+      for (const [blockIndex, block] of message.blocks.entries()) {
+        const element = blockElement(block, defer);
+        element.dataset.blockIndex = String(blockIndex);
+        article.appendChild(element);
+      }
       return article;
+    }
+
+    function revealMatchingDisclosures(article, message) {
+      const query = state.query.toLocaleLowerCase();
+      if (!query) return;
+      for (const details of article?.querySelectorAll('details[data-block-index]') || []) {
+        const block = message?.blocks[Number(details.dataset.blockIndex)];
+        if ([block?.name, block?.text].filter(Boolean).join('\n').toLocaleLowerCase().includes(query)) {
+          details.open = true;
+        }
+      }
     }
 
     const resizeObserver = typeof windowObject.ResizeObserver === 'function'
       ? new windowObject.ResizeObserver(() => scheduleMeasureRenderedMessages())
       : null;
+    const disclosureQueries = new WeakMap();
 
     function createVirtualSpacer(edge, height) {
       const spacer = document.createElement('div');
@@ -691,6 +842,32 @@
       spacer.setAttribute('aria-hidden', 'true');
       spacer.style.height = `${Math.max(0, Math.round(height))}px`;
       return spacer;
+    }
+
+    const virtualSpacers = {
+      top: createVirtualSpacer('top', 0),
+      bottom: createVirtualSpacer('bottom', 0),
+    };
+
+    function updateVirtualSpacer(edge, height) {
+      const spacer = virtualSpacers[edge];
+      const value = `${Math.max(0, Math.round(height))}px`;
+      if (spacer.style.height !== value) spacer.style.height = value;
+      return spacer;
+    }
+
+    function reconcileTranscriptChildren(children) {
+      const retained = new Set(children);
+      for (const child of Array.from(transcriptRoot.children)) {
+        if (retained.has(child)) continue;
+        resizeObserver?.unobserve?.(child);
+        child.remove();
+      }
+      let cursor = transcriptRoot.firstChild;
+      for (const child of children) {
+        if (child === cursor) cursor = cursor.nextSibling;
+        else transcriptRoot.insertBefore(child, cursor);
+      }
     }
 
     function visibleRange() {
@@ -796,10 +973,8 @@
       if (range.start === state.renderStart && range.end === state.renderEnd) return;
       state.renderStart = range.start;
       state.renderEnd = range.end;
-      resizeObserver?.disconnect?.();
       const previousArticles = state.mountedArticles;
       const nextArticles = new Map();
-      transcriptRoot.replaceChildren();
 
       if (!state.filteredRecords.length) {
         state.mountedArticles = nextArticles;
@@ -807,28 +982,34 @@
         empty.className = 'empty-state';
         empty.textContent = state.messages.length
           ? 'No messages match the current search and filter.'
-          : 'No renderable messages in this transcript.';
-        transcriptRoot.appendChild(empty);
+          : (state.mode === 'conversation'
+            ? 'No displayable messages in this conversation.'
+            : 'No renderable messages in this transcript.');
+        reconcileTranscriptChildren([empty]);
         return;
       }
 
-      const fragment = document.createDocumentFragment();
+      const children = [];
       const topHeight = state.heightIndex.sum(0, range.start);
-      if (topHeight > 0) fragment.appendChild(createVirtualSpacer('top', topHeight));
+      if (topHeight > 0) children.push(updateVirtualSpacer('top', topHeight));
       for (let index = range.start; index < range.end; index++) {
         const record = state.filteredRecords[index];
         const article = previousArticles.get(record.key) || renderMessage(record.message);
+        if (state.mode !== 'conversation' && disclosureQueries.get(article) !== state.query) {
+          revealMatchingDisclosures(article, record.message);
+          disclosureQueries.set(article, state.query);
+        }
         article.dataset.virtualIndex = String(index);
         article.dataset.messageKey = record.key;
         nextArticles.set(record.key, article);
-        fragment.appendChild(article);
+        children.push(article);
       }
       const bottomHeight = state.heightIndex.sum(range.end, state.filteredRecords.length);
-      if (bottomHeight > 0) fragment.appendChild(createVirtualSpacer('bottom', bottomHeight));
-      transcriptRoot.appendChild(fragment);
+      if (bottomHeight > 0) children.push(updateVirtualSpacer('bottom', bottomHeight));
+      reconcileTranscriptChildren(children);
       state.mountedArticles = nextArticles;
-      for (const article of transcriptRoot.querySelectorAll('.message[data-virtual-index]')) {
-        resizeObserver?.observe?.(article);
+      for (const [key, article] of nextArticles) {
+        if (previousArticles.get(key) !== article) resizeObserver?.observe?.(article);
       }
       scheduleMeasureRenderedMessages();
       if (state.followingTail) {
@@ -844,7 +1025,7 @@
       }
       return windowObject.setTimeout(() => callback({
         didTimeout: true,
-        timeRemaining: () => 8,
+        timeRemaining: () => 0,
       }), 0);
     }
 
@@ -863,9 +1044,12 @@
       }
       const processSlice = (deadline) => {
         if (generation !== state.filterGeneration) return;
+        const startedAt = windowObject.performance.now();
         let processed = 0;
         while (index < state.records.length &&
-            (processed < 400 || deadline.timeRemaining() > 2)) {
+            (processed === 0 || (processed < FILTER_SLICE_RECORDS &&
+              windowObject.performance.now() - startedAt < FILTER_SLICE_MS &&
+              (deadline.didTimeout || deadline.timeRemaining() > 2)))) {
           const record = state.records[index++];
           if (!query) record.searchText = null;
           if (recordMatches(record, state.filter, query)) filtered.push(record);
@@ -920,7 +1104,7 @@
       const heading = document.createElement('div');
       heading.className = 'summary-heading';
       const title = document.createElement('h1');
-      title.textContent = descriptor.label || `agent-${descriptor.agentId || ''}`;
+      title.textContent = descriptor.label || `agent-${descriptor.agentId || descriptor.sessionId || ''}`;
       const raw = document.createElement('button');
       raw.type = 'button';
       raw.textContent = 'Open JSONL';
@@ -929,10 +1113,352 @@
       const metadata = document.createElement('p');
       const malformed = transcript.malformedLines ? ` | ${transcript.malformedLines} malformed` : '';
       const partial = transcript.partialLine ? ' | receiving data' : '';
-      metadata.textContent = `${descriptor.agentType || descriptor.agentId || 'sub-agent'} | ` +
-        `${state.messages.length} messages | ${transcript.lines || 0} JSONL lines | ` +
+      const currentCount = state.mode === 'conversation' ? state.totalMessages : state.messages.length;
+      metadata.textContent = `${descriptor.agentType || descriptor.projectLabel || descriptor.agentId || descriptor.sessionId || 'sub-agent'} | ` +
+        `${currentCount} messages | ${transcript.lines || 0} JSONL lines | ` +
         `${formatBytes(transcript.bytes)} | ${descriptor.status || 'idle'}${malformed}${partial}`;
       summaryRoot.append(heading, metadata);
+    }
+
+    function resetConversationState(metadata, requestId) {
+      richQueue.clear();
+      if (state.searchRequestId) {
+        vscode.postMessage({ type: 'cancelSearch', requestId: state.searchRequestId });
+      }
+      if (state.mode !== 'conversation') {
+        state.subagentFilter = state.filter;
+        state.subagentQuery = state.query;
+      }
+      state.mode = 'conversation';
+      state.transcript = metadata || {};
+      state.pagedSubagent = metadata?.descriptor?.kind === 'subagent';
+      state.messages = [];
+      state.records = [];
+      state.filteredRecords = [];
+      state.shownMessages = 0;
+      state.pageIndex = 0;
+      state.pageSize = 60;
+      state.totalMessages = Number(metadata?.messageCount) || 0;
+      state.loadedTotalMessages = state.totalMessages;
+      state.pendingConversationLine = null;
+      state.followingTail = false;
+      state.tailRequested = false;
+      state.filterGeneration++;
+      state.searchGeneration++;
+      state.searchRequestId = null;
+      state.searchContinuationToken = null;
+      state.searchResultCount = 0;
+      state.searchSnapshotStale = false;
+      state.pageRequestId = null;
+      state.pageStartRequestId = requestId ? String(requestId) : null;
+      state.pageChunks = null;
+      state.filter = state.pagedSubagent ? state.subagentFilter : 'all';
+      state.query = state.pagedSubagent ? state.subagentQuery : '';
+      state.initialPagedSearch = !!state.query || state.filter !== 'all';
+      state.renderStart = -1;
+      state.renderEnd = -1;
+      state.heightCache.clear();
+      state.heightIndex = createHeightIndex([], state.heightCache);
+      state.mountedArticles.clear();
+      searchInput.value = state.query;
+      searchInput.disabled = true;
+      searchInput.setAttribute('aria-label', 'Search complete conversation history');
+      searchInput.placeholder = 'Search complete conversation history';
+      if (filterGroup) filterGroup.hidden = !state.pagedSubagent;
+      for (const button of filterButtons) button.setAttribute('aria-pressed', String(button.dataset.filter === state.filter));
+      if (latestButton) latestButton.hidden = true;
+      if (conversationSearchResults) conversationSearchResults.hidden = true;
+      if (conversationPagination) conversationPagination.hidden = false;
+      transcriptRoot.setAttribute('aria-busy', 'true');
+      renderSummary();
+      updateConversationPagination();
+    }
+
+    function showConversationLoading(label = 'Conversation History') {
+      richQueue.clear();
+      if (state.mode !== 'conversation') {
+        state.subagentFilter = state.filter;
+        state.subagentQuery = state.query;
+      }
+      state.mode = 'conversation';
+      state.pagedSubagent = false;
+      state.transcript = {
+        descriptor: { label },
+        bytes: 0,
+        lines: 0,
+        malformedLines: 0,
+        partialLine: false,
+        messageCount: 0,
+      };
+      state.messages = [];
+      state.records = [];
+      state.filteredRecords = [];
+      state.totalMessages = 0;
+      state.loadedTotalMessages = 0;
+      state.pageIndex = 0;
+      state.pageSize = 60;
+      state.filterGeneration++;
+      state.searchGeneration++;
+      state.searchRequestId = null;
+      state.searchContinuationToken = null;
+      state.searchResultCount = 0;
+      state.searchSnapshotStale = false;
+      state.pageRequestId = null;
+      state.pageStartRequestId = null;
+      state.pageChunks = null;
+      state.renderStart = -1;
+      state.renderEnd = -1;
+      state.heightCache.clear();
+      state.heightIndex = createHeightIndex([], state.heightCache);
+      state.mountedArticles.clear();
+      state.filter = 'all';
+      state.query = '';
+      searchInput.value = '';
+      searchInput.disabled = true;
+      searchInput.setAttribute('aria-label', 'Search complete conversation history');
+      searchInput.placeholder = 'Search complete conversation history';
+      if (filterGroup) filterGroup.hidden = true;
+      if (latestButton) latestButton.hidden = true;
+      if (conversationPagination) conversationPagination.hidden = false;
+      if (conversationSearchResults) conversationSearchResults.hidden = true;
+      conversationPageLabel.textContent = 'Indexing local history…';
+      conversationPrevious.disabled = true;
+      conversationNext.disabled = true;
+      if (conversationFirst) conversationFirst.disabled = true;
+      if (conversationLatest) conversationLatest.disabled = true;
+      if (conversationPageInput) conversationPageInput.disabled = true;
+      conversationSearchList.replaceChildren();
+      transcriptRoot.setAttribute('aria-busy', 'true');
+      resizeObserver?.disconnect?.();
+      transcriptRoot.replaceChildren();
+      const loading = document.createElement('div');
+      loading.className = 'empty-state';
+      loading.textContent = 'Indexing local conversation history…';
+      transcriptRoot.appendChild(loading);
+      summaryRoot.replaceChildren();
+      statusRoot.textContent = 'Preparing the sparse history index…';
+    }
+
+    function updateConversationPagination() {
+      if (state.mode !== 'conversation' || !conversationPagination) return;
+      const pageCount = Math.ceil(state.totalMessages / state.pageSize);
+      const busy = !!state.pageRequestId || !!state.pageStartRequestId || searchInput.disabled;
+      const newMessages = Math.max(0, state.totalMessages - state.loadedTotalMessages);
+      conversationPagination.hidden = false;
+      conversationPrevious.disabled = busy || state.pageIndex <= 0;
+      conversationNext.disabled = busy || state.pageIndex + 1 >= pageCount;
+      if (conversationFirst) conversationFirst.disabled = busy || state.pageIndex <= 0;
+      if (conversationLatest) {
+        conversationLatest.disabled = busy || !pageCount || (state.pageIndex + 1 >= pageCount && !newMessages);
+        conversationLatest.textContent = newMessages ? `Latest · ${newMessages} new messages` : 'Latest';
+      }
+      if (conversationPageInput) {
+        conversationPageInput.max = String(Math.max(1, pageCount));
+        conversationPageInput.disabled = busy || !pageCount;
+        if (document.activeElement !== conversationPageInput) conversationPageInput.value = String(state.pageIndex + 1);
+      }
+      conversationPageLabel.textContent = `${state.totalMessages ? state.pageIndex + 1 : 0} / ${pageCount} · ${state.totalMessages} messages`;
+    }
+
+    function requestConversationPage(pageIndex, lineNumber, preserveScroll = false, location = null) {
+      if (state.mode !== 'conversation' || !Number.isInteger(pageIndex) || pageIndex < 0) return;
+      state.pendingConversationLine = Number.isInteger(lineNumber) ? lineNumber : null;
+      state.pendingConversationLocation = location ? { ...location, query: state.query } : null;
+      state.navigationGeneration++;
+      state.pageRequestId = `page-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      state.pageChunks = null;
+      statusRoot.textContent = 'Loading conversation page...';
+      transcriptRoot.setAttribute('aria-busy', 'true');
+      updateConversationPagination();
+      vscode.postMessage({
+        type: 'loadPage',
+        pageIndex,
+        requestId: state.pageRequestId,
+        preserveScroll,
+      });
+    }
+
+    function appendConversationSearchHits(hits) {
+      for (const hit of hits || []) {
+        if (conversationSearchList.childElementCount >= 300) {
+          conversationSearchList.firstElementChild.remove();
+        }
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'conversation-search-hit';
+        button.dataset.messageIndex = Number.isInteger(hit.messageIndex) && hit.messageIndex >= 0
+          ? String(hit.messageIndex)
+          : '';
+        const heading = document.createElement('strong');
+        heading.textContent = `#${hit.line} · ${hit.role}`;
+        const preview = document.createElement('span');
+        preview.textContent = hit.preview || '';
+        button.append(heading, preview);
+        button.addEventListener('click', () => {
+          const rawMessageIndex = button.dataset.messageIndex;
+          const messageIndex = rawMessageIndex ? Number(rawMessageIndex) : NaN;
+          if (!Number.isInteger(messageIndex) || messageIndex < 0 || hit.raw) {
+            vscode.postMessage({ type: 'openRaw', line: hit.line });
+            return;
+          }
+          requestConversationPage(Math.floor(messageIndex / state.pageSize), hit.line, false, hit.location);
+        });
+        conversationSearchList.appendChild(button);
+        state.searchResultCount++;
+      }
+    }
+
+    function runConversationSearch(query, append = false) {
+      const normalized = String(query || '').trim();
+      if (state.mode !== 'conversation') return;
+      if ((!normalized && state.filter === 'all') || normalized.length > 512) {
+        if (state.searchRequestId) {
+          vscode.postMessage({ type: 'cancelSearch', requestId: state.searchRequestId });
+        }
+        state.searchGeneration++;
+        state.searchRequestId = null;
+        state.searchContinuationToken = null;
+        state.searchResultCount = 0;
+        state.searchSnapshotStale = false;
+        conversationSearchList.replaceChildren();
+        if (normalized.length > 512) {
+          if (conversationSearchResults) conversationSearchResults.hidden = false;
+          conversationSearchSummary.textContent = 'Search queries are limited to 512 characters.';
+          conversationSearchMore.hidden = true;
+        } else if (conversationSearchResults) {
+          conversationSearchResults.hidden = true;
+        }
+        return;
+      }
+      if (!append) {
+        if (state.searchRequestId) {
+          vscode.postMessage({ type: 'cancelSearch', requestId: state.searchRequestId });
+        }
+        state.searchGeneration++;
+        state.searchRequestId = `search-${state.searchGeneration}-${Date.now()}`;
+        state.searchContinuationToken = null;
+        state.searchResultCount = 0;
+        state.searchSnapshotStale = false;
+        conversationSearchList.replaceChildren();
+      }
+      if (append && !state.searchContinuationToken) return;
+      const requestId = state.searchRequestId;
+      if (conversationSearchResults) conversationSearchResults.hidden = false;
+      conversationSearchSummary.textContent = append
+        ? `${state.searchResultCount} matches · loading more...`
+        : 'Searching complete local history...';
+      conversationSearchMore.hidden = true;
+      vscode.postMessage({
+        type: 'search',
+        requestId,
+        query: normalized,
+        filter: state.filter,
+        continuationToken: append ? state.searchContinuationToken : undefined,
+      });
+    }
+
+    async function revealConversationLocation(article, location, generation) {
+      if (!article || !location || generation !== state.navigationGeneration) return;
+      const block = Array.from(article.children).find((element) => element.dataset.blockIndex === String(location.blockIndex));
+      if (!block) return;
+      if (block.tagName === 'DETAILS') block.open = true;
+      await new Promise(windowObject.requestAnimationFrame);
+      await new Promise(windowObject.requestAnimationFrame);
+      if (!article.isConnected || generation !== state.navigationGeneration) return;
+      block.scrollIntoView({ block: 'center' });
+      const rich = block.querySelector('ce-rich-message, ce-rich-code');
+      if (rich) await rich.revealLocation(location.start, location.query, () => generation === state.navigationGeneration);
+      else windowObject.__CLAUDE_ENHANCE_RICH__?.revealText(block, location.query);
+    }
+
+    function installConversationPage(message) {
+      const page = Number(message.pageIndex);
+      if (!Number.isInteger(page) || page < 0) return;
+      const previousPageIndex = state.pageIndex;
+      const restorePagedPosition = state.pagedSubagent && state.pageStartRequestId &&
+        persistedState.viewId === message.transcript?.descriptor?.viewId && persistedState.pageIndex === page &&
+        Number.isFinite(persistedState.scrollY);
+      const previousPage = state.messages;
+      const previousAnchor = message.preserveScroll ? captureVirtualAnchor() : null;
+      const wasNearBottom = document.documentElement.scrollHeight -
+        (windowObject.scrollY + windowObject.innerHeight) < 180;
+      if (previousPageIndex !== page) state.heightCache.clear();
+      state.mode = 'conversation';
+      state.pageIndex = page;
+      state.pageSize = Math.max(1, Math.min(60, Number(message.pageSize) || 60));
+      state.loadedTotalMessages = Number(message.totalMessages) || 0;
+      state.totalMessages = Math.max(state.totalMessages, state.loadedTotalMessages);
+      state.transcript = message.transcript || state.transcript;
+      state.messages = Array.isArray(message.messages) ? message.messages.slice(0, state.pageSize) : [];
+      state.records = state.messages.map((record, index) => createMessageRecord(
+        record,
+        Number.isInteger(record.conversationIndex) ? record.conversationIndex : page * state.pageSize + index
+      ));
+      state.filteredRecords = state.records;
+      state.shownMessages = state.records.length;
+      state.heightIndex = createHeightIndex(state.records, state.heightCache);
+      state.renderStart = -1;
+      state.renderEnd = -1;
+      state.pendingAnchor = null;
+      state.pendingScrollRestore = null;
+      state.restoringScroll = false;
+      state.pageRequestId = null;
+      state.pageStartRequestId = null;
+      state.followingTail = false;
+      state.loadingReplacement = false;
+      searchInput.disabled = false;
+      if (state.initialPagedSearch) {
+        state.initialPagedSearch = false;
+        runConversationSearch(state.query);
+      }
+      transcriptRoot.setAttribute('aria-busy', 'false');
+      scheduleVirtualRender(true);
+      const targetLine = state.pendingConversationLine;
+      const targetLocation = state.pendingConversationLocation;
+      const navigationGeneration = state.navigationGeneration;
+      state.pendingConversationLine = null;
+      state.pendingConversationLocation = null;
+      requestAnimationFrame(() => {
+        const previousPageIsPrefix = previousPage.length > 0 &&
+          state.messages.length >= previousPage.length &&
+          previousPage.every((record, index) => record.id === state.messages[index]?.id);
+        if (message.preserveScroll && previousPageIndex === page && previousPageIsPrefix) {
+          if (wasNearBottom) {
+            windowObject.scrollTo({ top: document.body.scrollHeight });
+          } else {
+            const article = previousAnchor && state.mountedArticles.get(previousAnchor.key);
+            const rect = article?.getBoundingClientRect?.();
+            if (rect && previousAnchor) {
+              windowObject.scrollTo(0, windowObject.scrollY + rect.top - previousAnchor.offset);
+            }
+          }
+          statusRoot.textContent = 'Conversation history updated.';
+          return;
+        }
+        if (message.preserveScroll && previousPageIndex < page && wasNearBottom) {
+          windowObject.scrollTo({ top: document.body.scrollHeight });
+          statusRoot.textContent = 'Conversation history updated.';
+          return;
+        }
+        if (targetLine) {
+          const target = transcriptRoot.querySelector(`.message[data-message-line="${targetLine}"]`);
+          const targetMessage = state.messages.find((record) => record.line === targetLine);
+          revealMatchingDisclosures(target, targetMessage);
+          target?.scrollIntoView?.({ block: 'center' });
+          void revealConversationLocation(target, targetLocation, navigationGeneration).catch(() => {
+            if (navigationGeneration === state.navigationGeneration) statusRoot.textContent = 'Message loaded. Open Source to inspect the match.';
+          });
+        } else if (restorePagedPosition) {
+          windowObject.scrollTo(0, Math.max(0, persistedState.scrollY));
+        } else {
+          windowObject.scrollTo(0, transcriptRoot.offsetTop || 0);
+        }
+      });
+      const malformed = state.transcript?.malformedLines || 0;
+      statusRoot.textContent = `${malformed} malformed records skipped${state.transcript?.partialLine ? ' · final record is still being written' : ''}`
+        .replace(/^0 malformed records skipped$/, '');
+      updateConversationPagination();
+      renderSummary();
     }
 
     function formatBytes(bytes) {
@@ -943,6 +1469,7 @@
     }
 
     function startTranscriptReplacement(transcript) {
+      richQueue.clear();
       const previousFilePath = state.transcript?.filePath || persistedState.filePath || null;
       const changedTranscript = !!previousFilePath && previousFilePath !== transcript.filePath;
       const currentScrollY = Math.max(0, Number(windowObject.scrollY) || 0);
@@ -1042,6 +1569,15 @@
       windowObject.clearTimeout(searchTimer);
       searchTimer = windowObject.setTimeout(() => {
         state.query = searchInput.value.trim();
+        if (state.mode === 'conversation') {
+          if (state.pagedSubagent) {
+            state.subagentQuery = state.query;
+            persistUiState();
+          }
+          runConversationSearch(state.query);
+          return;
+        }
+        state.subagentQuery = state.query;
         persistUiState();
         state.followingTail = false;
         state.tailRequested = false;
@@ -1051,16 +1587,25 @@
     for (const button of filterButtons) {
       button.addEventListener('click', () => {
         state.filter = button.dataset.filter;
+        if (state.mode === 'subagent' || state.pagedSubagent) state.subagentFilter = state.filter;
         for (const candidate of filterButtons) {
           candidate.setAttribute('aria-pressed', String(candidate === button));
         }
         persistUiState();
+        if (state.mode === 'conversation') {
+          runConversationSearch(state.query);
+          return;
+        }
         state.followingTail = false;
         state.tailRequested = false;
         rebuildFilteredRecords({ resetScroll: true });
       });
     }
     latestButton.addEventListener('click', () => {
+      if (state.mode === 'conversation') {
+        requestConversationPage(Math.max(0, Math.ceil(state.totalMessages / state.pageSize) - 1));
+        return;
+      }
       state.followingTail = true;
       state.tailRequested = true;
       scheduleVirtualRender(true);
@@ -1089,9 +1634,108 @@
     }, { passive: true });
     windowObject.addEventListener('resize', () => scheduleVirtualRender(true), { passive: true });
 
+    conversationPrevious?.addEventListener('click', () => {
+      requestConversationPage(state.pageIndex - 1);
+    });
+    conversationNext?.addEventListener('click', () => {
+      requestConversationPage(state.pageIndex + 1);
+    });
+    conversationFirst?.addEventListener('click', () => requestConversationPage(0));
+    conversationLatest?.addEventListener('click', () => {
+      requestConversationPage(Math.max(0, Math.ceil(state.totalMessages / state.pageSize) - 1));
+    });
+    conversationJump?.addEventListener('submit', (event) => {
+      event.preventDefault();
+      const pageNumber = Number(conversationPageInput?.value);
+      const pageCount = Math.ceil(state.totalMessages / state.pageSize);
+      if (!state.pageRequestId && Number.isInteger(pageNumber) && pageNumber >= 1 && pageNumber <= pageCount) {
+        requestConversationPage(pageNumber - 1);
+      }
+    });
+    conversationSearchMore?.addEventListener('click', () => runConversationSearch(state.query, true));
+
     windowObject.addEventListener('message', (event) => {
       const message = event.data;
-      if (message?.type === 'replaceStart') {
+      if (message?.type === 'conversationLoading') {
+        showConversationLoading(message.label);
+      } else if (message?.type === 'conversationStart') {
+        resetConversationState(message.transcript || {}, message.requestId);
+      } else if (message?.type === 'conversationPage') {
+        if (message.requestId === state.pageRequestId ||
+            message.requestId === state.pageStartRequestId ||
+            (String(message.requestId || '').startsWith('refresh-') && !state.pageRequestId)) {
+          if (message.streamed) message.messages = state.pageChunks?.requestId === message.requestId ? state.pageChunks.messages : [];
+          state.pageChunks = null;
+          installConversationPage(message);
+        }
+      } else if (message?.type === 'conversationPageChunk') {
+        if (message.requestId === state.pageRequestId || message.requestId === state.pageStartRequestId) {
+          if (state.pageChunks?.requestId !== message.requestId) state.pageChunks = { requestId: message.requestId, messages: [] };
+          state.pageChunks.messages.push(...(message.messages || []).slice(0, 60 - state.pageChunks.messages.length));
+        }
+        vscode.postMessage({ type: 'loadPage', requestId: message.requestId, ackToken: message.ackToken });
+      } else if (message?.type === 'searchResults' && message.requestId === state.searchRequestId) {
+        state.searchContinuationToken = message.continuationToken || null;
+        appendConversationSearchHits(message.hits);
+        const shown = conversationSearchList.childElementCount;
+        const range = state.searchResultCount > shown
+          ? ` · showing ${state.searchResultCount - shown + 1}–${state.searchResultCount}`
+          : '';
+        conversationSearchSummary.textContent = `${state.searchResultCount} matches${range}${message.done ? ' · complete' : ''}`;
+        if (state.searchSnapshotStale) {
+          conversationSearchSummary.textContent += ' · New messages available; search again to include them.';
+        }
+        conversationSearchMore.hidden = !state.searchContinuationToken;
+      } else if (message?.type === 'searchError' && message.requestId === state.searchRequestId) {
+        conversationSearchSummary.textContent = message.message || 'History search failed.';
+        conversationSearchMore.hidden = true;
+      } else if (message?.type === 'conversationPaused') {
+        if (state.searchRequestId) vscode.postMessage({ type: 'cancelSearch', requestId: state.searchRequestId });
+        state.searchGeneration++;
+        state.searchRequestId = null;
+        state.searchContinuationToken = null;
+      } else if (message?.type === 'conversationUpdate') {
+        const follow = state.pagedSubagent && state.followingTail && !state.pageRequestId &&
+          !state.searchRequestId && state.pageIndex + 1 >= Math.ceil(state.totalMessages / state.pageSize);
+        state.transcript = message.transcript || state.transcript;
+        state.totalMessages = Number(state.transcript?.messageCount) || state.totalMessages;
+        if (message.messagesChanged && state.searchRequestId && !state.searchSnapshotStale) {
+          state.searchSnapshotStale = true;
+          conversationSearchSummary.textContent += ' · New messages available; search again to include them.';
+        }
+        if (message.pageRequestId) {
+          state.pageRequestId = String(message.pageRequestId);
+          state.pendingConversationLine = null;
+          statusRoot.textContent = 'Loading updated conversation page...';
+          transcriptRoot.setAttribute('aria-busy', 'true');
+        }
+        updateConversationPagination();
+        renderSummary();
+        if (follow && message.messagesChanged) {
+          requestConversationPage(Math.max(0, Math.ceil(state.totalMessages / state.pageSize) - 1), undefined, true);
+        }
+      } else if (message?.type === 'replaceStart') {
+        state.mode = 'subagent';
+        state.pagedSubagent = false;
+        state.filter = state.subagentFilter;
+        state.query = state.subagentQuery;
+        searchInput.value = state.query;
+        for (const button of filterButtons) {
+          button.setAttribute('aria-pressed', String(button.dataset.filter === state.filter));
+        }
+        if (state.searchRequestId) vscode.postMessage({ type: 'cancelSearch', requestId: state.searchRequestId });
+        state.searchGeneration++;
+        state.searchRequestId = null;
+        state.searchContinuationToken = null;
+        state.searchResultCount = 0;
+        conversationSearchList.replaceChildren();
+        searchInput.disabled = false;
+        searchInput.setAttribute('aria-label', 'Search transcript');
+        searchInput.placeholder = 'Search transcript';
+        if (filterGroup) filterGroup.hidden = false;
+        if (latestButton) latestButton.hidden = false;
+        if (conversationPagination) conversationPagination.hidden = true;
+        if (conversationSearchResults) conversationSearchResults.hidden = true;
         startTranscriptReplacement(message.transcript || {});
       } else if (message?.type === 'replaceChunk') {
         appendMessageBatch(message.messages || [], { followTail: false });
@@ -1107,20 +1751,33 @@
         appendMessageBatch(message.messages || []);
         if (message.transcript) appendTranscriptMetadata(message.transcript);
       } else if (message?.type === 'error') {
+        richQueue.clear();
         state.restoringScroll = false;
+        state.pageRequestId = null;
+        state.pageStartRequestId = null;
+        searchInput.disabled = false;
+        updateConversationPagination();
         transcriptRoot.setAttribute('aria-busy', 'false');
         const error = document.createElement('div');
         error.className = 'api-error error-block';
         error.textContent = message.message || 'Unable to read transcript.';
+        resizeObserver?.disconnect?.();
+        state.mountedArticles.clear();
         transcriptRoot.replaceChildren(error);
       }
     });
+
+    if (state.mode !== 'conversation') {
+      if (conversationPagination) conversationPagination.hidden = true;
+      if (conversationSearchResults) conversationSearchResults.hidden = true;
+    }
 
     vscode.postMessage({ type: 'ready' });
   }
 
   return Object.freeze({
     PIPE_SENTINEL,
+    LANGUAGE_ALIASES,
     candidateAt,
     createMarkdownEngine,
     createMathExtensions,

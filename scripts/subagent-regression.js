@@ -404,7 +404,7 @@ function testTranscriptVirtualization() {
   assert(view.VIRTUAL_WINDOW_MESSAGES === 60 && view.VIRTUAL_WINDOW_OVERSCAN === 12 &&
       view.VIRTUAL_MAX_MESSAGES === 100,
     'transcript DOM windows should remain bounded');
-  assert(view.MAX_HIGHLIGHT_LENGTH === 500 * 1024,
+  assert(view.MAX_HIGHLIGHT_LENGTH === 50 * 1024,
     'sub-agent code highlighting should stop at the oversized-code limit');
 }
 
@@ -476,6 +476,9 @@ function testSidebarHelpers() {
   assert(!html.includes('unsafe-eval'), 'transcript CSP should forbid eval');
   assert(sidebar.MAX_HISTORY_WATCHERS === 128,
     'history directory watchers should remain bounded for large project roots');
+  assert(sidebar.conversationHistoryErrorMessage({ code: 'EACCES' }) ===
+    'The selected conversation file cannot be read.',
+  'filesystem errors should be summarized without exposing local paths');
 }
 
 function testSidebarRegistration() {
@@ -532,6 +535,7 @@ function testSidebarRegistration() {
     window: {
       createTreeView: () => ({ visible: false, dispose() {} }),
       showQuickPick: () => Promise.resolve(undefined),
+      showInformationMessage: () => Promise.resolve(),
       showTextDocument: () => Promise.resolve(),
     },
   };
@@ -541,6 +545,7 @@ function testSidebarRegistration() {
   assert(registration.provider.scope === sidebar.SCOPE_WORKSPACE, 'sidebar should default to active-workspace scope');
   assert(contexts.get(sidebar.SCOPE_CONTEXT_KEY) === sidebar.SCOPE_WORKSPACE, 'workspace scope context should initialize');
   assert(commands.has(sidebar.OPEN_VIEW_COMMAND), 'open-sidebar command should register');
+  assert(commands.has(sidebar.OPEN_CONVERSATION_HISTORY_COMMAND), 'open-conversation-history command should register');
   assert(commands.has(sidebar.OPEN_TRANSCRIPT_COMMAND), 'open-transcript command should register');
   assert(commands.has(sidebar.OPEN_RAW_COMMAND), 'open-raw command should register');
   assert(commands.has(sidebar.REFRESH_COMMAND), 'refresh command should register');
